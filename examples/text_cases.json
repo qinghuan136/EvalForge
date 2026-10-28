@@ -1,0 +1,6 @@
+[
+  {"id": "case-1", "input": {"text": "  Hello WORLD  "}, "expected": "hello world", "metadata": {"scenario": "大小写与首尾空格"}},
+  {"id": "case-2", "input": {"text": "hello    world"}, "expected": "hello world", "metadata": {"scenario": "合并连续空白"}},
+  {"id": "case-3", "input": {"text": "  你好 世界  "}, "expected": "你好 世界", "metadata": {"scenario": "中文输入"}},
+  {"id": "case-4", "input": {"text": "北京"}, "expected": "beijing", "metadata": {"scenario": "故意不匹配：Task 不提供音译"}}
+]

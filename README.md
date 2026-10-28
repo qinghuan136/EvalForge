@@ -1,0 +1,98 @@
+# EvalForge V0
+
+本地 JSON Dataset → Experiment Runner → Task → Evaluator → 终端摘要 / JSON 报告。
+
+Python 3.11+。V0 离线实验执行仅使用标准库，无需启动 Phoenix、数据库或模型服务。
+项目已另外安装 PostgreSQL 基础设施（SQLAlchemy + asyncpg + Alembic），使用方式见 [数据库说明](docs/database.md)。
+
+## 运行
+
+在 EvalForge 项目根目录执行（PowerShell）：
+
+数据库相关命令和全部测试请使用项目的 `.venv` 解释器；V0 示例也可继续独立运行。
+
+```powershell
+.\.venv\Scripts\python.exe -m examples.run_demo
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+```
+
+示例默认生成 `results/demo.json`。4 条文本规范化样本全部执行成功，
+其中 1 条故意要求 Task 不具备的音译能力：`exact_match` 均分 0.75，`non_empty` 均分 1.0。
+**执行成功不等于答案正确**：错误答案是 0 分，执行异常另记 error。
+
+```sh
+python -m examples.run_demo --dataset examples/text_cases.json --output results/my-run.json
+```
+
+V0 示例可直接从源码运行；数据库部分需要先安装项目依赖，见数据库说明。
+
+如果本机尚未配置系统 Python，本次验证使用的内置解释器也可以直接执行（PowerShell）：
+
+```powershell
+& 'C:\Users\30233\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -X utf8 -m examples.run_demo
+```
+
+## 换成自己的 Task
+
+```python
+from evalforge import load_dataset, run_experiment, write_report
+
+def my_task(input):
+    return input["question"].strip()
+
+def correctness(output, expected):
+    return output == expected
+
+result = run_experiment(
+    dataset=load_dataset("my-cases.json"),
+    task=my_task,
+    evaluators={"correctness": correctness},
+    experiment_name="first-experiment",
+)
+write_report(result, "results/first-experiment.json")
+```
+
+数据集是 UTF-8 JSON 数组，每条格式如下。id 必须唯一且非空，input 和 metadata 是对象；
+expected 可为任意 JSON 值，metadata 可省略，expected 为 null 也有效。
+
+```json
+[
+  {"id": "case-1", "input": {"question": " hello "}, "expected": "hello", "metadata": {"scenario": "trim"}}
+]
+```
+
+Phoenix Dataset 的 `output` 存的是参考答案。V0 将它明确命名为 `expected`；
+Task 返回值才叫 `output`。这不是对 Phoenix 数据集导出文件的直接兼容读取器。
+
+## 函数契约
+
+- Task 可按需声明 `input / expected / reference / metadata / example`。
+- Evaluator 可按需声明上述参数及 `output`；reference 是 expected 的别名。
+- 单个任意名称的参数接收 input（Task）或 output（Evaluator）。支持关键字专用、位置专用和默认参数。
+- example 是本地 Example 对象，如 `example.id`、`example.expected`，不提供 Phoenix ExampleProxy 的兼容字典接口。
+- 函数调用时获得深拷贝，修改参数不影响数据集、已记录输出或其他评分器。
+- 评分器返回 bool、数值、字符串、`(score, label)`、`(score, label, explanation)`、包含对应字段的 dict 或 EvaluationResult。
+- 分数必须是有限数值，不强制限制在 0～1；标签评分不被自动转换成数值。
+- V0 只接受同步函数，不支持 `*args / **kwargs`、多输出评分器、装饰器注册或远程配置。
+
+## 执行和错误行为
+
+1. 预检所有函数签名，再拍下数据集快照。
+2. 顺序执行所有 Task，保留每条 input、expected、metadata、output、error。
+3. 对每条成功输出执行每个 Evaluator，以 example_id 关联样本与结果。
+4. Task 失败时，其评分记录为 skipped；评分失败时仅记录当前 evaluator 的 error，继续其余评分。
+5. 数值平均分只统计成功的数值评分；0 分参与平均，错误、跳过、纯标签均不补 0。
+
+配置错误直接报错；普通 Task/Evaluator 异常写入实验报告；KeyboardInterrupt/SystemExit 继续向外传播。
+V0 没有超时、中断恢复、重试、异步或并发，也没有 UI、数据库、API、Agent 或 Tracing。
+
+## 建议阅读顺序
+
+1. `examples/text_cases.json` 与 `examples/run_demo.py`：先看输入和调用方式。
+2. `evalforge/models.py`：看样本、执行记录与评分记录的契约。
+3. `evalforge/runner.py`：看 run_experiment 的两个循环，然后看参数绑定。
+4. `evalforge/evaluators.py`：看任意评分返回值怎样统一。
+5. `evalforge/reporting.py` 与 `results/demo.json`：看结果关联与均分分母。
+6. `docs/phoenix-experiment-chain.md`：逐项对照原版实现。
+
+源码研究、取舍与开发验证记录见 [Phoenix 链路笔记](docs/phoenix-experiment-chain.md)。
