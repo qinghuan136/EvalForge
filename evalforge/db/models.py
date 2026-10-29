@@ -1,17 +1,25 @@
-"""ORM 基类；业务表在后续持久化阶段逐项加入。
+"""ORM 统一入口；导入后，17 张核心表全部注册到 Base.metadata。
 
-evalforge/models.py 继续保存 V0 的 dataclass 数据契约，不与 ORM 混用。
+内存数据契约继续位于 evalforge/models.py。不存在 Result / Runner 独立表。
 """
 
-from sqlalchemy import MetaData
-from sqlalchemy.orm import DeclarativeBase
+from .base import Base
+from .orm.datasets import Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion
+from .orm.evaluators import (
+    BuiltinEvaluator, CodeEvaluator, CodeEvaluatorVersion, DatasetEvaluators, Evaluator,
+    LLMEvaluator,
+)
+from .orm.experiments import (
+    Experiment, ExperimentDatasetExample, ExperimentRun, ExperimentRunAnnotation,
+)
+from .orm.jobs import (
+    ExperimentDatasetEvaluator, ExperimentEvalOnlyConfig, ExperimentJob, ExperimentPromptTask,
+)
 
-
-class Base(DeclarativeBase):
-    metadata = MetaData(naming_convention={
-        "ix": "ix_%(column_0_label)s",
-        "uq": "uq_%(table_name)s_%(column_0_name)s",
-        "ck": "ck_%(table_name)s_%(constraint_name)s",
-        "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
-        "pk": "pk_%(table_name)s",
-    })
+__all__ = [
+    "Base", "Dataset", "DatasetVersion", "DatasetExample", "DatasetExampleRevision",
+    "Experiment", "ExperimentDatasetExample", "ExperimentRun", "ExperimentRunAnnotation",
+    "Evaluator", "CodeEvaluator", "CodeEvaluatorVersion", "LLMEvaluator", "BuiltinEvaluator",
+    "DatasetEvaluators", "ExperimentJob", "ExperimentPromptTask", "ExperimentEvalOnlyConfig",
+    "ExperimentDatasetEvaluator",
+]

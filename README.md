@@ -4,10 +4,22 @@
 
 Python 3.11+。V0 离线实验执行仅使用标准库，无需启动 Phoenix、数据库或模型服务。
 项目已另外安装 PostgreSQL 基础设施（SQLAlchemy + asyncpg + Alembic），使用方式见 [数据库说明](docs/database.md)。
+数据字典中的 17 张核心表已实现 ORM，结构、外部依赖边界及迁移步骤见 [ORM 说明](docs/orm.md)。
 
 ## 运行
 
 在 EvalForge 项目根目录执行（PowerShell）：
+
+先看占位函数串起的标准流程（无需数据库）：
+
+```powershell
+.\.venv\Scripts\python.exe -m examples.run_pipeline
+```
+
+生成 `results/pipeline.json`：包含一次 Experiment、4 条 TaskRun、4 条 EvaluationRun 和摘要。
+占位 Task 透传输入，Evaluator 只返回 `placeholder` 标签；均分为 `null`，不代表质量评分。
+后续替换 `examples/run_pipeline.py` 中的两个普通函数即可，Runner 不需要改动。
+流程结构和源码阅读说明见 [内存执行流程](docs/runner-pipeline.md)。
 
 数据库相关命令和全部测试请使用项目的 `.venv` 解释器；V0 示例也可继续独立运行。
 
@@ -79,12 +91,14 @@ Task 返回值才叫 `output`。这不是对 Phoenix 数据集导出文件的直
 
 1. 预检所有函数签名，再拍下数据集快照。
 2. 顺序执行所有 Task，保留每条 input、expected、metadata、output、error。
-3. 对每条成功输出执行每个 Evaluator，以 example_id 关联样本与结果。
+3. 对每条成功输出执行每个 Evaluator，以 task_run_id 关联具体执行记录，以 example_id 找到样本。
 4. Task 失败时，其评分记录为 skipped；评分失败时仅记录当前 evaluator 的 error，继续其余评分。
 5. 数值平均分只统计成功的数值评分；0 分参与平均，错误、跳过、纯标签均不补 0。
 
 配置错误直接报错；普通 Task/Evaluator 异常写入实验报告；KeyboardInterrupt/SystemExit 继续向外传播。
-V0 没有超时、中断恢复、重试、异步或并发，也没有 UI、数据库、API、Agent 或 Tracing。
+每次调用创建独立的 Experiment ID；同名调用也代表两次评测。报告包含 `experiment` 对象，
+TaskRun 带 `experiment_id`，EvaluationRun 带 `task_run_id`。这些 ID 是内存记录的 UUID，和 ORM 主键分开。
+本地 Runner 没有超时、中断恢复、重试、异步、并发、UI、数据库访问、API、Agent 或 Tracing。
 
 ## 建议阅读顺序
 

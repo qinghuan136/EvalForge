@@ -89,7 +89,6 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.db.engine.dialect.name, "postgresql")
         self.assertEqual(self.db.engine.dialect.driver, "asyncpg")
         self.assertEqual(self.db.engine.pool.checkedout(), 0)
-        self.assertEqual(len(Base.metadata.tables), 0)
 
     async def test_transaction_context_creates_a_fresh_session_per_operation(self):
         async with self.db.transaction() as first:

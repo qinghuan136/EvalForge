@@ -65,7 +65,7 @@ Client.datasets.get_dataset(...)
 | 数据集与 Task 分离 | `models.py`、`dataset.py` | 本地 JSON 读取，预期值命名 expected，不含版本服务 |
 | 按函数签名绑定参数 | `runner.py` 的 `_prepare / _bind / _invoke` | 同步、固定参数名和单参回退，不引入完整反射适配体系 |
 | 输入、参考答案与输出隔离 | 每次绑定均 deepcopy；Task 输出保存副本 | 防止一个评分器修改下一评分器看到的数据 |
-| TaskRun 与评分记录分离 | `TaskRun / EvaluationRun / ExperimentResult` | 以 example_id 关联；每条样本只执行一次 |
+| TaskRun 与评分记录分离 | `TaskRun / EvaluationRun / ExperimentResult` | 以 task_run_id 关联执行记录，以 example_id 获取样本；每条样本只执行一次 |
 | 两阶段执行 | `run_experiment` 中 Task 循环与 Evaluator 循环 | 不加入通用执行器、重试、队列或并发 |
 | 评分返回值规范化 | `normalize_evaluation` | 保留常见单结果类型，不支持 Score SDK 对象、多结果列表 |
 | 错误作为结果的一部分 | task error、evaluation error、skipped | 不依赖服务端记录，也不把异常混成低分 |
@@ -73,6 +73,9 @@ Client.datasets.get_dataset(...)
 
 V0 是参照这些设计的本地精简改写，不是直接调用或原样移植 Phoenix Runner。
 没有 Phoenix import，也没有 arize 包依赖；不再复制 Phoenix 的 API、Tracing、生成类型和服务端配置。
+
+2026-10-29 补充了独立的内存 Experiment 对象、运行记录 ID 关联与占位函数入口，
+见 [内存执行流程](runner-pipeline.md)。数据库接入仍暂缓，以下验证表保留最初 V0 的历史结果。
 
 ## 4. 研究中遇到的问题与处理
 

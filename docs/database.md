@@ -1,6 +1,6 @@
 # PostgreSQL 基础设施
 
-本阶段准备连接能力，不启动 PostgreSQL，不创建业务表，不改变现有 V0 实验执行流程。
+已具备连接能力和 17 张核心表的 ORM 定义；当前不启动 PostgreSQL、不执行实际建表，不改变现有 V0 实验执行流程。
 
 ## 已提供的组件
 
@@ -81,13 +81,13 @@ Engine 和连接池应在同一个事件循环内使用并关闭，不要跨多�
 连接超时为 10 秒，SQL 命令超时为 30 秒；Task / Evaluator 执行应放在数据库事务外。
 这里只准备异步数据库访问，现有同步 Task 不需要因此改成 async。
 
-## 后续建表
+## ORM 与后续建表
 
-在 `evalforge/db/models.py` 中增加本项目 ORM 模型；现有 `evalforge/models.py` 继续保留 dataclass 契约。
-所有 ORM 模型须在 Alembic 加载 metadata 时被导入。然后在有连接的开发数据库上执行：
+17 张核心表的 ORM 已实现，统一从 `evalforge/db/models.py` 导入；现有 `evalforge/models.py` 继续保留 dataclass 契约。
+模型分组、继承和暂缓的外部外键见 [ORM 说明](orm.md)。Alembic 已能加载完整 metadata，在有连接的开发数据库上生成迁移：
 
 ```powershell
-.\.venv\Scripts\python.exe -m alembic revision --autogenerate -m "create dataset tables"
+.\.venv\Scripts\python.exe -m alembic revision --autogenerate -m "create core tables"
 # 检查生成的脚本后执行
 .\.venv\Scripts\python.exe -m alembic upgrade head
 ```
@@ -96,7 +96,7 @@ Engine 和连接池应在同一个事件循环内使用并关闭，不要跨多�
 实例未配置时，只能验证配置、驱动加载、会话管理及离线迁移；真实连接和数据库事务读写待实例就绪后验证。
 测试设置 `EVALFORGE_TEST_DATABASE_URL` 后会启用只读的 PostgreSQL 连接集成测试。
 
-## 本次验证
+## 数据库基础设施阶段验证（ORM 实现之前）
 
 - Python 3.12.14；SQLAlchemy 2.1.6、asyncpg 0.32.0、Alembic 1.20.1、python-dotenv 1.2.4。
 - `pip check` 通过，无依赖冲突。

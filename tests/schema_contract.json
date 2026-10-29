@@ -1,0 +1,168 @@
+{
+  "datasets": {
+    "id": false,
+    "name": false,
+    "description": true,
+    "metadata": false,
+    "created_at": false,
+    "updated_at": false,
+    "user_id": true
+  },
+  "dataset_versions": {
+    "id": false,
+    "dataset_id": false,
+    "description": true,
+    "metadata": false,
+    "created_at": false,
+    "user_id": true
+  },
+  "dataset_examples": {
+    "id": false,
+    "dataset_id": false,
+    "span_rowid": true,
+    "external_id": true,
+    "created_at": false
+  },
+  "dataset_example_revisions": {
+    "id": false,
+    "dataset_example_id": false,
+    "dataset_version_id": false,
+    "input": false,
+    "output": false,
+    "metadata": false,
+    "content_hash": true,
+    "revision_kind": false,
+    "created_at": false
+  },
+  "experiments": {
+    "id": false,
+    "dataset_id": false,
+    "dataset_version_id": false,
+    "name": false,
+    "description": true,
+    "repetitions": false,
+    "metadata": false,
+    "is_ephemeral": false,
+    "project_name": true,
+    "user_id": true,
+    "created_at": false,
+    "updated_at": false
+  },
+  "experiments_dataset_examples": {
+    "experiment_id": false,
+    "dataset_example_id": false,
+    "dataset_example_revision_id": false
+  },
+  "experiment_runs": {
+    "id": false,
+    "experiment_id": false,
+    "dataset_example_id": false,
+    "repetition_number": false,
+    "output": false,
+    "start_time": false,
+    "end_time": false,
+    "error": true,
+    "trace_id": true,
+    "prompt_token_count": true,
+    "completion_token_count": true
+  },
+  "experiment_run_annotations": {
+    "id": false,
+    "experiment_run_id": false,
+    "name": false,
+    "annotator_kind": false,
+    "score": true,
+    "label": true,
+    "explanation": true,
+    "error": true,
+    "metadata": false,
+    "trace_id": true,
+    "start_time": false,
+    "end_time": false
+  },
+  "evaluators": {
+    "id": false,
+    "kind": false,
+    "name": false,
+    "description": true,
+    "metadata": false,
+    "user_id": true,
+    "created_at": false
+  },
+  "code_evaluators": {
+    "id": false,
+    "kind": false,
+    "language": false,
+    "sandbox_config_id": true,
+    "input_mapping": false,
+    "output_configs": false,
+    "updated_at": false
+  },
+  "code_evaluator_code_versions": {
+    "id": false,
+    "code_evaluator_id": false,
+    "source_code": false,
+    "user_id": true,
+    "created_at": false
+  },
+  "llm_evaluators": {
+    "id": false,
+    "kind": false,
+    "prompt_id": false,
+    "prompt_version_tag_id": true,
+    "output_configs": false,
+    "updated_at": false
+  },
+  "builtin_evaluators": {
+    "id": false,
+    "kind": false,
+    "key": false,
+    "input_schema": false,
+    "output_configs": false,
+    "synced_at": false
+  },
+  "dataset_evaluators": {
+    "id": false,
+    "dataset_id": false,
+    "evaluator_id": false,
+    "name": false,
+    "description": true,
+    "input_mapping": false,
+    "output_configs": true,
+    "project_id": false,
+    "user_id": true,
+    "created_at": false,
+    "updated_at": false
+  },
+  "experiment_jobs": {
+    "id": false,
+    "type": false,
+    "status": false,
+    "claimed_at": true,
+    "claimed_by": true,
+    "cooldown_until": true,
+    "max_concurrency": false,
+    "created_at": false
+  },
+  "experiment_prompt_tasks": {
+    "id": false,
+    "type": false,
+    "model_provider": false,
+    "model_name": false,
+    "custom_provider_id": true,
+    "template_type": false,
+    "template_format": false,
+    "template": false,
+    "tools": true,
+    "response_format": true,
+    "invocation_parameters": false,
+    "connection": true,
+    "prompt_version_id": true,
+    "playground_config": true,
+    "stream_model_output": false
+  },
+  "experiment_dataset_evaluators": {
+    "experiment_id": false,
+    "dataset_evaluator_id": false
+  }
+}

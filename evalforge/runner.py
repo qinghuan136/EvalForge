@@ -11,7 +11,7 @@ from copy import deepcopy
 from typing import Any
 
 from .evaluators import normalize_evaluation
-from .models import Dataset, EvaluationRun, ExperimentResult, TaskRun
+from .models import Dataset, EvaluationRun, Experiment, ExperimentResult, TaskRun
 
 _TASK_PARAMS = {"input", "expected", "reference", "metadata", "example"}
 _EVAL_PARAMS = _TASK_PARAMS | {"output"}
@@ -69,6 +69,8 @@ def run_experiment(
     *, dataset: Dataset, task: Callable[..., Any],
     evaluators: Mapping[str, Callable[..., Any]], experiment_name: str = "experiment",
 ) -> ExperimentResult:
+    if not isinstance(experiment_name, str) or not experiment_name.strip():
+        raise ValueError("Experiment name must be a non-empty string")
     task_signature = _prepare(task, _TASK_PARAMS, "input")
     if not evaluators:
         raise ValueError("At least one evaluator is required")
@@ -81,6 +83,13 @@ def run_experiment(
     # 拍下本次实验的样本快照；回调拿到各自独立的副本。
     examples = deepcopy(dataset.examples)
     examples_by_id = {example.id: example for example in examples}
+    experiment = Experiment(
+        name=experiment_name, dataset_name=dataset.name,
+        task_name=getattr(task, "__name__", type(task).__name__),
+        evaluator_names=tuple(name for name, _, _ in evaluation_functions),
+    )
+
+    # 第一阶段：执行 Task。一次调用创建一个新的 Experiment。
     task_runs = []
     for example in examples:
         context = {
@@ -98,8 +107,10 @@ def run_experiment(
         task_runs.append(TaskRun(
             example.id, deepcopy(example.input), deepcopy(example.expected),
             deepcopy(example.metadata), output, error,
+            experiment_id=experiment.id,
         ))
 
+    # 第二阶段：评分关联具体 TaskRun；example_id 用来取该样本的参考答案。
     evaluation_runs = []
     for run in task_runs:
         example = examples_by_id[run.example_id]
@@ -110,14 +121,19 @@ def run_experiment(
         }
         for name, evaluator, signature in evaluation_functions:
             if run.error is not None:
-                evaluation_runs.append(EvaluationRun(run.example_id, name, "skipped"))
+                evaluation_runs.append(EvaluationRun(
+                    run.example_id, name, "skipped", task_run_id=run.id,
+                ))
                 continue
             try:
                 value = _invoke(evaluator, signature, context, "output")
                 result = normalize_evaluation(value)
-                evaluation_runs.append(EvaluationRun(run.example_id, name, "ok", result))
+                evaluation_runs.append(EvaluationRun(
+                    run.example_id, name, "ok", result, task_run_id=run.id,
+                ))
             except Exception as exc:
                 evaluation_runs.append(EvaluationRun(
                     run.example_id, name, "error", error=f"{type(exc).__name__}: {exc}",
+                    task_run_id=run.id,
                 ))
-    return ExperimentResult(experiment_name, dataset.name, task_runs, evaluation_runs)
+    return ExperimentResult(experiment, task_runs, evaluation_runs)
