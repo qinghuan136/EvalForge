@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "evalforge-client"
+version = "0.1.0"
+description = "EvalForge local Runner: WebSocket transport and bidirectional JSON-RPC"
+requires-python = ">=3.11"
+dependencies = [
+    "websockets>=15,<18",
+    "jsonrpcserver>=5.0.9,<6",
+    "jsonrpcclient>=4.0.3,<5",
+    "aiosqlite>=0.22.1,<1",
+]
+
+[tool.setuptools.packages.find]
+include = ["evalforge_client*"]

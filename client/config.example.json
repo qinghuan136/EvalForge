@@ -1,0 +1,9 @@
+{
+  "cloud_url": "wss://evalforge.example.com/runner",
+  "runner_id": "runner-01",
+  "token_env": "EVALFORGE_RUNNER_TOKEN",
+  "state_path": "state/runner.sqlite3",
+  "targets": {
+    "order-agent": {"url": "http://127.0.0.1:8001/invoke"}
+  }
+}

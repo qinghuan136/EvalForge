@@ -6,6 +6,9 @@ Python 3.11+。V0 离线实验执行仅使用标准库，无需启动 Phoenix、
 项目已另外安装 PostgreSQL 基础设施（SQLAlchemy + asyncpg + Alembic），使用方式见 [数据库说明](docs/database.md)。
 数据字典中的 17 张核心表已实现 ORM，结构、外部依赖边界及迁移步骤见 [ORM 说明](docs/orm.md)。
 
+独立的本地客户端位于 [client/](client/README.md)，已实现 WebSocket 传输、双向 JSON-RPC 和本地 SQLite 存储基础层，
+单独安装依赖。会话、Job 与 Agent HTTP 调用层仍待接入。
+
 ## 运行
 
 在 EvalForge 项目根目录执行（PowerShell）：
