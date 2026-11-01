@@ -6,7 +6,7 @@
 - **认证**：WSS 连接时校验 Runner 凭据；`runner_id` 必须与认证身份一致。`runner.hello` 不替代鉴权。
 - **执行边界**：Cloud 负责任务调度、状态和评测；Runner 仅调用本地预配置的目标 HTTP API，并回传原始响应。**Dataset 的参考输出（expected output）留在云端**。
 - **V1 限制**：一个 Runner 同时执行一个 Job；一个 Job 对应一条 Dataset Example。云端不得下发任意本地 URL 或 Shell 命令。
-- **标识**：`runner_id`（设备）、`session_id`（连接会话）、`job_id`（任务）、`attempt_id`（执行尝试）、`target_id`（本地目标）、`example_id`（样本）。JSON-RPC `id` 仅关联一次请求/响应，**不是 Job ID**。
+- **标识**：`runner_id`（设备）、`session_id`（连接会话）、`job_id`（任务）、`attempt_id`（执行尝试）、`agent_target_id`（本地 Agent 目标）、`example_id`（样本）。JSON-RPC `id` 仅关联一次请求/响应，**不是 Job ID**。
 
 所有需要确认的操作采用 JSON-RPC **Request/Response**（含 `id`）；允许丢失的进度事件可采用 **Notification**（无 `id`）。
 
@@ -34,7 +34,7 @@
 ### 2.2 `jobs.dispatch`
 
 ```json
-{"jsonrpc":"2.0","method":"jobs.dispatch","params":{"job_id":"job-01","attempt_id":"a-01","target_id":"order-agent","example_id":"ex-01","input":{"message":"查询订单1024"},"timeout_seconds":60},"id":2}
+{"jsonrpc":"2.0","method":"jobs.dispatch","params":{"job_id":"job-01","attempt_id":"a-01","agent_target_id":"order-agent","example_id":"ex-01","input":{"message":"查询订单1024"},"timeout_seconds":60},"id":2}
 ```
 
 ```json
@@ -42,7 +42,7 @@
 ```
 
 - `accepted=true` 仅表示 Runner 已接收该尝试，**不代表执行成功**。
-- Runner 若繁忙或未配置 `target_id`，返回 `accepted=false`，`reason` 可为 `busy` / `target_not_found`；Cloud 负责重新调度。
+- Runner 若繁忙或未配置 `agent_target_id`，返回 `accepted=false`，`reason` 可为 `busy` / `target_not_found`；Cloud 负责重新调度。尚未完成同步时返回 `not_ready`；未接入执行层时返回 `executor_unavailable`。
 - `input` **原样作为目标 HTTP JSON 请求体**；目标 URL、鉴权等由 Runner 的本地配置决定。
 
 ### 2.3 `jobs.started`
@@ -93,7 +93,11 @@
 {"jsonrpc":"2.0","result":{"jobs":[{"job_id":"job-01","attempt_id":"a-01","action":"continue"}]},"id":6}
 ```
 
-- `action`：`continue`（允许继续）、`cancel`（停止）、`discard`（本次尝试失效）、`retry_upload`（重传本地待确认结果）。
+- 当前 `action`：`continue`（允许继续）、`cancel`（请求停止）、`retry_upload`（重传本地待确认结果）；`discard` 暂不实现。
+- `active_jobs` 上报本地 `accepted / running / unknown` 状态；`unknown` 不能用 `continue` 触发重执行。客户端进程启动把遗留 running 转为 unknown，网络重连不会自动改变执行状态。
+- `pending_results` 为保存的完整 `jobs.complete` 业务参数列表，不含 JSON-RPC 封装。Cloud 须对快照中每个 Attempt 返回一条指令；历史待确认结果须明确返回 retry_upload，云端即使已存结果，也可幂等接收后重新确认。
+- 客户端完整校验指令后应用；遗漏、重复、未知 ID、不支持动作或状态冲突使本轮同步失败。快照后新增的最终结果等 ready 后按正常流程上报，不需要再次 sync。
+- hello 的 status=ready 仅表示握手通过；客户端完成 sync 才进入会话 ready。同步完成与执行容量是否空闲分开判断；当前未接入 JobManager 时 capabilities 为空，仍拒绝派发。
 - 重连后先 `runner.hello` 再 `runner.sync`，完成同步后再接受新 Job。
 - 同一 Runner 的新会话接管旧会话；旧连接不可继续派发或上报不属于它的尝试。
 

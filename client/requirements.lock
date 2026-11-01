@@ -1,4 +1,6 @@
 aiosqlite==0.22.1
+greenlet==3.5.6
+SQLAlchemy==2.1.6
 attrs==26.1.0
 jsonrpcclient==4.0.3
 jsonrpcserver==5.0.9
