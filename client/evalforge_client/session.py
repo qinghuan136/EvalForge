@@ -8,7 +8,7 @@ from . import __version__
 from .attempts import AttemptRepository
 from .config import ClientConfig
 from .models import RunnerAttempt, TERMINAL_STATUSES
-from .rpc import JsonRpcPeer
+from .rpc import JsonRpcPeer, RpcError
 
 logger = logging.getLogger(__name__)
 
@@ -18,12 +18,12 @@ class SessionError(RuntimeError):
 
 
 class SessionJobs(Protocol):
-    """后续 JobManager 接口；其执行任务必须独立于连接生命周期。"""
+    """JobManager 接口；其执行及取消任务独立于连接生命周期。"""
     capabilities: list[str]
 
     async def dispatch(self, params: dict) -> dict: ...
     async def resume(self, attempt: RunnerAttempt) -> None: ...
-    async def cancel(self, attempt: RunnerAttempt) -> None: ...
+    async def cancel(self, attempt: RunnerAttempt, reason: str | None = None) -> None: ...
 
 
 class RunnerSession:
@@ -41,14 +41,15 @@ class RunnerSession:
             return {"accepted": False, "reason": "not_ready"}
         if self.jobs is None:
             return {"accepted": False, "reason": "executor_unavailable"}
-        if await self.attempts.list_unresolved():
-            return {"accepted": False, "reason": "busy"}
-        # JobManager 仍须原子管理容量，并在持久化接收后返回。
+        # 去重必须先于 busy 判断；JobManager 原子管理容量并持久化接收。
         return await self.jobs.dispatch(params)
 
     async def _cancel(self, job_id: str, attempt_id: str, reason: str | None = None):
         if not self.ready:
             return {"accepted": False, "reason": "not_ready"}
+        if (any(not isinstance(value, str) or not value.strip() for value in (job_id, attempt_id))
+                or (reason is not None and not isinstance(reason, str))):
+            raise RpcError(-32602, "Invalid cancellation params")
         row = await self.attempts.get(job_id, attempt_id)
         if row is None:
             return {"accepted": False, "reason": "attempt_not_found"}
@@ -56,6 +57,10 @@ class RunnerSession:
         return {"accepted": True}
 
     async def _apply_cancel(self, row, reason=None):
+        if self.jobs is not None:
+            await self.jobs.cancel(row, reason)
+            return
+        # 未注入执行器的独立会话仍允许处理已有 accepted/unknown 记录。
         row = await self.attempts.request_cancel(row.job_id, row.attempt_id, reason)
         if row.execution_status == "accepted":
             await self.attempts.finish(row.job_id, row.attempt_id, {
@@ -63,8 +68,6 @@ class RunnerSession:
                 "output": None, "duration_ms": 0, "http_status": None,
                 "error": {"code": "cancelled", "message": "Cancelled before Agent invocation"},
             })
-        elif row.execution_status == "running" and self.jobs is not None:
-            await self.jobs.cancel(row)
         # unknown 保留未知事实和取消意图，不伪造远端已停止。
 
     async def run(self, peer: JsonRpcPeer):
@@ -106,7 +109,9 @@ class RunnerSession:
                     await self.jobs.resume(row)
             self.phase = "ready"
             logger.info("Runner session ready")
-            await self._serve_ready(peer, historical)
+            # sync 已报告这些任务的执行状态，不必再重复发送 started。
+            reported_started = {key for key, row in snapshot.items() if row.started_at is not None}
+            await self._serve_ready(peer, historical, reported_started)
         finally:
             self.phase, self.session_id = "disconnected", None
 
@@ -142,15 +147,28 @@ class RunnerSession:
             raise SessionError("Result was not acknowledged")
         await self.attempts.acknowledge(row.job_id, row.attempt_id)
 
-    async def _serve_ready(self, peer, historical):
-        async def upload_new_results():
+    async def _serve_ready(self, peer, historical, reported_started):
+        async def report_execution():
             while True:
-                for row in await self.attempts.list_pending_results():
-                    if (row.job_id, row.attempt_id) not in historical:
+                active, pending = await self.attempts.sync_snapshot()
+                for row in active + pending:
+                    key = (row.job_id, row.attempt_id)
+                    if key in historical:
+                        continue
+                    if row.started_at is not None and key not in reported_started:
+                        ack = await peer.call("jobs.started", {
+                            "job_id": row.job_id, "attempt_id": row.attempt_id,
+                        }, timeout=self.config.rpc_timeout)
+                        if not isinstance(ack, dict) or ack.get("acknowledged") is not True:
+                            raise SessionError("Execution start was not acknowledged")
+                        reported_started.add(key)
+                    if row.delivery_status == "pending":
                         await self._upload(peer, row)
+                # 仅保留仍占用同步快照的 ID，长连接不会累计所有历史任务。
+                reported_started.intersection_update((r.job_id, r.attempt_id) for r in active + pending)
                 await asyncio.sleep(0.5)
 
-        tasks = [asyncio.create_task(peer.wait_closed()), asyncio.create_task(upload_new_results())]
+        tasks = [asyncio.create_task(peer.wait_closed()), asyncio.create_task(report_execution())]
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:

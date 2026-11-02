@@ -5,9 +5,9 @@ import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from .transport import WebSocketTransport
+from .targets import AgentTarget
 
 
 @dataclass(frozen=True)
@@ -34,13 +34,7 @@ class ClientConfig:
         for name, target in self.targets.items():
             if not isinstance(name, str) or not name.strip() or not isinstance(target, dict):
                 raise ValueError("Invalid Agent target configuration")
-            try:
-                url = urlsplit(target.get("url", ""))
-                port = url.port
-                if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password or url.fragment or port == 0:
-                    raise ValueError()
-            except (ValueError, TypeError):
-                raise ValueError("Invalid Agent target URL") from None
+            AgentTarget.from_config(target)
         self.transport()  # 复用传输层的 WSS、凭据及 URL 校验。
 
     def transport(self) -> WebSocketTransport:

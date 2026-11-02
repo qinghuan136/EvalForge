@@ -7,7 +7,7 @@ Python 3.11+。V0 离线实验执行仅使用标准库，无需启动 Phoenix、
 数据字典中的 17 张核心表已实现 ORM，结构、外部依赖边界及迁移步骤见 [ORM 说明](docs/orm.md)。
 
 独立的本地客户端位于 [client/](client/README.md)，已实现 WebSocket 传输、双向 JSON-RPC 和本地 SQLite 存储基础层，
-单独安装依赖。会话、Job 与 Agent HTTP 调用层仍待接入。
+单独安装依赖。已接通会话同步、单 Job HTTP 执行、结果持久化与确认上报，见 [Job 执行链路](docs/client/Job执行层核心链路.md)。
 
 ## 运行
 

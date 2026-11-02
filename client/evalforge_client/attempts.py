@@ -74,7 +74,7 @@ class AttemptRepository:
             raise ValueError("Cancellation reason must be a string or None")
         async with self.database.session() as session:
             row = await self._require(session, job_id, attempt_id)
-            if row.execution_status in TERMINAL_STATUSES:
+            if row.execution_status in TERMINAL_STATUSES or row.cancel_requested:
                 return row
             row.cancel_requested, row.cancel_reason, row.updated_at = 1, reason, utc_now()
             return row

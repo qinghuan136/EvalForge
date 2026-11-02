@@ -42,6 +42,7 @@
 ```
 
 - `accepted=true` 仅表示 Runner 已接收该尝试，**不代表执行成功**。
+- Runner 先持久化再确认接单。同一 job_id + attempt_id 的相同参数重复派发正常确认且不重复执行；参数不一致返回 accepted=false、reason=attempt_conflict。先去重，再判断容量。
 - Runner 若繁忙或未配置 `agent_target_id`，返回 `accepted=false`，`reason` 可为 `busy` / `target_not_found`；Cloud 负责重新调度。尚未完成同步时返回 `not_ready`；未接入执行层时返回 `executor_unavailable`。
 - `input` **原样作为目标 HTTP JSON 请求体**；目标 URL、鉴权等由 Runner 的本地配置决定。
 
@@ -65,8 +66,9 @@
 {"jsonrpc":"2.0","result":{"accepted":true},"id":4}
 ```
 
-- `accepted=true` 仅表示已接收取消指令；最终需通过 `jobs.complete(status="cancelled")` 报告。
+- `accepted=true` 仅表示取消请求已接收并持久化。取消生效后通过 `jobs.complete(status="cancelled")` 报告；若已有执行结果则保留原结果，unknown 仅保留取消意图。
 - 取消是**尽力而为**：可停止后续执行、尝试中止当前 HTTP 等待，但不能保证目标 Agent 已停止或撤销副作用。
+- 当前实现只停止客户端 HTTP 等待，不调用 Agent 取消接口。重复取消幂等；已获得响应后继续完成结果落盘，迟到取消不覆盖原结果。
 
 ### 2.5 `jobs.complete`
 
@@ -97,7 +99,7 @@
 - `active_jobs` 上报本地 `accepted / running / unknown` 状态；`unknown` 不能用 `continue` 触发重执行。客户端进程启动把遗留 running 转为 unknown，网络重连不会自动改变执行状态。
 - `pending_results` 为保存的完整 `jobs.complete` 业务参数列表，不含 JSON-RPC 封装。Cloud 须对快照中每个 Attempt 返回一条指令；历史待确认结果须明确返回 retry_upload，云端即使已存结果，也可幂等接收后重新确认。
 - 客户端完整校验指令后应用；遗漏、重复、未知 ID、不支持动作或状态冲突使本轮同步失败。快照后新增的最终结果等 ready 后按正常流程上报，不需要再次 sync。
-- hello 的 status=ready 仅表示握手通过；客户端完成 sync 才进入会话 ready。同步完成与执行容量是否空闲分开判断；当前未接入 JobManager 时 capabilities 为空，仍拒绝派发。
+- hello 的 status=ready 仅表示握手通过；客户端完成 sync 才进入会话 ready。同步完成与执行容量是否空闲分开判断；默认入口已接入单 Job HTTP 执行层并声明 http_json，未注入执行层的独立会话 capabilities 为空并拒绝派发。
 - 重连后先 `runner.hello` 再 `runner.sync`，完成同步后再接受新 Job。
 - 同一 Runner 的新会话接管旧会话；旧连接不可继续派发或上报不属于它的尝试。
 

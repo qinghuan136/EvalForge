@@ -2,7 +2,7 @@
 
 独立安装的本地 Runner。当前实现 **WebSocket 传输层 + 双向 JSON-RPC 2.0 层 + SQLite 异步 ORM 与 Attempt 仓储**。
 协议依据：[V1 草案](../docs/EvalForge_Runner_JSON-RPC_Protocol_v1.md)。
-Python 3.11+，直接依赖 `websockets`、`jsonrpcserver`、`jsonrpcclient`、`aiosqlite`、`SQLAlchemy[asyncio]`，
+Python 3.11+，直接依赖 `websockets`、`jsonrpcserver`、`jsonrpcclient`、`aiosqlite`、`SQLAlchemy[asyncio]`、`httpx`，
 使用本地 SQLite 文件；ORM 模型独立于平台 PostgreSQL 模型，不需要外部数据库服务。完整依赖版本记录在 `requirements.lock`。
 
 ## 安装与验证
@@ -21,7 +21,8 @@ python -m venv .venv
 最终打印相同的中文 JSON 数据；退出时关闭双方连接。它验证通信两层，不模拟 Job 执行。
 
 `python -m evalforge_client` 已提供配置加载、启动恢复、连接和 hello/sync 链路。
-会话 ready 后仍不执行评测：JobManager 和 Agent HTTP 调用尚未实现，派发返回 `executor_unavailable`，hello 的 capabilities 暂为空。
+会话 ready 后可以接收单个 Job，调用本地 HTTP Agent，保存结果并上报确认；hello 声明 `http_json` 能力。
+完整流程见 [Job 执行层核心链路](../docs/client/Job执行层核心链路.md)。已补齐本地 HTTP 等待取消、取消竞态与断线/重启恢复，见 [取消与恢复](../docs/client/取消与恢复.md)。
 
 ## 启动客户端
 
@@ -48,13 +49,17 @@ $env:EVALFORGE_RUNNER_TOKEN = "你的 Runner 凭据"
 | `app.py`、`config.py` | 已实现：配置读取、进程恢复、组件生命周期、连接循环和退出 |
 | `models.py` | 已实现：17 字段的 RunnerAttempt ORM、JSON 转换、状态和一致性约束 |
 | `database.py`、`attempts.py` | 已实现：异步 Session、版本化建表、Attempt 仓储 |
-| `session.py` | 已实现：hello/sync、响应校验、接单门禁和结果上传；通过 SessionJobs 接口衔接后续执行层 |
+| `session.py` | 已实现：hello/sync、接单门禁、started/complete 通知与 ACK |
 | `store.py` | 保留原生 SQL 接口：SQLite 文件连接、事务、关闭 |
-| `job_manager.py`、`http_executor.py` | 占位：Job 执行、Agent HTTP 调用 |
+| `job_manager.py` | 单 Job 容量、派发去重、持久化接收、HTTP 执行与结果保存 |
+| `http_executor.py`、`targets.py` | 已实现：单次 HTTP Agent 调用、本地目标和请求头校验 |
 | `config.example.json` | 可加载的配置示例；凭据从指定环境变量读取 |
 | `tests/test_rpc.py`、`test_transport.py`、`test_store.py`、`test_database.py` | 通信、本地存储与 ORM 仓储测试 |
 | `tests/test_session.py` | 会话、结果补交、同步期间完成和真实回环重连测试 |
-| `tests/test_job_lifecycle.py`、`test_recovery.py` | 完整 Job 执行及恢复的后续测试位置，仅含占位说明 |
+| `tests/test_http_executor.py` | HTTP 输入输出、错误、超时、取消、隔离与真实回环调用 |
+| `tests/test_job_lifecycle.py` | 单 Job、去重、busy、失败持久化及 WebSocket + HTTP 端到端测试 |
+| `tests/test_cancellation.py` | 执行前/执行中取消、完成竞态、清理幂等及真实 HTTP 连接关闭 |
+| `tests/test_recovery.py` | 断线继续、同步取消、重启恢复与 ACK 丢失重传，含真实 WebSocket + HTTP |
 
 ## 传输层
 
@@ -186,9 +191,9 @@ async with ClientDatabase("state/runner.sqlite3") as database:
 - `ClientDatabase.session()` 提供 SQLAlchemy `AsyncSession`，成功提交、异常回滚；每个块独立会话，事务串行，使用 `BEGIN IMMEDIATE`。不要嵌套会话、手动提交或在事务中等待网络。
 - `RunnerAttempt.input_json/result_json` 在 Python 中为 JSON 值，在磁盘中为 TEXT；非字符串对象键和非有限数会被拒绝。直接修改已加载 JSON 时需整体重新赋值。
 - `accept()` 幂等保存派发，相同 ID 参数不一致抛出 `AttemptConflict`；对象键顺序不影响比较。返回值是已提交、脱离会话的 ORM 对象，修改它不会自动写回。
-- `claim()` 在 `accepted` 且无取消意图时条件更新为 `running`；只有返回 True 才取得执行权，之后才能调用 Agent。不同 Attempt 之间的单任务容量由后续 JobManager 管理。
-- `request_cancel()` 仅保存意图；`finish()` 原子保存终态与待确认结果，最终结果不可被仓储重写；`acknowledge()` 仅在收到云端确认后调用。
-- `recover_interrupted()` 显式将遗留 `running` 转为 `unknown`；app 只在启动时调用一次，不能用于普通重连。进程锁暂记 TODO，当前依赖单进程使用约定；HTTP 执行尚未接入。
+- `claim()` 在 `accepted` 且无取消意图时条件更新为 `running`；只有返回 True 才取得执行权，之后才能调用 Agent。不同 Attempt 之间的单任务容量由 JobManager 管理。
+- `request_cancel()` 仅保存首次取消意图及原因；JobManager 负责停止 HTTP 等待。`finish()` 原子保存终态与待确认结果，最终结果不可被仓储重写；`acknowledge()` 仅在收到云端确认后调用。
+- `recover_interrupted()` 显式将遗留 `running` 转为 `unknown`；app 只在启动时调用一次，不能用于普通重连。进程锁暂记 TODO，当前依赖单进程使用约定。
 - `list_unresolved()` 和 `list_pending_results()` 为后续同步提供数据，不自动重传或重执行。
 
 ## 会话与同步规则
@@ -202,7 +207,7 @@ async with ClientDatabase("state/runner.sqlite3") as database:
 - 快照生成后新增的结果在 ready 后按正常流程上报。上传器 ready 后立即检查，随后每 0.5 秒检查 SQLite，避免只依赖内存通知而遗漏；无需再次 sync。
 - 应用同步指令前重新读本地状态；已完成任务不会被旧的 continue/cancel 指令改回执行中。
 - SessionJobs 的 resume/cancel 必须快速交给独立 JobManager，不能把 Agent 执行挂在连接处理协程中。数据库和 jobs 对象跨连接保留。
-- 没有接入执行层时仍可建立 ready 会话并同步存量记录，但拒绝派发；接入后仍检查未解决 Attempt，容量竞争最终由 JobManager 管理。
+- 默认入口已接入 JobManager；会话先检查 ready，JobManager 先识别重复派发，再原子检查容量和未解决 Attempt。新任务繁忙时返回 busy，不落盘排队。
 
 后续事项见 [客户端 TODO](../docs/client/TODO.md)。
 
