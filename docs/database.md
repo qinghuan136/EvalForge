@@ -1,6 +1,6 @@
 # PostgreSQL 基础设施
 
-已具备连接能力和 17 张核心表的 ORM 定义；当前不启动 PostgreSQL、不执行实际建表，不改变现有 V0 实验执行流程。
+已具备连接能力和 21 张表的 ORM 定义（含停用保留的旧配置）；身份与凭证设计见 [鉴权数据结构](auth-schema.md)。当前不启动 PostgreSQL、不执行实际建表，不改变现有 V0 实验执行流程。
 
 ## 已提供的组件
 
@@ -83,7 +83,7 @@ Engine 和连接池应在同一个事件循环内使用并关闭，不要跨多�
 
 ## ORM 与后续建表
 
-17 张核心表的 ORM 已实现，统一从 `evalforge/db/models.py` 导入；现有 `evalforge/models.py` 继续保留 dataclass 契约。
+18 张表的 ORM 已实现，统一从 `evalforge/db/models.py` 导入；现有 `evalforge/models.py` 继续保留 dataclass 契约。
 模型分组、继承和暂缓的外部外键见 [ORM 说明](orm.md)。Alembic 已能加载完整 metadata，在有连接的开发数据库上生成迁移：
 
 ```powershell

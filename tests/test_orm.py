@@ -36,9 +36,15 @@ class SchemaContractTests(unittest.TestCase):
         for table in Base.metadata.tables.values():
             for foreign_key in table.foreign_keys:
                 self.assertIn(foreign_key.column.table.name, Base.metadata.tables)
-                self.assertEqual(foreign_key.ondelete, "CASCADE")
-        self.assertEqual(len(Base.metadata.sorted_tables), 17)
-        for name in ("users", "spans", "prompts", "projects", "sandbox_configs", "languages"):
+                expected = {
+                    ("runners", "owner_user_id"): "RESTRICT",
+                    ("runner_credentials", "runner_id"): "RESTRICT",
+                    ("runner_attempts", "runner_id"): "RESTRICT",
+                    ("experiments", "user_id"): "SET NULL",
+                }.get((table.name, foreign_key.parent.name), "CASCADE")
+                self.assertEqual(foreign_key.ondelete, expected)
+        self.assertEqual(len(Base.metadata.sorted_tables), 21)
+        for name in ("spans", "prompts", "projects", "sandbox_configs", "languages"):
             self.assertNotIn(name, Base.metadata.tables)
         self.assertEqual(Dataset.__table__.c.user_id.info["deferred_foreign_key"]["target"], "users.id")
         self.assertFalse(Dataset.__table__.c.user_id.foreign_keys)
@@ -90,7 +96,7 @@ class PersistenceTests(unittest.TestCase):
         ))
         run = ExperimentRun(
             experiment=experiment, dataset_example=example, repetition_number=1,
-            output={"task_output": None}, start_time=NOW, end_time=NOW + timedelta(milliseconds=150),
+            status="succeeded", output={"task_output": None}, start_time=NOW, end_time=NOW + timedelta(milliseconds=150),
         )
         run.annotations.append(ExperimentRunAnnotation(
             name="correctness", annotator_kind="CODE", score=0, label="wrong",
@@ -121,7 +127,7 @@ class PersistenceTests(unittest.TestCase):
         with Session(self.engine) as session:
             session.add(ExperimentRun(
                 experiment_id=experiment_id, dataset_example_id=example_id, repetition_number=1,
-                output={"task_output": "duplicate"}, start_time=NOW, end_time=NOW,
+                status="succeeded", output={"task_output": "duplicate"}, start_time=NOW, end_time=NOW,
             ))
             with self.assertRaises(IntegrityError):
                 session.commit()

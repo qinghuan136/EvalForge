@@ -1,6 +1,7 @@
 """WSS 文本传输；每次重连交出新连接，不恢复会话或重放业务消息。"""
 
 import asyncio
+import logging
 import math
 import random
 import ssl
@@ -11,6 +12,8 @@ from urllib.parse import urlsplit
 
 from websockets.asyncio.client import ClientConnection, connect, process_exception
 from websockets.exceptions import ConnectionClosed
+
+logger = logging.getLogger(__name__)
 
 
 class TransportClosed(ConnectionError):
@@ -96,6 +99,7 @@ class WebSocketTransport:
             raise ValueError("reconnect_max must be >= reconnect_min")
 
     async def _connect(self) -> WebSocketConnection:
+        logger.info("Connecting to Cloud")
         headers = {"Authorization": f"Bearer {self.bearer_token}"} if self.bearer_token else None
         try:
             socket = await connect(
@@ -111,7 +115,10 @@ class WebSocketTransport:
                 and process_exception(exc) is None
             )
             # 不把可能含 URL / 凭据的底层异常带到调用者或日志。
+            logger.log(logging.WARNING if retryable else logging.ERROR,
+                       "Cloud connection failed retryable=%s error_type=%s", retryable, type(exc).__name__)
             raise ConnectionFailed(retryable=retryable) from None
+        logger.info("Cloud connection established")
         return WebSocketConnection(socket)
 
     @asynccontextmanager
@@ -130,6 +137,7 @@ class WebSocketTransport:
         关闭迭代器，确保当前 socket 立即关闭。认证等永久握手失败直接抛出。
         """
         delay = self.reconnect_min
+        retries = 0
         while True:
             try:
                 connection = await self._connect()
@@ -142,7 +150,12 @@ class WebSocketTransport:
                     yield connection
                 finally:
                     await connection.close()
+                    logger.info("Cloud connection closed")
                 if asyncio.get_running_loop().time() - started >= self.stable_after:
                     delay = self.reconnect_min
-            await asyncio.sleep(random.uniform(delay / 2, delay))
+                    retries = 0
+            retries += 1
+            wait_seconds = random.uniform(delay / 2, delay)
+            logger.info("Cloud reconnect scheduled attempt=%d delay_seconds=%.2f", retries, wait_seconds)
+            await asyncio.sleep(wait_seconds)
             delay = min(self.reconnect_max, delay * 2)

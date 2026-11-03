@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+from functools import partial
 from time import monotonic
 
 from .attempts import AttemptConflict, AttemptRepository
@@ -34,6 +35,7 @@ class JobManager:
         return self
 
     async def __aexit__(self, *exc) -> None:
+        logger.info("JobManager stopping active=%s", self._running())
         async with self._lock:
             self._closed = True
             self._stop_http_wait()
@@ -42,6 +44,7 @@ class JobManager:
         if self._task is not None:
             tasks.append(self._task)
         await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info("JobManager stopped")
         # 退出不伪造业务取消结果；遗留 running 由下次进程启动转成 unknown。
 
     @staticmethod
@@ -66,6 +69,8 @@ class JobManager:
         values = self._parameters(params)
         async with self._lock:
             if self._closed or self._failed:
+                logger.warning("Dispatch rejected job_id=%r attempt_id=%r reason=executor_unavailable",
+                               values["job_id"], values["attempt_id"])
                 return {"accepted": False, "reason": "executor_unavailable"}
             row = await self.attempts.get(values["job_id"], values["attempt_id"])
             if row is not None:
@@ -73,15 +78,25 @@ class JobManager:
                 try:
                     row = await self.attempts.accept(**values)
                 except AttemptConflict:
+                    logger.warning("Dispatch rejected job_id=%r attempt_id=%r reason=attempt_conflict",
+                                   row.job_id, row.attempt_id)
                     return {"accepted": False, "reason": "attempt_conflict"}
                 if row.execution_status == "accepted":
                     self._schedule(row)
+                logger.debug("Duplicate dispatch confirmed job_id=%r attempt_id=%r status=%s",
+                             row.job_id, row.attempt_id, row.execution_status)
                 return {"accepted": True}
             if not self.executor.has_target(values["agent_target_id"]):
+                logger.warning("Dispatch rejected job_id=%r attempt_id=%r agent_target_id=%r reason=target_not_found",
+                               values["job_id"], values["attempt_id"], values["agent_target_id"])
                 return {"accepted": False, "reason": "target_not_found"}
             if self._running() or await self.attempts.list_unresolved():
+                logger.debug("Dispatch rejected job_id=%r attempt_id=%r reason=busy",
+                             values["job_id"], values["attempt_id"])
                 return {"accepted": False, "reason": "busy"}
             row = await self.attempts.accept(**values)
+            logger.info("Job accepted job_id=%r attempt_id=%r agent_target_id=%r",
+                        row.job_id, row.attempt_id, row.agent_target_id)
             self._schedule(row)
             return {"accepted": True}  # 此时 accepted 已提交，不等待 HTTP 执行。
 
@@ -96,13 +111,15 @@ class JobManager:
             return
         self._key = key
         self._task = asyncio.create_task(self._execute(row), name="evalforge-job")
-        self._task.add_done_callback(self._execution_done)
+        self._task.add_done_callback(partial(self._execution_done, key=key))
 
-    def _execution_done(self, task: asyncio.Task) -> None:
-        failed = not self._closed if task.cancelled() else task.exception() is not None
+    def _execution_done(self, task: asyncio.Task, *, key: tuple[str, str]) -> None:
+        error = None if task.cancelled() else task.exception()
+        failed = not self._closed if task.cancelled() else error is not None
         if failed:
             self._failed = True
-            logger.error("Job control failed; new dispatches are disabled")
+            logger.error("Job control failed; new dispatches disabled job_id=%r attempt_id=%r error_type=%s",
+                         *key, "CancelledError" if task.cancelled() else type(error).__name__)
 
     async def _execute(self, row: RunnerAttempt) -> None:
         async with self._lock:
@@ -113,7 +130,11 @@ class JobManager:
                 await self._finish_cancelled(row)
                 return
             if not await self.attempts.claim(row.job_id, row.attempt_id):
+                logger.debug("Job execution skipped job_id=%r attempt_id=%r reason=claim_not_acquired",
+                             row.job_id, row.attempt_id)
                 return
+            logger.info("Job execution started job_id=%r attempt_id=%r agent_target_id=%r",
+                        row.job_id, row.attempt_id, row.agent_target_id)
             # 与取消共享锁，保证 running 提交后、HTTP Task 建立前不会遗漏取消信号。
             started = monotonic()
             http_task = self._http_task = asyncio.create_task(self.executor.execute(
@@ -123,13 +144,17 @@ class JobManager:
             outcome = await http_task
         except asyncio.CancelledError:
             if self._closed:
+                logger.warning("HTTP wait stopped during shutdown; execution unresolved job_id=%r attempt_id=%r",
+                               row.job_id, row.attempt_id)
                 raise  # 退出进程不等于用户取消；下次启动将 running 转为 unknown。
             current = await self.attempts.get(row.job_id, row.attempt_id)
             if not current.cancel_requested:
                 raise
             await self._finish_cancelled(current, duration_ms=(monotonic() - started) * 1000)
             return
-        except Exception:
+        except Exception as exc:
+            logger.error("Unexpected executor failure job_id=%r attempt_id=%r error_type=%s",
+                         row.job_id, row.attempt_id, type(exc).__name__)
             # 网络错误已由 HTTP 层结构化；本分支处理意外执行错误，不暴露异常内容。
             outcome = HttpExecutionResult(None, None, 0, {
                 "code": "executor_error", "message": "Agent execution failed unexpectedly",
@@ -142,6 +167,10 @@ class JobManager:
             "output": outcome.output, "duration_ms": outcome.duration_ms,
             "http_status": outcome.http_status, "error": outcome.error,
         })
+        logger.log(logging.INFO if outcome.error is None else logging.WARNING,
+                   "Job result saved job_id=%r attempt_id=%r status=%s delivery=pending http_status=%s duration_ms=%.1f error_code=%r",
+                   row.job_id, row.attempt_id, "succeeded" if outcome.error is None else "failed",
+                   outcome.http_status, outcome.duration_ms, None if outcome.error is None else outcome.error["code"])
 
     async def _finish_cancelled(self, row: RunnerAttempt, *, duration_ms: float = 0) -> None:
         await self.attempts.finish(row.job_id, row.attempt_id, {
@@ -152,6 +181,8 @@ class JobManager:
                 if row.started_at is not None or duration_ms > 0 else "Cancelled before Agent invocation"
             )},
         })
+        logger.info("Job result saved job_id=%r attempt_id=%r status=cancelled delivery=pending duration_ms=%.1f",
+                    row.job_id, row.attempt_id, duration_ms)
 
     def _stop_http_wait(self) -> None:
         # 清理响应流也可能 await；重复 cancel 不能再次打断它的 finally/aclose。
@@ -168,13 +199,17 @@ class JobManager:
             if row.execution_status == "accepted":
                 if len(await self.attempts.list_unresolved()) != 1:
                     raise RpcError(-32000, "Runner capacity is occupied")
+                logger.info("Resuming accepted attempt job_id=%r attempt_id=%r cancel_requested=%s",
+                            row.job_id, row.attempt_id, bool(row.cancel_requested))
                 self._schedule(row)
             elif row.execution_status == "running":
                 if not self._running() or self._key != (row.job_id, row.attempt_id):
                     raise RpcError(-32000, "Active execution is unavailable")
                 if row.cancel_requested:
                     self._stop_http_wait()
+                logger.debug("Keeping active attempt job_id=%r attempt_id=%r", row.job_id, row.attempt_id)
             elif row.execution_status == "unknown":
+                logger.warning("Unknown attempt cannot resume job_id=%r attempt_id=%r", row.job_id, row.attempt_id)
                 raise RpcError(-32000, "Unknown attempts cannot be executed again")
 
     async def cancel(self, attempt: RunnerAttempt, reason: str | None = None) -> None:
@@ -190,7 +225,7 @@ class JobManager:
 
             def done(completed):
                 self._cancel_tasks.pop(key, None)
-                self._execution_done(completed)
+                self._execution_done(completed, key=key)
 
             task.add_done_callback(done)
         # RPC 处理协程因断线被取消，不能撤销已经开始的本地取消处理。
@@ -199,6 +234,8 @@ class JobManager:
     async def _apply_cancel(self, key: tuple[str, str], reason: str | None) -> None:
         async with self._lock:
             row = await self.attempts.request_cancel(*key, reason)
+            logger.info("Cancellation handled job_id=%r attempt_id=%r status=%s cancel_requested=%s",
+                        *key, row.execution_status, bool(row.cancel_requested))
             if row.execution_status == "accepted":
                 await self._finish_cancelled(row)
             elif row.execution_status == "running":

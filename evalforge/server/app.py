@@ -1,0 +1,53 @@
+"""FastAPI 工厂与资源生命周期；通过 Uvicorn --factory 启动。"""
+
+from contextlib import AsyncExitStack, asynccontextmanager
+
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from redis.asyncio import Redis
+
+from evalforge.db import Database, DatabaseSettings
+from evalforge.redis import RedisSettings, RedisStore
+
+from .config import ServerSettings
+from .errors import install_handlers
+from .routes.auth import router as auth_router
+from .security import Passwords
+from .services.auth import AuthService
+from .sessions import SessionStore
+
+
+def create_app(settings: ServerSettings | None = None, *, database: Database | None = None,
+               redis_client: Redis | None = None) -> FastAPI:
+    config = settings or ServerSettings.from_env()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        async with AsyncExitStack() as resources:
+            db = database if database is not None else await resources.enter_async_context(Database(DatabaseSettings.from_env()))
+            redis = redis_client
+            if redis is None:
+                store = await resources.enter_async_context(RedisStore(RedisSettings.from_env()))
+                redis = store.client
+            app.state.sessions = SessionStore(redis, config.session_ttl_seconds)
+            passwords = Passwords()
+            await passwords.initialize()
+            app.state.auth = AuthService(db, app.state.sessions, passwords)
+            # 注入资源由调用方管理；应用创建的资源由 AsyncExitStack 按逆序关闭。
+            yield
+
+    app = FastAPI(title="EvalForge Cloud", version="0.1.0", lifespan=lifespan)
+    app.state.settings = config
+    install_handlers(app)
+    app.add_middleware(CORSMiddleware, allow_origins=list(config.allowed_origins), allow_credentials=True,
+                       allow_methods=["GET", "POST", "PATCH", "DELETE"], allow_headers=["Content-Type", "X-CSRF-Token"])
+
+    @app.middleware("http")
+    async def no_auth_cache(request: Request, call_next):
+        response = await call_next(request)
+        if request.url.path.startswith("/api/v1/auth/"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+    app.include_router(auth_router)
+    return app

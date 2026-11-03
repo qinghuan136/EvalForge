@@ -72,6 +72,7 @@ class RunnerSession:
 
     async def run(self, peer: JsonRpcPeer):
         self.phase = "hello"
+        logger.info("Session handshake starting runner_id=%r", self.config.runner_id)
         peer.register("jobs.dispatch", self._dispatch)
         peer.register("jobs.cancel", self._cancel)
         try:
@@ -84,7 +85,10 @@ class RunnerSession:
                     or not hello["session_id"].strip() or hello.get("status") != "ready"):
                 raise SessionError("Invalid hello response")
             self.session_id, self.phase = hello["session_id"], "syncing"
+            logger.info("Session handshake accepted runner_id=%r session_id=%r", self.config.runner_id, self.session_id)
             active, pending = await self.attempts.sync_snapshot()
+            logger.info("Session syncing session_id=%r active_jobs=%d pending_results=%d",
+                        self.session_id, len(active), len(pending))
             historical = {(r.job_id, r.attempt_id) for r in pending}
             snapshot = {(r.job_id, r.attempt_id): r for r in active + pending}
             reply = await peer.call("runner.sync", {
@@ -96,6 +100,8 @@ class RunnerSession:
             actions = self._validate_actions(reply, snapshot, historical)
             # 先完整校验所有指令，再应用；执行时重新读取，不能倒退同步期间变化的事实。
             for key, action in actions:
+                logger.debug("Applying sync instruction session_id=%r job_id=%r attempt_id=%r action=%s",
+                             self.session_id, *key, action)
                 row = await self.attempts.get(*key)
                 if row is None:
                     raise SessionError("Attempt disappeared during synchronization")
@@ -108,11 +114,13 @@ class RunnerSession:
                 elif self.jobs is not None:
                     await self.jobs.resume(row)
             self.phase = "ready"
-            logger.info("Runner session ready")
+            logger.info("Runner session ready runner_id=%r session_id=%r", self.config.runner_id, self.session_id)
             # sync 已报告这些任务的执行状态，不必再重复发送 started。
             reported_started = {key for key, row in snapshot.items() if row.started_at is not None}
             await self._serve_ready(peer, historical, reported_started)
         finally:
+            logger.info("Session ended runner_id=%r session_id=%r phase=%s",
+                        self.config.runner_id, self.session_id, self.phase)
             self.phase, self.session_id = "disconnected", None
 
     @staticmethod
@@ -142,10 +150,16 @@ class RunnerSession:
             return
         if row.delivery_status != "pending" or row.result_json is None:
             raise SessionError("No persisted result to upload")
+        logger.debug("Uploading pending result session_id=%r job_id=%r attempt_id=%r",
+                     self.session_id, row.job_id, row.attempt_id)
         ack = await peer.call("jobs.complete", row.result_json, timeout=self.config.rpc_timeout)
         if not isinstance(ack, dict) or ack.get("acknowledged") is not True:
+            logger.warning("Result ACK rejected session_id=%r job_id=%r attempt_id=%r",
+                           self.session_id, row.job_id, row.attempt_id)
             raise SessionError("Result was not acknowledged")
         await self.attempts.acknowledge(row.job_id, row.attempt_id)
+        logger.info("Result acknowledged session_id=%r job_id=%r attempt_id=%r",
+                    self.session_id, row.job_id, row.attempt_id)
 
     async def _serve_ready(self, peer, historical, reported_started):
         async def report_execution():
@@ -162,6 +176,8 @@ class RunnerSession:
                         if not isinstance(ack, dict) or ack.get("acknowledged") is not True:
                             raise SessionError("Execution start was not acknowledged")
                         reported_started.add(key)
+                        logger.debug("Execution start acknowledged session_id=%r job_id=%r attempt_id=%r",
+                                     self.session_id, row.job_id, row.attempt_id)
                     if row.delivery_status == "pending":
                         await self._upload(peer, row)
                 # 仅保留仍占用同步快照的 ID，长连接不会累计所有历史任务。

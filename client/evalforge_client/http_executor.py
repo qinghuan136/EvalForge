@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import math
 from dataclasses import dataclass, field
 from http.cookiejar import CookieJar, DefaultCookiePolicy
@@ -12,6 +13,8 @@ import httpx
 
 from .models import encode_json
 from .targets import AgentTarget
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -88,10 +91,14 @@ class HttpExecutor:
         payload = encode_json(input_json).encode("utf-8")
         target = self._targets[agent_target_id]
         started, status = monotonic(), None
+        logger.debug("Agent HTTP request started agent_target_id=%r timeout_seconds=%s", agent_target_id, timeout_seconds)
 
         def result(output=None, *, code=None, message=None):
             error = None if code is None else {"code": code, "message": message}
-            return HttpExecutionResult(output, status, (monotonic() - started) * 1000, error)
+            duration_ms = (monotonic() - started) * 1000
+            logger.debug("Agent HTTP request finished agent_target_id=%r http_status=%s duration_ms=%.1f error_code=%r",
+                         agent_target_id, status, duration_ms, code)
+            return HttpExecutionResult(output, status, duration_ms, error)
 
         try:
             async with asyncio.timeout(timeout_seconds):
@@ -126,4 +133,7 @@ class HttpExecutor:
             return result(code="connection_error", message="Could not connect to Agent")
         except httpx.RequestError:
             return result(code="request_error", message="Agent HTTP request failed")
-        # CancelledError 向上传播；执行层决定如何持久化取消，不能声称 Agent 已停止。
+        except asyncio.CancelledError:
+            logger.debug("Agent HTTP wait cancelled agent_target_id=%r duration_ms=%.1f",
+                         agent_target_id, (monotonic() - started) * 1000)
+            raise  # 继续向上传播；执行层决定如何持久化取消，不能声称 Agent 已停止。

@@ -1,4 +1,4 @@
-"""服务端任务配置的持久化结构；本阶段不实现后台执行器。"""
+"""已停用的 Phoenix 风格后台配置；保留表及外键，不用于新远程执行链路。"""
 
 from datetime import datetime
 from typing import Any
@@ -15,6 +15,7 @@ class ExperimentJob(HasId):
         CheckConstraint("type IN ('PROMPT', 'EVAL_ONLY')", name="valid_type"),
         CheckConstraint("status IN ('RUNNING', 'COMPLETED', 'STOPPED', 'ERROR')", name="valid_experiment_status"),
         UniqueConstraint("type", "id"),
+        {"info": {"deprecated": True, "replacement": "experiments.execution_config"}},
     )
     __mapper_args__ = {"polymorphic_on": "type", "polymorphic_abstract": True}
 

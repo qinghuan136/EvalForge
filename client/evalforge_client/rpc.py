@@ -150,6 +150,10 @@ class JsonRpcPeer:
             async with asyncio.timeout(timeout):
                 await self._connection.send_text(encoded)
                 return await future
+        except (TimeoutError, TransportClosed, RpcError, RpcProtocolError) as exc:
+            logger.debug("RPC call failed method=%r request_id=%r error_type=%s",
+                         method, request_id, type(exc).__name__)
+            raise
         finally:
             self._pending.pop(request_id, None)
             if not future.done():
@@ -235,7 +239,7 @@ class JsonRpcPeer:
     def _handler_done(self, task: asyncio.Task) -> None:
         self._handlers.discard(task)
         if not task.cancelled() and task.exception() is not None:
-            logger.warning("RPC reply could not be delivered")
+            logger.warning("RPC reply could not be delivered error_type=%s", type(task.exception()).__name__)
 
     def _resolve(self, message: dict) -> None:
         request_id = message.get("id")

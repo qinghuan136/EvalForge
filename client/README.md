@@ -39,6 +39,25 @@ $env:EVALFORGE_RUNNER_TOKEN = "你的 Runner 凭据"
 可设置 `rpc_timeout`（默认 30 秒）。进程独占锁暂记 TODO，同一状态库只能手动启动一个 Runner。
 配置示例的云端地址为占位，尚未验证真实 Cloud 部署。
 
+## 日志
+
+使用标准库 `logging`，CLI 输出到标准错误流，默认 INFO，包含本地时间、级别和模块名。
+需要排查时在启动命令增加 `--log-level DEBUG`；也支持 WARNING、ERROR、CRITICAL。
+
+```powershell
+.\.venv\Scripts\python.exe -m evalforge_client --config client-config.json --log-level DEBUG
+```
+
+- INFO：启动、连接、hello/sync、接单、执行开始、结果落盘、取消意图、结果 ACK 和退出。
+- DEBUG：重试上传、同步指令、busy/重复派发、HTTP 调用元信息和 RPC 失败定位。
+- WARNING/ERROR：调用失败、断线、unknown 恢复、协议确认异常、存储/执行控制异常。
+- 任务相关日志包含 job_id / attempt_id，HTTP 相关日志包含目标 ID、状态码、耗时、错误码。
+- Worker 日志不绑定旧 session_id；会话通信日志携带当前 session_id。外部标识中的换行按 repr 转义。
+- 不输出凭证、完整 URL、输入输出正文、取消原因和原始异常文本；不逐次记录轮询或保活。
+- DEBUG 只提升客户端命名空间，第三方库仍使用 WARNING 阈值，避免输出 HTTP、SQL 或 WebSocket 正文。
+
+2026-11-03：日志关联、敏感内容不泄露及 CLI DEBUG 隔离测试通过；完整客户端测试共 94 项通过。
+
 ## 文件与职责
 
 | 文件 | 状态及职责 |
