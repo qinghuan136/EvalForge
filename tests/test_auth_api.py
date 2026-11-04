@@ -7,84 +7,23 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
-import fakeredis.aioredis
-import httpx
 from argon2.exceptions import HashingError, VerificationError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import event, select
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session as SyncSession
 
-from evalforge.db import Database
-from evalforge.db.models import Base, Runner, RunnerCredential, User
-from evalforge.server.app import create_app
+from api_support import APITestCase, ORIGIN, PASSWORD
+from evalforge.db.models import Runner, RunnerCredential, User
 from evalforge.server.config import ServerSettings
 from evalforge.server.errors import APIError
 from evalforge.server.security import token_digest
 from evalforge.server.sessions import PREFIX
 
-ORIGIN = "https://testserver"
-PASSWORD = "Correct horse battery staple"
 NEW_PASSWORD = "Another correct password 2026"
 
 
-class SQLiteDatabase(Database):
-    """复用生产 Database.transaction，仅替换测试引擎。"""
-    def __init__(self):
-        self.engine = create_async_engine("sqlite+aiosqlite:///:memory:")
-        self._sessions = async_sessionmaker(self.engine, expire_on_commit=False)
-
-        @event.listens_for(self.engine.sync_engine, "connect")
-        def foreign_keys(connection, _):
-            connection.execute("PRAGMA foreign_keys=ON")
-
-
-class AuthAPITests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.database = SQLiteDatabase()
-        self.addAsyncCleanup(self.database.close)
-        async with self.database.engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
-        self.redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
-        self.addAsyncCleanup(self.redis.aclose)
-        self.config = ServerSettings(allowed_origins=(ORIGIN,))
-        self.app = create_app(self.config, database=self.database, redis_client=self.redis)
-        self.lifespan = self.app.router.lifespan_context(self.app)
-        await self.lifespan.__aenter__()
-        self.addAsyncCleanup(self.lifespan.__aexit__, None, None, None)
-        self.client = self.new_client()
-        self.addAsyncCleanup(self.client.aclose)
-
-    def new_client(self):
-        return httpx.AsyncClient(transport=httpx.ASGITransport(app=self.app, raise_app_exceptions=False),
-                                 base_url=ORIGIN, headers={"Origin": ORIGIN})
-
-    async def csrf(self, client=None):
-        client = client or self.client
-        response = await client.get("/api/v1/auth/csrf")
-        self.assertEqual(response.status_code, 200, response.text)
-        client.headers["X-CSRF-Token"] = response.json()["csrf_token"]
-        return response
-
-    async def register(self, username="alice"):
-        await self.csrf()
-        response = await self.client.post("/api/v1/auth/register", json={"username": username, "password": PASSWORD})
-        self.assertEqual(response.status_code, 201, response.text)
-        return response
-
-    async def login(self, client=None, password=PASSWORD):
-        client = client or self.client
-        await self.csrf(client)
-        response = await client.post("/api/v1/auth/login", json={"username": "alice", "password": password})
-        self.assertEqual(response.status_code, 200, response.text)
-        client.headers["X-CSRF-Token"] = response.json()["csrf_token"]
-        return response
-
-    async def user(self):
-        async with self.database.transaction() as db:
-            return await db.scalar(select(User).where(User.username == "alice"))
-
+class AuthAPITests(APITestCase):
     async def test_register_normalizes_username_hashes_password_and_does_not_log_in(self):
         response = await self.register(" ALIce ")
         self.assertEqual(response.json(), {"user": {"id": 1, "username": "alice", "display_name": None}})

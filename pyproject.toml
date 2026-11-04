@@ -18,6 +18,9 @@ dependencies = [
     "pydantic>=2.9,<3",
     "argon2-cffi>=25.1,<26",
     "anyio>=4.9,<5",
+    "websockets>=15,<18",
+    "jsonrpcserver>=5.0.9,<6",
+    "jsonrpcclient>=4.0.3,<5",
 ]
 
 [project.optional-dependencies]
@@ -25,6 +28,7 @@ test = [
     "httpx>=0.28,<1",
     "aiosqlite>=0.21,<1",
     "fakeredis[lua]>=2.30,<3",
+    "cryptography>=46,<49",
 ]
 
 [tool.setuptools.packages.find]

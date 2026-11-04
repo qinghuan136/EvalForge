@@ -17,7 +17,8 @@
     "enabled": false,
     "created_at": false,
     "updated_at": false,
-    "last_seen_at": true
+    "last_seen_at": true,
+    "deleted_at": true
   },
   "runner_credentials": {
     "id": false,

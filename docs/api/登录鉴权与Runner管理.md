@@ -1,6 +1,6 @@
 # 登录鉴权与 Runner 管理接口
 
-状态：七个浏览器鉴权接口已实现；Runner 管理与 WSS 云端入口尚未实现。启动和验证见 [鉴权服务](../server-auth.md)。本文采用最新约定：page + pagesize 分页；Runner 与凭证一对一，创建时自动签发，不提供单独更换凭证的接口。
+状态：浏览器鉴权、Runner 管理、WSS 认证和 JSON-RPC 基础设施已实现，业务会话及调度后续接入。启动见 [鉴权服务](../server-auth.md)、[Runner 管理](../server-runners.md)、[WSS 接入](../server-wss.md)。分页采用 page + pagesize；Runner 与凭证一对一，创建时签发，删除后重建。
 
 ## 通用约定
 
@@ -45,7 +45,7 @@ CSRF 用于防止其他网站借浏览器自动携带的 Cookie 发起伪造操�
 | PATCH | `/runners/{runner_id}` | `{name}` | 200：更新后的 Runner；仅允许改名 |
 | DELETE | `/runners/{runner_id}` | 无 | 204：逻辑删除、凭证撤销、当前会话失效 |
 
-分页：page ≥ 1，pagesize 默认 20、范围 1–100；列表排除已删除记录，按 created_at 降序、runner_id 降序稳定排序。
+分页：page 范围 1–2147483647，pagesize 默认 20、范围 1–100；列表排除已删除记录，按 created_at 降序、runner_id 降序稳定排序。不冻结跨请求分页快照。
 
 创建响应示例：
 
@@ -70,12 +70,14 @@ CSRF 用于防止其他网站借浏览器自动携带的 Cookie 发起伪造操�
 ```
 
 - 创建 Runner 与初始凭证在同一数据库事务内完成，默认有效期十个日历年。
+- name 去除首尾空白后须为 1–100 字符；连接地址由 EVALFORGE_RUNNER_WS_URL 指定，不从请求 Host 推断。
 - 完整 Token 仅创建时返回，数据库只存摘要。查询及改名响应不含 Token 或摘要；丢失、泄露或到期时删除旧 Runner，再创建新的 Runner。
 - 不提供凭证列表、凭证更新、重置、单独撤销接口；PATCH 不接受 enabled、归属或凭证字段。
 - Runner 列表项与详情使用相同结构：runner_id、name、enabled、created_at、updated_at、last_seen_at、connection。
-- connection 包含 online 和 phase，来自当前会话注册表；离线时 phase 为 disconnected。会话存储不可用时返回 503，不能误报离线。在线不代表已经同步完成或有空闲容量。
+- connection 包含 online 和 phase，来自 Redis 注册表；phase 为 connected / syncing / ready，缺失时为 disconnected。会话存储不可用或记录损坏时返回 503，不能误报离线。在线不代表有空闲容量；WSS 写入方尚未接入，目前正常无注册记录时显示离线。
 - 删除采用 deleted_at 标记，保留凭证记录及 Attempt 历史，不提供恢复；重建后 runner_id 和 Token 都不同。自己的已删除 Runner 重复删除返回 204，详情返回 404。
 - 删除使连接及后续操作失效，但不保证本地 Agent 停止；在途 Attempt 按取消 / 状态恢复规则处理，不能仅凭断连判定成功或失败。
+- 删除已实现持久化禁用 / 撤销及 Redis 注册清理，WSS 授权复查关闭连接；多连接接管与旧会话业务写入隔离后续接入。Redis 清理失败返回 503，数据库撤销仍有效；重复 DELETE 可重试清理。
 
 ## Runner 连接
 
@@ -111,5 +113,5 @@ Authorization: Bearer efr.<token_id>.<secret>
 
 ## 模型衔接
 
-现有三表见 [鉴权数据设计](../auth-schema.md)。后续实现需给 runner_credentials.runner_id 添加唯一约束，并给 runners 添加 deleted_at；当前 ORM 尚未完成这两项调整。
+现有三表见 [鉴权数据设计](../auth-schema.md)。ORM 已添加 runner_credentials.runner_id 唯一约束及 runners.deleted_at；已有数据库仍需生成并执行迁移，create_all 不会升级旧表。
 本阶段不包含邮箱验证、找回密码、角色权限、凭证轮换和 Runner 恢复接口。

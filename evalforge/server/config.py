@@ -1,6 +1,7 @@
 """HTTP 会话配置；数据库与 Redis 配置继续使用各自基础设施。"""
 
 import os
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -33,6 +34,8 @@ class ServerSettings:
     session_ttl_seconds: int = 86400
     login_limit: int = 10
     register_limit: int = 5
+    runner_websocket_url: str = "wss://localhost:8000/api/v1/runner/ws"
+    runner_auth_check_seconds: float = 5
 
     def __post_init__(self):
         if not self.allowed_origins or type(self.cookie_secure) is not bool:
@@ -46,6 +49,21 @@ class ServerSettings:
         for name in ("session_ttl_seconds", "login_limit", "register_limit"):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ValueError(f"Invalid server {name}")
+        if (type(self.runner_auth_check_seconds) not in (int, float)
+                or not math.isfinite(self.runner_auth_check_seconds) or self.runner_auth_check_seconds <= 0):
+            raise ValueError("Invalid runner_auth_check_seconds")
+        try:
+            url = urlsplit(self.runner_websocket_url)
+            local_ws = (url.scheme == "ws" and not self.cookie_secure
+                        and url.hostname in {"localhost", "127.0.0.1", "::1"})
+            if (not url.hostname or (url.scheme != "wss" and not local_ws)
+                    or url.username is not None or url.password is not None
+                    or url.query or url.fragment or not url.path.startswith("/")
+                    or (url.port is not None and not 1 <= url.port <= 65535)
+                    or any(char.isspace() for char in self.runner_websocket_url)):
+                raise ValueError()
+        except (ValueError, TypeError):
+            raise ValueError("Configure a WSS Runner URL; local HTTP development may explicitly use loopback WS") from None
 
     @property
     def cookie_name(self) -> str:
@@ -59,9 +77,12 @@ class ServerSettings:
             raise ValueError("EVALFORGE_COOKIE_SECURE must be true or false")
         try:
             ttl = int(values.get("EVALFORGE_SESSION_TTL_SECONDS", "86400"))
+            auth_interval = float(values.get("EVALFORGE_RUNNER_AUTH_CHECK_SECONDS", "5"))
         except (ValueError, TypeError):
-            raise ValueError("Invalid EVALFORGE_SESSION_TTL_SECONDS") from None
+            raise ValueError("Invalid server session timing configuration") from None
         return cls(
             allowed_origins=tuple(value.strip() for value in values.get("EVALFORGE_ALLOWED_ORIGINS", "https://localhost:8000").split(",")),
             cookie_secure=secure == "true", session_ttl_seconds=ttl,
+            runner_websocket_url=values.get("EVALFORGE_RUNNER_WS_URL", "wss://localhost:8000/api/v1/runner/ws"),
+            runner_auth_check_seconds=auth_interval,
         )

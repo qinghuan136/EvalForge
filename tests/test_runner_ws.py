@@ -1,0 +1,282 @@
+"""真实 TLS + Uvicorn + WebSocket 测试；身份存储使用异步 SQLite。"""
+
+import asyncio
+import ipaddress
+import json
+import os
+import socket
+import ssl
+import sys
+import tempfile
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest.mock import patch
+
+import uvicorn
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
+from sqlalchemy.exc import OperationalError
+from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed, InvalidStatus
+
+from api_support import APITestCase, SQLiteDatabase
+from evalforge.db.models import Runner, RunnerCredential, User
+
+
+class RunnerWebSocketTests(APITestCase):
+    def make_database(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        return SQLiteDatabase("sqlite+aiosqlite:///" + str(Path(temp.name) / "ws.sqlite"))
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.tls = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tls.cleanup)
+        cls.cert = Path(cls.tls.name) / "localhost.pem"
+        cls.key = Path(cls.tls.name) / "localhost-key.pem"
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+        now = datetime.now(timezone.utc)
+        cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+                .serial_number(x509.random_serial_number()).not_valid_before(now - timedelta(minutes=1))
+                .not_valid_after(now + timedelta(days=1)).add_extension(
+                    x509.SubjectAlternativeName([x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
+                    critical=False).sign(key, hashes.SHA256()))
+        cls.cert.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        cls.key.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                              serialization.NoEncryption()))
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        await self.register()
+        await self.login()
+        response = await self.client.post("/api/v1/runners", json={"name": "tls-runner"})
+        self.assertEqual(response.status_code, 201, response.text)
+        data = response.json()
+        self.runner_id, self.credential_id = data["runner"]["runner_id"], data["credential"]["id"]
+        self.token = data["credential"]["token"]
+        self.app.state.settings = replace(self.config, runner_auth_check_seconds=0.05)
+        self.listener = socket.socket()
+        self.listener.bind(("127.0.0.1", 0))
+        self.listener.listen()
+        self.addCleanup(self.listener.close)
+        self.server = uvicorn.Server(uvicorn.Config(
+            self.app, lifespan="off", ws="websockets-sansio", log_config=None, access_log=False,
+            ssl_certfile=str(self.cert), ssl_keyfile=str(self.key), ws_max_size=1048576,
+            ws_ping_interval=0.2, ws_ping_timeout=1,
+        ))
+        self.server_task = asyncio.create_task(self.server.serve(sockets=[self.listener]))
+        self.addAsyncCleanup(self.stop_server)
+        async with asyncio.timeout(5):
+            while not self.server.started:
+                if self.server_task.done():
+                    self.server_task.result()
+                await asyncio.sleep(0.01)
+        self.url = f"wss://localhost:{self.listener.getsockname()[1]}/api/v1/runner/ws"
+        self.ssl = ssl.create_default_context(cafile=str(self.cert))
+
+    async def stop_server(self):
+        self.server.should_exit = True
+        await asyncio.wait_for(self.server_task, 5)
+
+    def connection(self, token=None, **kwargs):
+        headers = {"Authorization": f"Bearer {self.token if token is None else token}"}
+        headers.update(kwargs.pop("headers", {}))
+        return connect(self.url + kwargs.pop("suffix", ""), ssl=self.ssl, proxy=None,
+                       additional_headers=headers, **kwargs)
+
+    async def test_valid_credential_binds_identity_and_unknown_methods_are_not_faked(self):
+        async with self.connection() as ws:
+            await ws.send('{"jsonrpc":"2.0","method":"runner.hello","id":1}')
+            reply = json.loads(await asyncio.wait_for(ws.recv(), 2))
+            self.assertEqual(reply["error"]["code"], -32601)
+        async with self.database.transaction() as db:
+            self.assertIsNotNone((await db.get(RunnerCredential, self.credential_id)).last_used_at)
+        self.assertIsNone(await self.redis.get("evalforge:runner:session:" + self.runner_id))
+
+    async def test_bad_browser_and_missing_credentials_are_rejected_before_upgrade(self):
+        for token in ("bad", self.token[:-1] + ("x" if self.token[-1] != "x" else "y"),
+                      self.client.cookies.get(self.config.cookie_name)):
+            with self.subTest(token_type="invalid"):
+                with self.assertRaises(InvalidStatus) as caught:
+                    async with self.connection(token):
+                        self.fail("Must reject before upgrade")
+                self.assertEqual(caught.exception.response.status_code, 401)
+                self.assertNotIn(token.encode(), caught.exception.response.body)
+        with self.assertRaises(InvalidStatus) as caught:
+            async with connect(self.url, ssl=self.ssl, proxy=None):
+                self.fail("Missing credential")
+        self.assertEqual(caught.exception.response.status_code, 401)
+
+    async def test_expired_revoked_disabled_and_deleted_identities_are_rejected(self):
+        for case, expected in (("expired", 401), ("revoked", 401), ("runner_disabled", 403),
+                               ("user_disabled", 403), ("deleted", 401)):
+            async with self.database.transaction() as db:
+                credential = await db.get(RunnerCredential, self.credential_id)
+                runner, user = await db.get(Runner, self.runner_id), await db.get(User, 1)
+                credential.created_at = datetime.now(timezone.utc) - timedelta(days=2)
+                credential.expires_at = datetime.now(timezone.utc) + timedelta(days=1)
+                credential.revoked_at, runner.deleted_at = None, None
+                runner.enabled = user.enabled = True
+                if case == "expired":
+                    credential.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+                elif case == "revoked":
+                    credential.revoked_at = datetime.now(timezone.utc)
+                elif case == "runner_disabled":
+                    runner.enabled = False
+                elif case == "user_disabled":
+                    user.enabled = False
+                else:
+                    runner.deleted_at, runner.enabled = datetime.now(timezone.utc), False
+                    credential.revoked_at = datetime.now(timezone.utc)
+            with self.subTest(case=case), self.assertRaises(InvalidStatus) as caught:
+                async with self.connection():
+                    self.fail("Invalid identity")
+            self.assertEqual(caught.exception.response.status_code, expected)
+
+    async def test_origin_and_url_query_are_checked_without_cookie_fallback(self):
+        for options, expected in (({"origin": "https://evil.example"}, 403), ({"origin": "null"}, 403),
+                                  ({"suffix": "?token=private-secret"}, 400)):
+            with self.subTest(options=options), self.assertRaises(InvalidStatus) as caught:
+                async with self.connection(**options):
+                    self.fail("Invalid origin / query")
+            self.assertEqual(caught.exception.response.status_code, expected)
+            self.assertNotIn(b"private-secret", caught.exception.response.body)
+
+    async def test_rpc_parse_errors_batches_notifications_and_internal_error_privacy(self):
+        notified = asyncio.Event()
+
+        def setup(peer, identity):
+            self.assertEqual(identity.runner_id, self.runner_id)
+            self.assertEqual(identity.owner_user_id, 1)
+            async def echo(value):
+                return value
+            async def notice():
+                notified.set()
+            async def broken():
+                raise RuntimeError("private-token-must-not-leak")
+            peer.register("test.echo", echo)
+            peer.register("test.notice", notice)
+            peer.register("test.broken", broken)
+        self.app.state.configure_runner_rpc = setup
+        async with self.connection() as ws:
+            for payload, code in (("{bad", -32700), ("[]", -32600), ("7", -32600),
+                                  ('{"jsonrpc":"2.0","method":"test.echo","params":{"wrong":1},"id":3}', -32602),
+                                  ('{"jsonrpc":"2.0","method":"test.broken","id":4}', -32603)):
+                await ws.send(payload)
+                reply = await asyncio.wait_for(ws.recv(), 2)
+                self.assertEqual(json.loads(reply)["error"]["code"], code)
+                self.assertNotIn("private", reply)
+            await ws.send(json.dumps([
+                {"jsonrpc": "2.0", "method": "test.echo", "params": ["中文"], "id": "a"},
+                {"jsonrpc": "2.0", "method": "test.notice"},
+                {"jsonrpc": "2.0", "method": "test.echo", "params": [None], "id": None},
+            ]))
+            replies = json.loads(await asyncio.wait_for(ws.recv(), 2))
+            self.assertEqual([item["id"] for item in replies], ["a", None])
+            self.assertEqual(replies[0]["result"], "中文")
+            await asyncio.wait_for(notified.wait(), 1)
+            with self.assertRaises(TimeoutError):
+                await asyncio.wait_for(ws.recv(), 0.05)
+
+    async def test_real_client_transport_and_rpc_can_call_back_over_tls(self):
+        def setup(peer, identity):
+            async def reverse(value):
+                return await peer.call("client.double", [value], timeout=2)
+            peer.register("test.reverse", reverse)
+        self.app.state.configure_runner_rpc = setup
+        root = Path(__file__).resolve().parents[1]
+        client_python = root / "client/.venv/Scripts/python.exe"
+        if not client_python.exists():
+            client_python = Path(sys.executable)
+        script = """
+import asyncio, json, sys
+from evalforge_client.transport import WebSocketTransport
+from evalforge_client.rpc import JsonRpcPeer
+async def main():
+    config = json.loads(sys.stdin.read())
+    async with WebSocketTransport(config['url'], bearer_token=config['token']).open() as connection:
+        async with JsonRpcPeer(connection) as peer:
+            async def double(value): return value * 2
+            peer.register('client.double', double)
+            assert await peer.call('test.reverse', [21], timeout=3) == 42
+    print('CLIENT_RPC_OK')
+asyncio.run(main())
+"""
+        process = await asyncio.create_subprocess_exec(
+            str(client_python), "-X", "utf8", "-W", "error", "-c", script,
+            cwd=str(root / "client"), env={**os.environ, "SSL_CERT_FILE": str(self.cert)},
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(json.dumps({"url": self.url, "token": self.token}).encode()), 10)
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+        self.assertEqual(process.returncode, 0, stderr.decode())
+        self.assertIn(b"CLIENT_RPC_OK", stdout)
+
+    async def test_binary_and_oversized_messages_close_connection(self):
+        for payload, code in ((b"binary", 1003), ("x" * (1048576 + 1), 1009)):
+            async with self.connection() as ws:
+                await ws.send(payload)
+                with self.assertRaises(ConnectionClosed) as caught:
+                    await asyncio.wait_for(ws.recv(), 2)
+                self.assertEqual(caught.exception.rcvd.code, code)
+
+    async def test_idle_connections_close_after_deletion_and_browser_logout_does_not_revoke(self):
+        async with self.connection() as ws:
+            logout = await self.client.post("/api/v1/auth/logout-all")
+            self.assertEqual(logout.status_code, 204)
+            await ws.ping()
+            await self.login()
+            deleted = await self.client.delete(f"/api/v1/runners/{self.runner_id}")
+            self.assertEqual(deleted.status_code, 204)
+            with self.assertRaises(ConnectionClosed) as caught:
+                await asyncio.wait_for(ws.recv(), 2)
+            self.assertEqual(caught.exception.rcvd.code, 1008)
+
+    async def test_database_outage_is_sanitized_and_existing_connection_fails_closed(self):
+        error = OperationalError("private database URI", {}, Exception("private secret"))
+        with patch.object(self.database, "transaction", side_effect=error):
+            with self.assertRaises(InvalidStatus) as caught:
+                async with self.connection():
+                    self.fail("Unavailable authentication")
+        self.assertEqual(caught.exception.response.status_code, 503)
+        self.assertNotIn(b"private", caught.exception.response.body)
+        async with self.connection() as ws:
+            with patch.object(self.database, "transaction", side_effect=error):
+                with self.assertRaises(ConnectionClosed) as caught:
+                    await asyncio.wait_for(ws.recv(), 2)
+            self.assertEqual(caught.exception.rcvd.code, 1011)
+
+    async def test_idle_connection_expires_without_waiting_for_an_application_message(self):
+        async with self.connection() as ws:
+            # 握手完成后令凭证到期，避免把 DNS / TLS 握手耗时当成测试前置条件。
+            async with self.database.transaction() as db:
+                credential = await db.get(RunnerCredential, self.credential_id)
+                credential.expires_at = credential.created_at + timedelta(microseconds=1)
+            with self.assertRaises(ConnectionClosed) as caught:
+                await asyncio.wait_for(ws.recv(), 3)
+            self.assertEqual(caught.exception.rcvd.code, 1008)
+
+    async def test_plain_ws_is_rejected_before_token_validation(self):
+        sent = []
+        async def send(message):
+            sent.append(message)
+        async def receive():
+            return {"type": "websocket.connect"}
+        scope = {"type": "websocket", "asgi": {"version": "3.0"}, "scheme": "ws", "path": "/api/v1/runner/ws",
+                 "root_path": "", "query_string": b"", "headers": [(b"host", b"localhost")],
+                 "server": ("localhost", 80), "client": ("127.0.0.1", 1234), "subprotocols": [],
+                 "extensions": {"websocket.http.response": {}}}
+        await self.app(scope, receive, send)
+        self.assertEqual(sent[0]["type"], "websocket.http.response.start")
+        self.assertEqual(sent[0]["status"], 403)
+        self.assertFalse(any(item["type"] == "websocket.accept" for item in sent))

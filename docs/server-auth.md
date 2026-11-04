@@ -1,7 +1,7 @@
 # 云端登录鉴权
 
 已实现 `/api/v1/auth` 下的 csrf、register、login、me、logout、logout-all、password 七个接口；请求与响应见 [接口文档](api/登录鉴权与Runner管理.md)。
-Runner 管理和云端 WSS 尚未实现，本次不改动客户端或 V0 实验流程。
+Runner 管理与 WSS 基础设施已实现，见 [Runner 管理](server-runners.md)和 [WSS 接入](server-wss.md)。业务会话、同步和调度后续接入。
 
 ## 启动
 

@@ -1,17 +1,17 @@
 # 用户与 Runner 鉴权数据设计
 
-最新接口已简化为 Runner 与凭证一对一、创建时签发、删除后重建，不再开放凭证轮换；见 [接口文档](api/登录鉴权与Runner管理.md)。下文保留已实现模型的说明；runner_id 唯一约束和 Runner.deleted_at 尚待后续 ORM 调整。
+Runner 与凭证按一对一管理，创建时签发、删除后重建；runner_id 唯一约束和 Runner.deleted_at 已实现。接口见 [接口文档](api/登录鉴权与Runner管理.md)，业务链路见 [Runner 管理](server-runners.md)。
 
 本阶段新增三张 PostgreSQL 表：`users`、`runners`、`runner_credentials`。
 对应 ORM 位于 `evalforge/db/orm/auth.py`，统一从 `evalforge.db.models` 导入。
-账号注册、登录、浏览器会话和密码验证已实现，见 [鉴权服务](server-auth.md)。Runner 凭证签发 / 验证、Runner 会话和 WSS 接口尚未实现，也未执行真实 PostgreSQL 建表。
+账号鉴权、Runner 管理、凭证签发及 WSS Token 验证 / 传输 / 失效关闭已实现，见 [WSS 接入](server-wss.md)。业务会话、同步和多连接接管后续接入；尚未执行真实 PostgreSQL 建表。
 
 ## ER 图
 
 ```mermaid
 erDiagram
     users ||--o{ runners : "拥有"
-    runners ||--o{ runner_credentials : "签发凭证"
+    runners ||--o| runner_credentials : "唯一凭证"
     users o|--o{ experiments : "拥有实验"
     experiments ||--o{ experiment_runs : "包含Job"
     experiment_runs ||--o{ runner_attempts : "派发尝试"
@@ -36,10 +36,11 @@ erDiagram
         datetime created_at
         datetime updated_at
         datetime last_seen_at "可空"
+        datetime deleted_at "可空"
     }
     runner_credentials {
         int id PK
-        string runner_id FK
+        string runner_id FK, UK
         string token_id UK
         binary token_hash
         string name "可空"
@@ -92,18 +93,19 @@ erDiagram
 | created_at | TIMESTAMPTZ | 否 | 默认数据库当前时间 |
 | updated_at | TIMESTAMPTZ | 否 | 默认当前时间，ORM 更新时维护 |
 | last_seen_at | TIMESTAMPTZ | 是 | 最近观测时间，可低频更新；不能单独用它判断在线 |
+| deleted_at | TIMESTAMPTZ | 是 | 逻辑删除时间；非空时 enabled 必须为 false；不提供恢复 |
 
-Runner 的身份跨重启、重连保持稳定；一个 Runner 可保留多份凭证，但只允许一个当前有效连接，后者由会话层实现。
+Runner 身份跨重启、重连保持稳定；数据库最多允许一份凭证，创建服务保证同时创建一份。一个当前有效连接的限制由后续会话层实现。活动列表使用 (owner_user_id, created_at, runner_id) 部分索引，条件为 deleted_at IS NULL。
 
 ## runner_credentials：客户端访问凭证
 
 | 字段 | PostgreSQL 类型 | 可空 | 用途 / 约束 |
 | --- | --- | --- | --- |
 | id | INTEGER | 否 | 内部主键，供会话标记所使用的凭证 |
-| runner_id | VARCHAR | 否 | FK → runners.runner_id，RESTRICT；有索引 |
+| runner_id | VARCHAR | 否 | FK → runners.runner_id，RESTRICT；唯一索引，一个 Runner 最多一份凭证 |
 | token_id | VARCHAR | 否 | 唯一、非空白；公开查询标识，ORM 插入时默认生成 UUID hex |
 | token_hash | BYTEA | 否 | 随机 secret 的 SHA-256 摘要，数据库检查长度为 32 字节；不存原始 Token |
-| name | VARCHAR | 是 | 凭证备注，例如“首次创建”“轮换凭证” |
+| name | VARCHAR | 是 | 内部备注，创建时为“首次创建”；不开放修改接口 |
 | created_at | TIMESTAMPTZ | 否 | 签发时间；ORM 默认当前 UTC 时间，数据库也有当前时间默认值 |
 | expires_at | TIMESTAMPTZ | 否 | 必须晚于 created_at；ORM 默认签发后十个日历年，允许显式指定 |
 | revoked_at | TIMESTAMPTZ | 是 | 撤销时间；非空时必须不早于 created_at |
@@ -114,7 +116,7 @@ Runner 的身份跨重启、重连保持稳定；一个 Runner 可保留多份�
 ## 创建和验证规则
 
 产品流程为“创建 Runner → 自动签发一份默认十年凭证 → 展示客户端配置”。
-后续创建服务应在同一事务中插入 Runner 和凭证；ORM 不通过事件或关系隐式签发 Token。
+创建服务在同一事务中插入 Runner 和凭证，提交后才返回完整 Token；ORM 不通过事件或关系隐式签发 Token。
 
 Token 形式：`efr.<token_id>.<随机 secret>`。secret 至少使用 32 个密码学安全随机字节，再编码为 URL-safe 字符串；完整 Token 仅签发时展示，客户端本地保存。
 验证服务按 token_id 查询后，计算 secret 的 SHA-256 并做恒定时间比较，同时检查：
@@ -124,7 +126,7 @@ Token 形式：`efr.<token_id>.<随机 secret>`。secret 至少使用 32 个密�
 - 凭证仅用于 Runner 接口；浏览器登录凭证另行管理，不能混用。
 
 账号禁用、Runner 禁用、凭证到期或撤销时，需要关闭受影响的现有连接；不是仅在握手时检查一次。
-浏览器普通退出或登录过期，不影响 Runner 连接。“重置凭证”由服务事务撤销旧凭证、签发新凭证，并使旧连接失效。
+浏览器普通退出或登录过期，不影响 Runner 凭证；不提供重置凭证。删除 Runner 时同时设置 deleted_at、enabled=false 和 revoked_at，再清理 Redis 注册信息；重新创建获得新身份和新凭证。
 
 ## 关联、删除与实现边界
 
@@ -134,12 +136,12 @@ Token 形式：`efr.<token_id>.<随机 secret>`。secret 至少使用 32 个密�
 - Dataset、Evaluator 等原有 user_id 暂缓外键保持原样，不在本次扩展范围内；评分表不改动。
 - 派发时必须检查 Experiment.user_id == Runner.owner_user_id；两个外键并不能自动保证属于同一用户。
 - 浏览器登录会话、Runner 有效会话注册表计划放 Redis；实际 WebSocket 对象留在云端进程内存，不建这两类 PostgreSQL 会话表。
-- 浏览器鉴权已实现 auth_version 比较、用户名标准化、Argon2id 密码验证及 Redis 会话失效；Runner 的创建 / 删除与授权后续实现，不开放凭证重置接口。
+- 浏览器鉴权、Runner 管理和 WSS Token 认证 / 授权失效关闭已实现；多连接接管、业务会话及旧会话写入隔离后续实现。
 
 已有数据库需先处理孤立的 experiments.user_id / runner_attempts.runner_id，再通过迁移添加外键。create_all 不会升级已有表；本次未生成或执行正式迁移。
 
 ## 验证
 
-新增 8 项模型测试，使用内存 SQLite 实际验证默认值、十年与闰日到期、凭证轮换记录、唯一性、外键、摘要长度、时间约束及历史保护；另编译 PostgreSQL DDL 验证 BYTEA / TIMESTAMPTZ。
+8 项身份模型测试使用内存 SQLite 实际验证默认值、十年与闰日到期、一对一约束、外键、摘要长度、时间约束及历史保护；另编译 PostgreSQL DDL 验证 BYTEA / TIMESTAMPTZ。
 云端全量 79 项测试：77 项通过，2 项因没有真实 PostgreSQL / Redis 实例跳过。这不等于已验证实际登录或 WSS 鉴权。
 临时将到期约束的 > 改为 >= 后，等于签发时间的边界测试按预期失败；已恢复严格约束。

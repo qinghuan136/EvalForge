@@ -36,33 +36,31 @@ class AuthORMTests(unittest.TestCase):
         session.flush()
         return runner
 
-    def test_identity_credentials_round_trip_and_independent_rotation(self):
+    def test_identity_and_unique_credential_round_trip(self):
         with Session(self.engine) as session, session.begin():
             runner = self.seed_runner(session)
-            first = RunnerCredential(runner=runner, token_hash=HASH, created_at=NOW, revoked_at=NOW)
-            second = RunnerCredential(runner=runner, token_hash=HASH, created_at=NOW)
-            session.add_all([first, second])
+            credential = RunnerCredential(runner=runner, token_hash=HASH, created_at=NOW)
+            session.add(credential)
             session.flush()
             runner_id = runner.runner_id
-            self.assertNotEqual(first.token_id, second.token_id)
-            self.assertEqual(second.expires_at, NOW.replace(year=2036))
+            self.assertTrue(credential.token_id)
+            self.assertEqual(credential.expires_at, NOW.replace(year=2036))
             self.assertTrue(runner.enabled)
             self.assertTrue(runner.owner.enabled)
             self.assertEqual(runner.owner.auth_version, 1)
         with Session(self.engine) as session:
             runner = session.get(Runner, runner_id)
             self.assertEqual(runner.owner.username, "alice")
-            self.assertEqual(len(runner.credentials), 2)
-            self.assertEqual(sum(row.revoked_at is None for row in runner.credentials), 1)
-            self.assertEqual(runner.credentials[0].token_hash, HASH)
+            self.assertIsNone(runner.credential.revoked_at)
+            self.assertEqual(runner.credential.token_hash, HASH)
 
     def test_ten_calendar_years_default_and_explicit_expiry(self):
         with Session(self.engine) as session, session.begin():
             runner = self.seed_runner(session)
             leap = RunnerCredential(runner=runner, token_hash=HASH,
                                     created_at=datetime(2028, 2, 29, tzinfo=timezone.utc))
-            automatic = RunnerCredential(runner=runner, token_hash=HASH)
-            explicit = RunnerCredential(runner=runner, token_hash=HASH, created_at=NOW,
+            automatic = RunnerCredential(runner=Runner(owner=runner.owner, name="automatic"), token_hash=HASH)
+            explicit = RunnerCredential(runner=Runner(owner=runner.owner, name="explicit"), token_hash=HASH, created_at=NOW,
                                         expires_at=NOW + timedelta(days=1))
             session.add_all([leap, automatic, explicit])
             session.flush()
@@ -81,6 +79,7 @@ class AuthORMTests(unittest.TestCase):
             User(username="alice", password_hash="hash"),
             Runner(runner_id=" ", owner_user_id=owner_id, name="machine"),
             Runner(owner_user_id=owner_id, name=" "),
+            Runner(owner_user_id=owner_id, name="deleted", enabled=True, deleted_at=NOW),
         ]
         for changes in ({"token_id": " "}, {"token_hash": b"short"},
                         {"expires_at": NOW}, {"expires_at": NOW - timedelta(days=1)},
@@ -97,13 +96,17 @@ class AuthORMTests(unittest.TestCase):
         with Session(self.engine) as session, session.begin():
             runner = self.seed_runner(session)
             session.add(RunnerCredential(runner=runner, token_id="public-lookup", token_hash=HASH))
+            other = Runner(owner=runner.owner, name="other")
+            session.add(other)
             session.flush()
             runner_id, owner_id = runner.runner_id, runner.owner_user_id
+            other_id = other.runner_id
         invalid = [
             Runner(owner_user_id=9999, name="orphan"),
             Runner(runner_id=runner_id, owner_user_id=owner_id, name="duplicate"),
             RunnerCredential(runner_id="missing", token_hash=HASH),
-            RunnerCredential(runner_id=runner_id, token_id="public-lookup", token_hash=HASH),
+            RunnerCredential(runner_id=other_id, token_id="public-lookup", token_hash=HASH),
+            RunnerCredential(runner_id=runner_id, token_id="different-lookup", token_hash=HASH),
         ]
         for row in invalid:
             with self.subTest(model=type(row).__name__), Session(self.engine) as session:
@@ -121,7 +124,10 @@ class AuthORMTests(unittest.TestCase):
             with Session(self.engine) as session:
                 row = session.get(model, key)
                 # 加载关联也不能让 ORM 把外键置空或级联删除。
-                list(row.runners if model is User else row.credentials)
+                if model is User:
+                    self.assertTrue(row.runners)
+                else:
+                    self.assertIsNotNone(row.credential)
                 session.delete(row)
                 with self.assertRaises(IntegrityError):
                     session.commit()

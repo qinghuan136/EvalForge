@@ -7,7 +7,7 @@ Python 3.11+。V0 离线实验执行仅使用标准库，无需启动 Phoenix、
 云端 Redis 异步连接基础设施已就绪（redis-py），配置、资源管理与检查命令见 [Redis 说明](docs/redis.md)。
 当前 21 张表已实现 ORM（含停用保留的旧配置），云端主链为 Experiment → ExperimentRun（Job）→ RunnerAttempt；结构和迁移边界见 [ORM 说明](docs/orm.md)。
 新增用户、Runner 与凭证三张表，字段及 Mermaid ER 图见 [身份与凭证设计](docs/auth-schema.md)。
-云端七个浏览器鉴权接口已实现，启动和验证见 [鉴权服务](docs/server-auth.md)；Runner 管理与 WSS 云端接口尚未实现。
+云端七个浏览器鉴权接口与五个 Runner 管理接口已实现，见 [鉴权服务](docs/server-auth.md)与 [Runner 管理](docs/server-runners.md)。[WSS / JSON-RPC 接入](docs/server-wss.md)已实现认证与传输，业务会话及任务派发后续接入。
 登录鉴权与 Runner 管理接口约定见 [接口文档](docs/api/登录鉴权与Runner管理.md)。
 
 独立的本地客户端位于 [client/](client/README.md)，已实现 WebSocket 传输、双向 JSON-RPC 和本地 SQLite 存储基础层，

@@ -4,7 +4,7 @@ from calendar import monthrange
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import CheckConstraint, ForeignKey, LargeBinary, func, true
+from sqlalchemy import CheckConstraint, ForeignKey, Index, LargeBinary, func, text, true
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from ..base import Base, HasId, UTC_TIMESTAMP
@@ -42,6 +42,9 @@ class Runner(Base):
     __tablename__ = "runners"
     __table_args__ = (
         CheckConstraint("length(trim(runner_id)) > 0 AND length(trim(name)) > 0", name="identity"),
+        CheckConstraint("deleted_at IS NULL OR NOT enabled", name="deleted_disabled"),
+        Index("ix_runners_owner_created_active", "owner_user_id", "created_at", "runner_id",
+              postgresql_where=text("deleted_at IS NULL"), sqlite_where=text("deleted_at IS NULL")),
     )
 
     runner_id: Mapped[str] = mapped_column(primary_key=True, default=lambda: str(uuid4()))
@@ -51,9 +54,10 @@ class Runner(Base):
     created_at: Mapped[datetime] = mapped_column(UTC_TIMESTAMP, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(UTC_TIMESTAMP, server_default=func.now(), onupdate=func.now())
     last_seen_at: Mapped[datetime | None] = mapped_column(UTC_TIMESTAMP)
+    deleted_at: Mapped[datetime | None] = mapped_column(UTC_TIMESTAMP)
 
     owner: Mapped[User] = relationship(back_populates="runners")
-    credentials: Mapped[list["RunnerCredential"]] = relationship(back_populates="runner", passive_deletes="all")
+    credential: Mapped["RunnerCredential | None"] = relationship(back_populates="runner", passive_deletes="all")
     attempts: Mapped[list["RunnerAttempt"]] = relationship(back_populates="runner", passive_deletes="all")
 
 
@@ -66,7 +70,7 @@ class RunnerCredential(HasId):
         CheckConstraint("revoked_at IS NULL OR revoked_at >= created_at", name="revocation"),
     )
 
-    runner_id: Mapped[str] = mapped_column(ForeignKey("runners.runner_id", ondelete="RESTRICT"), index=True)
+    runner_id: Mapped[str] = mapped_column(ForeignKey("runners.runner_id", ondelete="RESTRICT"), unique=True, index=True)
     token_id: Mapped[str] = mapped_column(unique=True, default=lambda: uuid4().hex)
     token_hash: Mapped[bytes] = mapped_column(LargeBinary(32))
     name: Mapped[str | None]
@@ -76,4 +80,4 @@ class RunnerCredential(HasId):
     revoked_at: Mapped[datetime | None] = mapped_column(UTC_TIMESTAMP)
     last_used_at: Mapped[datetime | None] = mapped_column(UTC_TIMESTAMP)
 
-    runner: Mapped[Runner] = relationship(back_populates="credentials")
+    runner: Mapped[Runner] = relationship(back_populates="credential")

@@ -1,6 +1,6 @@
 # 核心 ORM
 
-基于 Phoenix commit `14c193cfa`，按云端 + 轻客户端方案调整；当前 21 张表、182 个字段，含停用后保留的旧配置表，以及新增身份与凭证表。
+基于 Phoenix commit `14c193cfa`，按云端 + 轻客户端方案调整；当前 21 张表、183 个字段，含停用后保留的旧配置表，以及身份与凭证表。
 这里定义存储结构；尚未连接 PostgreSQL、执行建表或把 V0 Runner 接入数据库。
 
 ## 代码入口
@@ -69,6 +69,8 @@ Experiment（整体状态、execution_config）
 - Attempt 终态的完整结果与接收时间、unknown/rejected 原因、取消原因与时间的一致性。
 - Job 队列的 (status, created_at) 索引，以及 Runner/Job 活动 Attempt 的部分唯一索引。
 - 用户名 / token_id 唯一、身份名称非空白、auth_version 为正、凭证摘要长度为 32 字节、到期与撤销时间检查；ORM 默认凭证有效期为十个日历年。
+- Runner 与凭证一对一：runner_credentials.runner_id 唯一，Python 关系为 Runner.credential；创建服务同时写入二者。
+- Runner.deleted_at 为逻辑删除标记，删除后必须 enabled=false；活动列表使用归属 / 创建时间 / ID 的部分索引。删除服务撤销凭证，保留 Attempt 历史。
 
 跨数据集一致性仍需写入服务校验：例如修订的样本和版本属于同一数据集、实验快照的修订属于所选样本。
 这些不是 Phoenix 两个独立外键自动保证的条件，本阶段不通过 ORM 隐式写入钩子改变它们。
@@ -101,7 +103,7 @@ users 为真实账号模型，不是占位表；未创建 Trace、Prompt、沙�
 模型专项测试使用内存 SQLite 真正执行建表、写入、查询和约束失败；另行编译全部 PostgreSQL DDL，验证 JSONB、时区字段及复合外键。
 这些不替代真实 PostgreSQL 集成测试。
 
-2026-11-03：云端测试共 79 项，77 项通过，2 项因没有 PostgreSQL / Redis 实例跳过；新增 8 项身份模型测试。21 张表、182 个字段与字典契约一致；评分表及客户端 ORM 未改动。SQLite 验证活动唯一约束、身份引用、默认有效期及历史保护，PostgreSQL DDL 验证 JSONB、BYTEA、时间类型及部分索引。
+21 张表、183 个字段与字典契约一致；SQLite 验证唯一约束、身份引用、默认有效期及历史保护，PostgreSQL DDL 验证 JSONB、BYTEA、时间类型及部分索引。Runner 接口验证见 [Runner 管理](server-runners.md)。
 临时从活动索引移除 unknown 后，容量测试按预期失败；恢复源码后完整测试通过。数据字典的字段名和可空性已逐表核对，编译检查及 git diff --check 通过。
 
 实例就绪后生成迁移：

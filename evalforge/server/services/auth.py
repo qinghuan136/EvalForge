@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from evalforge.db import Database
 from evalforge.db.models import User
@@ -20,6 +21,14 @@ def not_authenticated() -> APIError:
 
 def invalid_credentials() -> APIError:
     return APIError(401, "invalid_credentials", "用户名或密码错误")
+
+
+async def locked_user(db: AsyncSession, user_id: int, auth_version: int) -> User:
+    """写事务内重新校验身份，并与改密 / 退出全部会话串行化。"""
+    user = await db.scalar(select(User).where(User.id == user_id).with_for_update())
+    if user is None or not user.enabled or user.auth_version != auth_version:
+        raise not_authenticated()
+    return user
 
 
 class AuthService:
@@ -72,9 +81,7 @@ class AuthService:
 
     async def logout_all(self, user: User, record: BrowserSession) -> None:
         async with self.database.transaction() as db:
-            current = await db.scalar(select(User).where(User.id == user.id).with_for_update())
-            if current is None or not current.enabled or current.auth_version != record.auth_version:
-                raise not_authenticated()
+            current = await locked_user(db, user.id, record.auth_version)
             current.auth_version += 1
         # 旧 Redis 会话可保留至 TTL；每次认证核对数据库版本，已全部失效。
 
@@ -83,9 +90,8 @@ class AuthService:
             raise APIError(401, "invalid_password", "当前密码错误")
         encoded = await self.passwords.hash(new)
         async with self.database.transaction() as db:
-            current = await db.scalar(select(User).where(User.id == user.id).with_for_update())
-            if (current is None or not current.enabled or current.auth_version != record.auth_version
-                    or current.password_hash != user.password_hash):
+            current = await locked_user(db, user.id, record.auth_version)
+            if current.password_hash != user.password_hash:
                 raise not_authenticated()
             current.password_hash = encoded
             current.auth_version += 1
