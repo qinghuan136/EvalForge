@@ -26,8 +26,8 @@ class WebSocketConnection:
         except asyncio.CancelledError:
             await asyncio.gather(check, return_exceptions=True)
             raise
-        except APIError:
-            await self.close(1008)
+        except APIError as exc:
+            await self.close(1011 if exc.status >= 500 else 1008)
             raise TransportClosed("Runner authorization expired") from None
         except Exception:
             await self.close(1011)

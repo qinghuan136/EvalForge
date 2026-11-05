@@ -31,6 +31,9 @@
 {"jsonrpc":"2.0","result":{"session_id":"session-01","status":"ready"},"id":1}
 ```
 
+- 云端已实现 hello 注册、租约和新连接接管，真实会话阶段仍为 syncing。响应中的 status=ready 仅兼容握手约定，不允许提前派发任务。
+- runner.sync、显式 runner.ready 和任务业务方法尚未接入；完整 ready 握手下一阶段配套调整。参见 [会话管理基础](server-sessions.md)。
+
 ### 2.2 `jobs.dispatch`
 
 ```json

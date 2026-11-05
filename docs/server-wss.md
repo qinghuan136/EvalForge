@@ -2,7 +2,7 @@
 
 已实现 `/api/v1/runner/ws` 的握手认证、文本传输及双向 JSON-RPC。应用入口沿用 `evalforge.server.app:create_app`。
 
-本阶段不注册业务方法：runner.hello / runner.sync / ready、Redis 有效会话注册、单连接接管及任务调度后续接入。普通客户端目前会在 hello 收到 -32601，而不会被错误告知已经 ready；Runner 管理列表也不会因底层连接存在就显示在线。
+已接入 [Runner 会话管理基础](server-sessions.md)：hello、Redis 租约、连接接管与清理，阶段由状态机统一判断。hello 成功后真实阶段为 syncing；仅建立底层连接、尚未注册时显示离线，hello 注册提交期间可短暂显示 connected。sync / ready 和任务业务后续接入。
 
 ## 文件与链路
 
@@ -28,7 +28,7 @@ routes/runner_ws.py
 - 连接绑定 runner_id、owner_user_id、credential_id、到期时间和摘要；后续不能通过 RPC 参数更换认证身份。握手成功校验时更新 last_used_at / last_seen_at。
 - 每次接收消息和发送消息前重校验；空闲时默认每 5 秒查询一次，接近原到期时间时提前检查。修改 `EVALFORGE_RUNNER_AUTH_CHECK_SECONDS` 可调整间隔，实际失效检测还受数据库查询耗时影响。
 - 凭证撤销、Runner 删除 / 禁用、账号禁用或到期关闭码为 1008；数据库不可用时关闭 1011。浏览器改密和退出全部登录不撤销 Runner 凭证。
-- 消息进入 RPC 前的检查不能替代后续业务事务内的归属、会话版本与 Attempt 校验。多连接接管和旧会话写入隔离属于下一阶段。
+- hello 注册后，每次消息收发和空闲监控还会检查 Redis 当前会话身份。消息进入 RPC 前的检查不能替代后续业务事务内的归属、会话版本与 Attempt 校验。
 
 ## 传输和 RPC 边界
 
@@ -43,7 +43,7 @@ routes/runner_ws.py
 - 库负责 JSON-RPC 标准解析与分发，适配层补严格 JSON 2.0、非有限数、容量控制和异常脱敏；普通异常返回 -32603，不回显异常文本。
 - 关闭时停止授权监控；已开始的短认证事务完成清理后才传播取消，避免遗留数据库关闭任务。
 
-后续会话层通过工厂参数 `configure_runner_rpc(peer, identity)` 注册 async 方法；回调本身同步执行，每条连接独立调用。生产默认无测试 echo 或任务占位方法。
+会话层默认注册 runner.hello。工厂参数 `configure_runner_rpc(peer, identity)` 可注册其他 async 方法；回调本身同步执行，每条连接独立调用，不应覆盖 hello。生产默认无测试 echo 或任务占位方法。
 
 ## 启动与验证
 

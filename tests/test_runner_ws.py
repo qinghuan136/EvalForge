@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 from sqlalchemy.exc import OperationalError
+from redis.exceptions import ConnectionError as RedisConnectionError
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
@@ -90,13 +91,89 @@ class RunnerWebSocketTests(APITestCase):
         return connect(self.url + kwargs.pop("suffix", ""), ssl=self.ssl, proxy=None,
                        additional_headers=headers, **kwargs)
 
+    async def hello(self, ws, request_id=1):
+        await ws.send(json.dumps({"jsonrpc": "2.0", "method": "runner.hello", "id": request_id,
+                                  "params": {"runner_id": self.runner_id, "version": "0.1.0",
+                                             "capabilities": ["http_json"], "max_concurrent_jobs": 1}}))
+        reply = json.loads(await asyncio.wait_for(ws.recv(), 2))
+        self.assertIn("result", reply, reply)
+        return reply["result"]
+
     async def test_valid_credential_binds_identity_and_unknown_methods_are_not_faked(self):
         async with self.connection() as ws:
             await ws.send('{"jsonrpc":"2.0","method":"runner.hello","id":1}')
             reply = json.loads(await asyncio.wait_for(ws.recv(), 2))
-            self.assertEqual(reply["error"]["code"], -32601)
+            self.assertEqual(reply["error"]["code"], -32602)
         async with self.database.transaction() as db:
             self.assertIsNotNone((await db.get(RunnerCredential, self.credential_id)).last_used_at)
+        self.assertIsNone(await self.redis.get("evalforge:runner:session:" + self.runner_id))
+
+    async def test_hello_registers_syncing_and_business_methods_are_still_unimplemented(self):
+        key = "evalforge:runner:session:" + self.runner_id
+        async with self.connection() as ws:
+            hello = await self.hello(ws)
+            record = json.loads(await self.redis.get(key))
+            self.assertEqual(record["session_id"], hello["session_id"])
+            self.assertEqual(record["phase"], "syncing")
+            response = await self.client.get(f"/api/v1/runners/{self.runner_id}")
+            self.assertEqual(response.json()["connection"], {"online": True, "phase": "syncing"})
+            for method in ("runner.sync", "runner.ready", "jobs.complete"):
+                await ws.send(json.dumps({"jsonrpc": "2.0", "method": method, "id": method}))
+                reply = json.loads(await asyncio.wait_for(ws.recv(), 2))
+                self.assertEqual(reply["error"]["code"], -32601)
+        async with asyncio.timeout(2):
+            while await self.redis.get(key) is not None:
+                await asyncio.sleep(0.01)
+        self.assertEqual((await self.client.get(f"/api/v1/runners/{self.runner_id}")).json()["connection"]["online"], False)
+
+    async def test_new_connection_takes_over_without_old_cleanup_removing_new_registration(self):
+        async with self.connection() as old:
+            first = await self.hello(old)
+            async with self.connection() as new:
+                second = await self.hello(new)
+                self.assertNotEqual(first["session_id"], second["session_id"])
+                with self.assertRaises(ConnectionClosed) as caught:
+                    await asyncio.wait_for(old.recv(), 2)
+                self.assertEqual(caught.exception.rcvd.code, 1008)
+                record = json.loads(await self.redis.get("evalforge:runner:session:" + self.runner_id))
+                self.assertEqual(record["session_id"], second["session_id"])
+                await new.send('{"jsonrpc":"2.0","method":"runner.sync","id":8}')
+                self.assertEqual(json.loads(await asyncio.wait_for(new.recv(), 2))["error"]["code"], -32601)
+
+    async def test_missing_hello_closes_idle_connection(self):
+        self.app.state.settings = replace(self.app.state.settings, runner_hello_timeout_seconds=0.1)
+        async with self.connection() as ws:
+            with self.assertRaises(ConnectionClosed) as caught:
+                await asyncio.wait_for(ws.recv(), 2)
+            self.assertEqual(caught.exception.rcvd.code, 1008)
+
+    async def test_expired_session_registration_closes_socket_without_resurrecting_it(self):
+        async with self.connection() as ws:
+            await self.hello(ws)
+            key = "evalforge:runner:session:" + self.runner_id
+            await self.redis.pexpire(key, 1)
+            with self.assertRaises(ConnectionClosed) as caught:
+                await asyncio.wait_for(ws.recv(), 2)
+            self.assertEqual(caught.exception.rcvd.code, 1008)
+            self.assertIsNone(await self.redis.get(key))
+
+    async def test_session_storage_outage_fails_closed_with_server_error(self):
+        async with self.connection() as ws:
+            await self.hello(ws)
+            connections = self.app.state.runner_sessions.connections
+            with patch.object(connections, "is_current", side_effect=RedisConnectionError("private redis URI")):
+                with self.assertRaises(ConnectionClosed) as caught:
+                    await asyncio.wait_for(ws.recv(), 2)
+            self.assertEqual(caught.exception.rcvd.code, 1011)
+
+    async def test_manager_shutdown_closes_wss_and_removes_registration(self):
+        async with self.connection() as ws:
+            await self.hello(ws)
+            await asyncio.wait_for(self.app.state.runner_sessions.close(), 2)
+            with self.assertRaises(ConnectionClosed) as caught:
+                await asyncio.wait_for(ws.recv(), 2)
+            self.assertEqual(caught.exception.rcvd.code, 1001)
+        self.assertFalse(self.app.state.runner_sessions.sessions)
         self.assertIsNone(await self.redis.get("evalforge:runner:session:" + self.runner_id))
 
     async def test_bad_browser_and_missing_credentials_are_rejected_before_upgrade(self):

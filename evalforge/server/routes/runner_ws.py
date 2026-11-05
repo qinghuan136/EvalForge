@@ -1,4 +1,4 @@
-"""Runner WebSocket 入口：握手认证、双向 RPC、连接期间授权检查。"""
+"""Runner WebSocket 入口：认证、RPC 绑定和会话生命周期监督。"""
 
 import asyncio
 import logging
@@ -53,7 +53,14 @@ async def runner_websocket(socket: WebSocket):
         await deny(socket, 503, "service_unavailable", "认证服务暂时不可用")
         return
 
-    connection = WebSocketConnection(socket, lambda: auth.check(identity))
+    session = None
+
+    async def authorize():
+        await auth.check(identity)
+        if session is not None:
+            await session.check_current()
+
+    connection = WebSocketConnection(socket, authorize)
     await socket.accept()
     peer = JsonRpcPeer(connection)
     stopping = asyncio.Event()
@@ -70,20 +77,24 @@ async def runner_websocket(socket: WebSocket):
             await connection.check_authorization()
 
     try:
-        # 只提供绑定身份的方法注册入口；业务层后续注册 hello/sync/任务方法。
+        session = socket.app.state.runner_sessions.open(identity, peer, config)
+        peer.register("runner.hello", session.hello)
+        # 额外方法由后续业务层注册；不伪造 sync / ready / Job 响应。
         setup = socket.app.state.configure_runner_rpc
         if setup is not None:
             setup(peer, identity)
         async with peer:
             closed = asyncio.create_task(peer.wait_closed())
             watcher = asyncio.create_task(watch_authorization())
-            tasks = [closed, watcher]
+            tasks = [closed, watcher, session.task]
             try:
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
                     task.result()
             finally:
                 stopping.set()
+                session.request_close()
+                await connection.close(session.close_code)
                 closed.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
     except TransportClosed:
@@ -92,4 +103,6 @@ async def runner_websocket(socket: WebSocket):
         logger.warning("Runner connection ended error_type=%s", type(exc).__name__)
         await connection.close(1011)
     finally:
+        if session is not None:
+            await session.close()
         await connection.close()

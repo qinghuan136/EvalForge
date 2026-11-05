@@ -18,6 +18,7 @@ from .routes.runner_ws import router as runner_ws_router
 from .rpc import JsonRpcPeer
 from .runner_auth import RunnerAuth, RunnerIdentity
 from .runner_connections import RunnerConnections
+from .runner_sessions import RunnerSessionManager
 from .security import Passwords
 from .services.auth import AuthService
 from .services.runners import RunnerService
@@ -41,8 +42,11 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
             passwords = Passwords()
             await passwords.initialize()
             app.state.auth = AuthService(db, app.state.sessions, passwords)
-            app.state.runners = RunnerService(db, RunnerConnections(redis), config.runner_websocket_url)
+            connections = RunnerConnections(redis)
+            app.state.runners = RunnerService(db, connections, config.runner_websocket_url)
             app.state.runner_auth = RunnerAuth(db)
+            app.state.runner_sessions = RunnerSessionManager(connections)
+            resources.push_async_callback(app.state.runner_sessions.close)
             # 注入资源由调用方管理；应用创建的资源由 AsyncExitStack 按逆序关闭。
             yield
 

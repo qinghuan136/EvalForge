@@ -36,6 +36,11 @@ class ServerSettings:
     register_limit: int = 5
     runner_websocket_url: str = "wss://localhost:8000/api/v1/runner/ws"
     runner_auth_check_seconds: float = 5
+    runner_hello_timeout_seconds: float = 10
+    runner_session_ttl_seconds: int = 60
+    runner_session_renew_seconds: float = 20
+    runner_session_operation_timeout_seconds: float = 5
+    runner_session_queue_size: int = 32
 
     def __post_init__(self):
         if not self.allowed_origins or type(self.cookie_secure) is not bool:
@@ -46,12 +51,17 @@ class ServerSettings:
                 raise ValueError("Allowed origins must be exact origins without paths")
             if not self.cookie_secure and url.hostname not in {"localhost", "127.0.0.1", "::1"}:
                 raise ValueError("Insecure cookies are only allowed for loopback development")
-        for name in ("session_ttl_seconds", "login_limit", "register_limit"):
+        for name in ("session_ttl_seconds", "login_limit", "register_limit",
+                     "runner_session_ttl_seconds", "runner_session_queue_size"):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ValueError(f"Invalid server {name}")
-        if (type(self.runner_auth_check_seconds) not in (int, float)
-                or not math.isfinite(self.runner_auth_check_seconds) or self.runner_auth_check_seconds <= 0):
-            raise ValueError("Invalid runner_auth_check_seconds")
+        for name in ("runner_auth_check_seconds", "runner_hello_timeout_seconds",
+                     "runner_session_renew_seconds", "runner_session_operation_timeout_seconds"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"Invalid {name}")
+        if self.runner_session_renew_seconds + self.runner_session_operation_timeout_seconds >= self.runner_session_ttl_seconds:
+            raise ValueError("Runner renewal interval plus operation timeout must be shorter than session TTL")
         try:
             url = urlsplit(self.runner_websocket_url)
             local_ws = (url.scheme == "ws" and not self.cookie_secure
@@ -78,6 +88,11 @@ class ServerSettings:
         try:
             ttl = int(values.get("EVALFORGE_SESSION_TTL_SECONDS", "86400"))
             auth_interval = float(values.get("EVALFORGE_RUNNER_AUTH_CHECK_SECONDS", "5"))
+            hello_timeout = float(values.get("EVALFORGE_RUNNER_HELLO_TIMEOUT_SECONDS", "10"))
+            runner_ttl = int(values.get("EVALFORGE_RUNNER_SESSION_TTL_SECONDS", "60"))
+            renew_interval = float(values.get("EVALFORGE_RUNNER_SESSION_RENEW_SECONDS", "20"))
+            operation_timeout = float(values.get("EVALFORGE_RUNNER_SESSION_OPERATION_TIMEOUT_SECONDS", "5"))
+            queue_size = int(values.get("EVALFORGE_RUNNER_SESSION_QUEUE_SIZE", "32"))
         except (ValueError, TypeError):
             raise ValueError("Invalid server session timing configuration") from None
         return cls(
@@ -85,4 +100,7 @@ class ServerSettings:
             cookie_secure=secure == "true", session_ttl_seconds=ttl,
             runner_websocket_url=values.get("EVALFORGE_RUNNER_WS_URL", "wss://localhost:8000/api/v1/runner/ws"),
             runner_auth_check_seconds=auth_interval,
+            runner_hello_timeout_seconds=hello_timeout, runner_session_ttl_seconds=runner_ttl,
+            runner_session_renew_seconds=renew_interval,
+            runner_session_operation_timeout_seconds=operation_timeout, runner_session_queue_size=queue_size,
         )
