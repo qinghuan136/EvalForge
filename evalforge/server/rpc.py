@@ -107,8 +107,9 @@ class JsonRpcPeer:
                     return Error(exc.code, exc.message, NODATA if exc.data is _MISSING else exc.data)
                 _encode(value)
                 return Success(value)
-            except Exception:
+            except Exception as exc:
                 # 5.0.9 默认附带异常文本；在适配边界统一脱敏。
+                logger.error("RPC handler failed method=%r error_type=%s", method, type(exc).__name__)
                 return Error(-32603, "Internal error")
             finally:
                 self._executing.discard(task)

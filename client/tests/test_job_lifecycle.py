@@ -256,7 +256,7 @@ class JobSessionTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(await peer.handlers["jobs.dispatch"](**dispatch_params(input=None)), {"accepted": True})
                         await wait_until(acknowledged)
                         self.assertEqual([name for name, _ in peer.calls],
-                                         ["runner.hello", "runner.sync", "jobs.started", "jobs.complete"])
+                                         ["runner.hello", "runner.sync", "runner.ready", "jobs.started", "jobs.complete"])
                         self.assertIsNone((await repo.get("j1", "a1")).result_json["output"])
                     finally:
                         peer.closed.set()
@@ -301,7 +301,9 @@ class JobSessionTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(params["output"], {"answer": "真实 HTTP 响应"})
                         completed.set()
                         return {"acknowledged": True}
-                    for method, handler in (("runner.hello", hello), ("runner.sync", sync),
+                    async def ready(session_id):
+                        return {"session_id": session_id, "status": "ready"}
+                    for method, handler in (("runner.hello", hello), ("runner.sync", sync), ("runner.ready", ready),
                                             ("jobs.started", started), ("jobs.complete", complete)):
                         peer.register(method, handler)
                     while True:

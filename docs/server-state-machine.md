@@ -72,7 +72,7 @@ guard 不通过时返回 allowed=False、next_state=None、reason="guard_rejecte
 ## RunnerSession 接入顺序
 
 1. hello：先用 validate_session_event() 拒绝错误阶段，再以 connected 注册；确认当前会话后，预览 HELLO_CONFIRMED，Redis 比较当前阶段并更新为预览目标，成功后更新本地阶段并响应。
-2. ready（待实现）：根据同步上下文计算目标阶段；复用同一转换入口，在 Redis 原子更新成功后再更新本地阶段、返回 ACK。
+2. ready：根据 sync_processed 和历史 pending_uploads 计算目标阶段；复用同一转换入口，在 Redis 原子更新成功后再更新本地阶段、返回 ACK。
 3. 续租：Redis 确认续租成功后，提交 LEASE_RENEWED；失败走 CLOSE，不能由状态机复活租约。
 4. 关闭：通过 CLOSE 进入本地终态，再按 session_id 条件清理 Redis；不在 Redis 长期保存 closed。
 

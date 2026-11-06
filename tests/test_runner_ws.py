@@ -24,6 +24,7 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from api_support import APITestCase, SQLiteDatabase
+from attempt_support import seed_attempt, result_params
 from evalforge.db.models import Runner, RunnerCredential, User
 
 
@@ -108,7 +109,7 @@ class RunnerWebSocketTests(APITestCase):
             self.assertIsNotNone((await db.get(RunnerCredential, self.credential_id)).last_used_at)
         self.assertIsNone(await self.redis.get("evalforge:runner:session:" + self.runner_id))
 
-    async def test_hello_registers_syncing_and_business_methods_are_still_unimplemented(self):
+    async def test_hello_registers_syncing_and_business_methods_validate_params(self):
         key = "evalforge:runner:session:" + self.runner_id
         async with self.connection() as ws:
             hello = await self.hello(ws)
@@ -120,7 +121,7 @@ class RunnerWebSocketTests(APITestCase):
             for method in ("runner.sync", "runner.ready", "jobs.complete"):
                 await ws.send(json.dumps({"jsonrpc": "2.0", "method": method, "id": method}))
                 reply = json.loads(await asyncio.wait_for(ws.recv(), 2))
-                self.assertEqual(reply["error"]["code"], -32601)
+                self.assertEqual(reply["error"]["code"], -32602)
         async with asyncio.timeout(2):
             while await self.redis.get(key) is not None:
                 await asyncio.sleep(0.01)
@@ -138,7 +139,30 @@ class RunnerWebSocketTests(APITestCase):
                 record = json.loads(await self.redis.get("evalforge:runner:session:" + self.runner_id))
                 self.assertEqual(record["session_id"], second["session_id"])
                 await new.send('{"jsonrpc":"2.0","method":"runner.sync","id":8}')
-                self.assertEqual(json.loads(await asyncio.wait_for(new.recv(), 2))["error"]["code"], -32601)
+                self.assertEqual(json.loads(await asyncio.wait_for(new.recv(), 2))["error"]["code"], -32602)
+
+    async def test_sync_ready_started_complete_and_reconnect_replay_over_tls(self):
+        owner = await self.user()
+        key = await seed_attempt(self.database, owner.id, self.runner_id)
+        async def call(ws, method, params):
+            await ws.send(json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": method}))
+            reply = json.loads(await asyncio.wait_for(ws.recv(), 2))
+            self.assertIn("result", reply, reply)
+            return reply["result"]
+        async with self.connection() as ws:
+            hello = await self.hello(ws)
+            await call(ws, "runner.sync", {"runner_id": self.runner_id, "active_jobs": [{
+                "job_id": key[0], "attempt_id": key[1], "status": "accepted"}], "pending_results": []})
+            await call(ws, "runner.ready", {"session_id": hello["session_id"]})
+            await call(ws, "jobs.started", {"job_id": key[0], "attempt_id": key[1]})
+            self.assertEqual(await call(ws, "jobs.complete", result_params(key)), {"acknowledged": True})
+        async with self.connection() as ws:
+            hello = await self.hello(ws)
+            sync = await call(ws, "runner.sync", {"runner_id": self.runner_id, "active_jobs": [],
+                                                  "pending_results": [result_params(key)]})
+            self.assertEqual(sync["jobs"][0]["action"], "retry_upload")
+            await call(ws, "jobs.complete", result_params(key))
+            await call(ws, "runner.ready", {"session_id": hello["session_id"]})
 
     async def test_missing_hello_closes_idle_connection(self):
         self.app.state.settings = replace(self.app.state.settings, runner_hello_timeout_seconds=0.1)

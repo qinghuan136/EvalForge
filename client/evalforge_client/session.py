@@ -113,7 +113,13 @@ class RunnerSession:
                     await self._apply_cancel(row, "cloud_sync")
                 elif self.jobs is not None:
                     await self.jobs.resume(row)
+            # 本地门禁先打开，保证云端确认 ready 后立即派发也能接收。
+            # ready RPC 失败会进入 finally，门禁随连接关闭，不影响已有 Job 执行。
             self.phase = "ready"
+            ready = await peer.call("runner.ready", {"session_id": self.session_id}, timeout=self.config.rpc_timeout)
+            if (not isinstance(ready, dict) or ready.get("status") != "ready"
+                    or ready.get("session_id") != self.session_id):
+                raise SessionError("Invalid ready response")
             logger.info("Runner session ready runner_id=%r session_id=%r", self.config.runner_id, self.session_id)
             # sync 已报告这些任务的执行状态，不必再重复发送 started。
             reported_started = {key for key, row in snapshot.items() if row.started_at is not None}

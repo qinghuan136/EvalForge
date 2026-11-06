@@ -59,7 +59,7 @@ flowchart TD
 | EVALFORGE_RUNNER_HELLO_TIMEOUT_SECONDS | 10 | 连接建立后完成 hello 的期限，错误 hello 不延长期限。 |
 | EVALFORGE_RUNNER_SESSION_TTL_SECONDS | 60 | Redis 会话租约秒数，正整数。 |
 | EVALFORGE_RUNNER_SESSION_RENEW_SECONDS | 20 | 续租间隔。 |
-| EVALFORGE_RUNNER_SESSION_OPERATION_TIMEOUT_SECONDS | 5 | 单次会话存储操作的超时。 |
+| EVALFORGE_RUNNER_SESSION_OPERATION_TIMEOUT_SECONDS | 5 | 单次会话存储操作或 Attempt 业务操作的超时。 |
 | EVALFORGE_RUNNER_SESSION_QUEUE_SIZE | 32 | 会话事件队列容量，正整数。 |
 
 所有时间必须有限且为正；续租间隔加操作超时必须小于 TTL。监控、调度及存储延迟仍会影响实际失效检测时间。
@@ -68,9 +68,9 @@ flowchart TD
 
 hello 响应仍为 `{"session_id":"...","status":"ready"}`，兼容现有 Client 的解析约定；其中 ready 只表示握手通过。Redis 和服务端本地真实阶段为 syncing，Runner API 显示 online=true、phase=syncing。
 
-服务端尚未注册 runner.sync、runner.ready、jobs.started 或 jobs.complete，调用返回 -32601，不伪造 ACK。现有 Client 在 hello 后继续 sync，因此本阶段还不能完成整个客户端启动闭环。
+服务端已注册 runner.sync、runner.ready、jobs.started 和 jobs.complete，客户端同步后显式确认 ready。数据库提交后才返回结果 ACK，详见 [Attempt 业务与同步](server-attempts.md)。
 
-下一步接入 AttemptService 与结果幂等入库，再实现 sync 和显式 ready。当前单写入模型不替代后续业务事务内的身份、有效会话与 Attempt 归属校验。
+会话事件仍由唯一管理协程处理；AttemptService 管理业务短事务。任务创建、调度与 AttemptWorker 留待后续实现。
 
 ## 验证
 

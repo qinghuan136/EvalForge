@@ -9,6 +9,8 @@ from typing import TypeVar
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError, field_validator
+from sqlalchemy.exc import SQLAlchemyError
+from redis.exceptions import RedisError
 
 from .config import ServerSettings
 from .errors import APIError
@@ -20,6 +22,8 @@ from .session_state_machine import (
     preview_session_transition, validate_session_event,
 )
 from .ws_transport import TransportClosed
+from .schemas.attempts import AttemptKey, AttemptResult, RunnerReady, RunnerSync
+from .services.attempts import AttemptError, AttemptService
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -63,6 +67,13 @@ class HelloReceived:
     reply: asyncio.Future[dict]
 
 
+@dataclass(frozen=True)
+class AttemptReceived:
+    method: str
+    params: AttemptKey | AttemptResult | RunnerSync | RunnerReady
+    reply: asyncio.Future[dict]
+
+
 class RunnerSession:
     def __init__(self, manager: "RunnerSessionManager", identity: RunnerIdentity,
                  peer: JsonRpcPeer, settings: ServerSettings):
@@ -70,7 +81,9 @@ class RunnerSession:
         self.session_id = uuid4().hex
         self._phase = SessionState.CONNECTED
         self.connected_at = datetime.now(timezone.utc)
-        self.events: asyncio.Queue[HelloReceived] = asyncio.Queue(settings.runner_session_queue_size)
+        self.events: asyncio.Queue[HelloReceived | AttemptReceived] = asyncio.Queue(settings.runner_session_queue_size)
+        self.sync_processed = False
+        self.pending_uploads: set[tuple[str, str]] = set()
         self.task: asyncio.Task | None = None
         self._stop: asyncio.Future[int] = asyncio.get_running_loop().create_future()
         self._registration_attempted = False
@@ -139,11 +152,14 @@ class RunnerSession:
             raise RpcError(-32602, "Invalid hello params") from None
         if hello.runner_id != self.identity.runner_id:
             raise RpcError(-32602, "Runner identity mismatch")
+        return await self._submit(HelloReceived(hello, asyncio.get_running_loop().create_future()))
+
+    async def _submit(self, event: HelloReceived | AttemptReceived) -> dict:
         if self.task is None or self.task.done() or self._stop.done():
             raise RpcError(-32001, "Session closed")
-        reply = asyncio.get_running_loop().create_future()
+        reply = event.reply
         try:
-            self.events.put_nowait(HelloReceived(hello, reply))
+            self.events.put_nowait(event)
         except asyncio.QueueFull:
             raise RpcError(-32000, "Session capacity exceeded") from None
         try:
@@ -153,6 +169,77 @@ class RunnerSession:
                 reply.cancel()
             elif not reply.cancelled():
                 reply.exception()
+
+    async def _attempt_request(self, method: str, model: type[BaseModel], params: dict) -> dict:
+        try:
+            parsed = model.model_validate(params)
+        except (ValidationError, ValueError):
+            raise RpcError(-32602, "Invalid attempt params") from None
+        return await self._submit(AttemptReceived(method, parsed, asyncio.get_running_loop().create_future()))
+
+    async def sync(self, **params) -> dict:
+        return await self._attempt_request("runner.sync", RunnerSync, params)
+
+    async def ready(self, **params) -> dict:
+        return await self._attempt_request("runner.ready", RunnerReady, params)
+
+    async def started(self, **params) -> dict:
+        return await self._attempt_request("jobs.started", AttemptKey, params)
+
+    async def complete(self, **params) -> dict:
+        return await self._attempt_request("jobs.complete", AttemptResult, params)
+
+    async def _handle_attempt(self, event: AttemptReceived) -> dict:
+        """RPC 业务入口：单消费者串行修改同步事实，数据库异常在这里收口。"""
+        await self.check_current()
+        params = event.params
+        if event.method == "runner.ready":
+            if params.session_id != self.session_id:
+                raise RpcError(-32001, "Session identity mismatch")
+            try:
+                await self._transition(SessionEvent.READY_REQUESTED, SessionContext(
+                    is_current=True, sync_processed=self.sync_processed,
+                    pending_uploads_count=len(self.pending_uploads)))
+            except TransitionRejected:
+                raise RpcError(-32002, "Session is not ready") from None
+            return {"session_id": self.session_id, "status": "ready"}
+        try:
+            if self.phase not in {SessionState.SYNCING, SessionState.READY}:
+                raise RpcError(-32001, "Hello required")
+            service = self.manager.attempts
+            if service is None:
+                raise RpcError(-32001, "Attempt service unavailable")
+            async with asyncio.timeout(self.settings.runner_session_operation_timeout_seconds):
+                if event.method == "runner.sync":
+                    if self.sync_processed or self.phase != SessionState.SYNCING:
+                        raise RpcError(-32001, "Sync already processed")
+                    result = await service.sync(self.identity, params)
+                    await self.check_current()
+                    self.pending_uploads = {(r.job_id, r.attempt_id) for r in params.pending_results}
+                    self.sync_processed = True
+                    return result
+                if not self.sync_processed:
+                    raise RpcError(-32001, "Sync required")
+                if event.method == "jobs.started":
+                    await service.started(self.identity, params)
+                else:
+                    await service.complete(self.identity, params)
+                await self.check_current()
+                if event.method == "jobs.complete":
+                    self.pending_uploads.discard((params.job_id, params.attempt_id))
+                return {"acknowledged": True}
+        except AttemptError as exc:
+            raise RpcError(-32002, str(exc)) from None
+        except (RpcError, APIError, RedisError):
+            raise
+        except Exception as exc:
+            # 不输出异常文本/SQL 参数，避免把凭据或 Agent 输入输出写进日志。
+            logger.error("Attempt persistence failed method=%s runner_id=%r job_id=%r attempt_id=%r error_type=%s",
+                         event.method, self.identity.runner_id, getattr(params, "job_id", None),
+                         getattr(params, "attempt_id", None), type(exc).__name__)
+            if isinstance(exc, (SQLAlchemyError, TimeoutError)):
+                raise RpcError(-32003, "Attempt persistence unavailable") from None
+            raise RpcError(-32603, "Internal error") from None
 
     async def _handle_hello(self, event: HelloReceived) -> dict:
         try:
@@ -182,7 +269,7 @@ class RunnerSession:
         loop = asyncio.get_running_loop()
         hello_deadline = loop.time() + self.settings.runner_hello_timeout_seconds
         deadline = hello_deadline
-        event: HelloReceived | None = None
+        event: HelloReceived | AttemptReceived | None = None
         getter: asyncio.Task | None = None
         try:
             while not self._stop.done():
@@ -211,9 +298,10 @@ class RunnerSession:
                 if not event.reply.done():
                     try:
                         async with asyncio.timeout_at(hello_deadline if self.phase == SessionState.CONNECTED else None):
-                            result = await self._handle_hello(event)
+                            result = (await self._handle_hello(event) if isinstance(event, HelloReceived)
+                                      else await self._handle_attempt(event))
                     except TimeoutError:
-                        if loop.time() >= hello_deadline:
+                        if isinstance(event, HelloReceived) and loop.time() >= hello_deadline:
                             self.request_close(1008)
                             break
                         raise
@@ -223,7 +311,8 @@ class RunnerSession:
                     else:
                         if not self._stop.done() and not event.reply.done():
                             event.reply.set_result(result)
-                        deadline = loop.time() + self.settings.runner_session_renew_seconds
+                        if isinstance(event, HelloReceived):
+                            deadline = loop.time() + self.settings.runner_session_renew_seconds
                 if self._stop.done():
                     break
                 event = None
@@ -266,8 +355,9 @@ class RunnerSession:
 
 
 class RunnerSessionManager:
-    def __init__(self, connections: RunnerConnections):
+    def __init__(self, connections: RunnerConnections, attempts: AttemptService | None = None):
         self.connections = connections
+        self.attempts = attempts
         self.instance_id = uuid4().hex
         self.sessions: dict[str, RunnerSession] = {}
         self._closing = False

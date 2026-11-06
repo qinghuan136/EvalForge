@@ -20,6 +20,7 @@
 | `jobs.cancel` | Cloud → Runner | 请求取消执行 | `accepted`（仅确认收到取消请求） |
 | `jobs.complete` | Runner → Cloud | 提交最终执行结果 | `acknowledged`（须在云端持久化成功后返回） |
 | `runner.sync` | Runner → Cloud | 重连后对齐未完成任务和待确认结果 | 各任务的后续操作 |
+| `runner.ready` | Runner → Cloud | 明确确认同步完成 | `session_id`、`status=ready` |
 
 ### 2.1 `runner.hello`
 
@@ -32,7 +33,7 @@
 ```
 
 - 云端已实现 hello 注册、租约和新连接接管，真实会话阶段仍为 syncing。响应中的 status=ready 仅兼容握手约定，不允许提前派发任务。
-- runner.sync、显式 runner.ready 和任务业务方法尚未接入；完整 ready 握手下一阶段配套调整。参见 [会话管理基础](server-sessions.md)。
+- 已接入 runner.sync、runner.ready、jobs.started、jobs.complete；调度器尚未接入。参见 [Attempt 业务与同步](server-attempts.md)。
 
 ### 2.2 `jobs.dispatch`
 
@@ -102,9 +103,22 @@
 - `active_jobs` 上报本地 `accepted / running / unknown` 状态；`unknown` 不能用 `continue` 触发重执行。客户端进程启动把遗留 running 转为 unknown，网络重连不会自动改变执行状态。
 - `pending_results` 为保存的完整 `jobs.complete` 业务参数列表，不含 JSON-RPC 封装。Cloud 须对快照中每个 Attempt 返回一条指令；历史待确认结果须明确返回 retry_upload，云端即使已存结果，也可幂等接收后重新确认。
 - 客户端完整校验指令后应用；遗漏、重复、未知 ID、不支持动作或状态冲突使本轮同步失败。快照后新增的最终结果等 ready 后按正常流程上报，不需要再次 sync。
-- hello 的 status=ready 仅表示握手通过；客户端完成 sync 才进入会话 ready。同步完成与执行容量是否空闲分开判断；默认入口已接入单 Job HTTP 执行层并声明 http_json，未注入执行层的独立会话 capabilities 为空并拒绝派发。
-- 重连后先 `runner.hello` 再 `runner.sync`，完成同步后再接受新 Job。
+- hello 的 status=ready 仅表示握手通过；客户端完成 sync、补传历史结果后请求 runner.ready。同步完成与执行容量是否空闲分开判断；默认入口已接入单 Job HTTP 执行层并声明 http_json，未注入执行层的独立会话 capabilities 为空并拒绝派发。
+- 重连后先 runner.hello，再 runner.sync，再 runner.ready。每个连接只成功处理一次 sync；数据库保存失败返回 RPC 错误，不自动重试。
 - 同一 Runner 的新会话接管旧会话；旧连接不可继续派发或上报不属于它的尝试。
+
+### 2.7 `runner.ready`
+
+```json
+{"jsonrpc":"2.0","method":"runner.ready","params":{"session_id":"session-01"},"id":7}
+```
+
+```json
+{"jsonrpc":"2.0","result":{"session_id":"session-01","status":"ready"},"id":7}
+```
+
+- 云端校验当前有效会话、sync 已处理及历史待补传结果全部入库后，条件更新 Redis 会话阶段并确认。重复 ready 幂等。
+- active Job 不需要执行结束，但仍占用容量。客户端先打开本地接单门禁再发 ready；ready 失败则结束会话。
 
 ## 3. 状态与可靠性
 

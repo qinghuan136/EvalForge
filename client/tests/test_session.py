@@ -28,6 +28,8 @@ class FakePeer:
 
     async def call(self, method, params, **kwargs):
         self.calls.append((method, params))
+        if method == "runner.ready" and method not in self.replies:
+            return {"session_id": params["session_id"], "status": "ready"}
         reply = self.replies[method]
         if callable(reply):
             return await reply(params)
@@ -77,7 +79,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             task = asyncio.create_task(session.run(peer))
             try:
                 await self.wait_ready(session, task)
-                self.assertEqual([c[0] for c in peer.calls], ["runner.hello", "runner.sync"])
+                self.assertEqual([c[0] for c in peer.calls], ["runner.hello", "runner.sync", "runner.ready"])
                 self.assertEqual(peer.calls[1][1]["active_jobs"], [])
                 self.assertEqual(await peer.handlers["jobs.dispatch"](),
                                  {"accepted": False, "reason": "executor_unavailable"})
@@ -86,6 +88,18 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                 await task
             self.assertFalse(session.ready)
             self.assertIsNone(session.session_id)
+
+    async def test_ready_response_must_match_session_and_failure_closes_local_gate(self):
+        async with ClientDatabase(self.path) as db:
+            for ready in ({"session_id": "other", "status": "ready"},
+                          {"session_id": "s1", "status": "syncing"}):
+                session = RunnerSession(self.config, AttemptRepository(db))
+                peer = FakePeer({"runner.hello": {"session_id": "s1", "status": "ready"},
+                                 "runner.sync": {"jobs": []}, "runner.ready": ready})
+                with self.subTest(ready=ready), self.assertRaises(SessionError):
+                    await session.run(peer)
+                self.assertFalse(session.ready)
+                self.assertEqual(peer.calls[-1], ("runner.ready", {"session_id": "s1"}))
 
     async def test_historical_pending_requires_cloud_instruction_and_ack(self):
         async with ClientDatabase(self.path) as db:
@@ -104,7 +118,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
             try:
                 await self.wait_ready(session, task)
                 self.assertEqual((await repo.get("j1", "a1")).delivery_status, "acknowledged")
-                self.assertEqual([c[0] for c in peer.calls], ["runner.hello", "runner.sync", "jobs.complete"])
+                self.assertEqual([c[0] for c in peer.calls], ["runner.hello", "runner.sync", "jobs.complete", "runner.ready"])
             finally:
                 peer.closed.set()
                 await task
@@ -235,6 +249,9 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                     return {"jobs": [dict(job_id="j1", attempt_id="a1", action="cancel")]}
                 peer.register("runner.hello", hello)
                 peer.register("runner.sync", sync)
+                async def ready(session_id):
+                    return {"session_id": session_id, "status": "ready"}
+                peer.register("runner.ready", ready)
                 try:
                     if not snapshots:
                         while not snapshots:

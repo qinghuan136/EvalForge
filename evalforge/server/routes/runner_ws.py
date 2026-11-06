@@ -79,7 +79,11 @@ async def runner_websocket(socket: WebSocket):
     try:
         session = socket.app.state.runner_sessions.open(identity, peer, config)
         peer.register("runner.hello", session.hello)
-        # 额外方法由后续业务层注册；不伪造 sync / ready / Job 响应。
+        peer.register("runner.sync", session.sync)
+        peer.register("runner.ready", session.ready)
+        peer.register("jobs.started", session.started)
+        peer.register("jobs.complete", session.complete)
+        # 额外方法由调用方注册，不能覆盖上述内置方法。
         setup = socket.app.state.configure_runner_rpc
         if setup is not None:
             setup(peer, identity)

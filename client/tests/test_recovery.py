@@ -265,7 +265,9 @@ class RecoveryNetworkTests(unittest.IsolatedAsyncioTestCase):
                         replayed.set()
                     return {"acknowledged": True}
 
-                for method, handler in (("runner.hello", hello), ("runner.sync", sync),
+                async def ready(session_id):
+                    return {"session_id": session_id, "status": "ready"}
+                for method, handler in (("runner.hello", hello), ("runner.sync", sync), ("runner.ready", ready),
                                         ("jobs.started", started), ("jobs.complete", complete)):
                     peer.register(method, handler)
                 try:
