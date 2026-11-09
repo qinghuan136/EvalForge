@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,6 +7,7 @@ name = "evalforge"
 version = "0.1.0"
 description = "A small, offline Dataset → Task → Evaluator experiment runner"
 requires-python = ">=3.11"
+license-files = ["third_party/phoenix-*/LICENSE*", "third_party/phoenix-*/IP_NOTICE"]
 dependencies = [
     "SQLAlchemy[asyncio]>=2.0,<3",
     "asyncpg>=0.30,<1",
