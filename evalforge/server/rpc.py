@@ -19,7 +19,7 @@ from jsonrpcserver import Error, Success, async_dispatch_to_serializable
 from jsonrpcserver.response import ErrorResponse, serialize_error
 from jsonrpcserver.sentinels import NODATA
 
-from .ws_transport import TransportClosed
+from .ws_transport import MAX_MESSAGE_BYTES, TransportClosed
 
 logger = logging.getLogger(__name__)
 _MISSING = object()
@@ -44,6 +44,10 @@ class RpcError(Exception):
 
 class RpcProtocolError(Exception):
     """对应本地请求的响应格式无效。"""
+
+
+class RpcRequestTooLarge(ValueError):
+    """请求还未交给传输层，编码大小已经超过限制。"""
 
 
 def _encode(value: Any) -> str:
@@ -145,6 +149,8 @@ class JsonRpcPeer:
         message = jsonrpcclient.request(method, self._params(method, params), id=uuid4().hex)
         request_id = message["id"]
         encoded = _encode(message)
+        if len(encoded.encode("utf-8")) > MAX_MESSAGE_BYTES:
+            raise RpcRequestTooLarge("JSON-RPC request exceeds the message size limit")
         future = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
         try:

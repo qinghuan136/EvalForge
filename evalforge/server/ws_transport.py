@@ -7,13 +7,16 @@ from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
 from .errors import APIError
 
+MAX_MESSAGE_BYTES = 1024 * 1024
+
 
 class TransportClosed(ConnectionError):
     """底层连接已结束，当前 RPC 的等待应失败。"""
 
 
 class WebSocketConnection:
-    def __init__(self, socket: WebSocket, authorize: Callable[[], Awaitable[None]], *, max_size: int = 1048576):
+    def __init__(self, socket: WebSocket, authorize: Callable[[], Awaitable[None]], *,
+                 max_size: int = MAX_MESSAGE_BYTES):
         self.socket, self.authorize, self.max_size = socket, authorize, max_size
         self._send_lock = asyncio.Lock()
         self._closed = False

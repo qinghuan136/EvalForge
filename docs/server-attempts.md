@@ -1,6 +1,6 @@
 # Attempt 业务与同步
 
-本阶段接通 Runner 上报与重连对账。调度器尚未实现，Job / Attempt 由测试预置；服务不创建新尝试、不自动重试 Agent、不执行评分。
+Runner 上报与重连对账由 AttemptService 处理。进程级 Scheduler 通过 DispatchService 领取 Job 并创建 Attempt。两条链路共用数据库状态。见 [当前架构](当前项目架构图解.md#10-进程级调度)。
 
 ## 代码分工
 
@@ -46,7 +46,7 @@ sequenceDiagram
 
 - `runner_attempts`：执行状态、开始上报时间、完整结果、结果接收时间、未知原因及同步产生的取消意图。
 - `experiment_runs`：Job 状态、开始/结束时间、输出、结构化错误、耗时和 HTTP 状态。输出包装为 `{"task_output": 原始输出}`，支持 JSON null。
-- 读取 `runners` 和 `experiments` 校验认证 Runner 与实验用户归属；不改 Dataset、评分表或实验整体完成状态。
+- 读取 `runners` 和 `experiments` 校验认证 Runner 与实验用户归属。V1 实验的最后一个 Job 进入终态时，同一事务将仍为 running 的实验更新为 completed。
 - 每次操作使用独立短事务。按 Runner → Job → Attempt 加行锁；同 Runner 操作串行，终态重复结果只比较确认，冲突拒绝覆盖。
 - `started` 不覆盖终态，也不把 unknown 当作确认仍在运行；sync 的当前 running 快照可以确认仍存活的执行。
 

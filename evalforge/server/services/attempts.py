@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 import json
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from evalforge.db import Database
@@ -20,33 +20,47 @@ class AttemptError(ValueError):
     """可预期的业务拒绝；message 只能使用服务端固定文本。"""
 
 
+async def lock_runner(db: AsyncSession, identity: RunnerIdentity) -> None:
+    # 同一 Runner 的短事务串行化；不持锁等待网络或 Agent。
+    runner = await db.scalar(select(Runner.runner_id).where(
+        Runner.runner_id == identity.runner_id, Runner.owner_user_id == identity.owner_user_id,
+        Runner.deleted_at.is_(None), Runner.enabled.is_(True),
+    ).with_for_update())
+    if runner is None:
+        raise AttemptError("Runner unavailable")
+
+
+async def lock_owned_attempt(db: AsyncSession, identity: RunnerIdentity,
+                             key: AttemptKey) -> tuple[RunnerAttempt, ExperimentRun]:
+    job = await db.scalar(select(ExperimentRun).join(Experiment).where(
+        ExperimentRun.job_id == key.job_id, Experiment.user_id == identity.owner_user_id,
+    ).with_for_update(of=ExperimentRun))
+    if job is None:
+        raise AttemptError("Attempt not found or not assigned to this Runner")
+    attempt = await db.scalar(select(RunnerAttempt).where(
+        RunnerAttempt.attempt_id == key.attempt_id, RunnerAttempt.experiment_run_id == job.id,
+        RunnerAttempt.runner_id == identity.runner_id,
+    ).with_for_update())
+    if attempt is None:
+        raise AttemptError("Attempt not found or not assigned to this Runner")
+    return attempt, job
+
+
+async def finish_experiment(db: AsyncSession, job: ExperimentRun, runner_id: str) -> None:
+    # V1 一个实验绑定一个 Runner，最后一个终态写入和收尾受同一 Runner 行锁保护。
+    incomplete = select(ExperimentRun.id).where(
+        ExperimentRun.experiment_id == Experiment.id, ExperimentRun.status.not_in(TERMINAL),
+    ).exists()
+    await db.execute(update(Experiment).where(
+        Experiment.id == job.experiment_id, Experiment.status == "running",
+        Experiment.execution_config["runner_id"].as_string() == runner_id,
+        ~incomplete,
+    ).values(status="completed").execution_options(synchronize_session=False))
+
+
 class AttemptService:
     def __init__(self, database: Database):
         self.database = database
-
-    async def _lock_runner(self, db: AsyncSession, identity: RunnerIdentity) -> None:
-        # 同一 Runner 的短事务串行化；不持锁等待网络或 Agent。
-        runner = await db.scalar(select(Runner).where(
-            Runner.runner_id == identity.runner_id, Runner.owner_user_id == identity.owner_user_id,
-            Runner.deleted_at.is_(None), Runner.enabled.is_(True),
-        ).with_for_update())
-        if runner is None:
-            raise AttemptError("Runner unavailable")
-
-    async def _owned(self, db: AsyncSession, identity: RunnerIdentity,
-                     key: AttemptKey) -> tuple[RunnerAttempt, ExperimentRun]:
-        job = await db.scalar(select(ExperimentRun).join(Experiment).where(
-            ExperimentRun.job_id == key.job_id, Experiment.user_id == identity.owner_user_id,
-        ).with_for_update(of=ExperimentRun))
-        if job is None:
-            raise AttemptError("Attempt not found or not assigned to this Runner")
-        attempt = await db.scalar(select(RunnerAttempt).where(
-            RunnerAttempt.attempt_id == key.attempt_id, RunnerAttempt.experiment_run_id == job.id,
-            RunnerAttempt.runner_id == identity.runner_id,
-        ).with_for_update())
-        if attempt is None:
-            raise AttemptError("Attempt not found or not assigned to this Runner")
-        return attempt, job
 
     @staticmethod
     def _same_result(attempt: RunnerAttempt, result: AttemptResult) -> None:
@@ -63,8 +77,8 @@ class AttemptService:
 
     async def started(self, identity: RunnerIdentity, key: AttemptKey) -> None:
         async with self.database.transaction() as db:
-            await self._lock_runner(db, identity)
-            attempt, job = await self._owned(db, identity, key)
+            await lock_runner(db, identity)
+            attempt, job = await lock_owned_attempt(db, identity, key)
             if attempt.status in TERMINAL:
                 return  # 迟到的 started 不覆盖终态。
             self._can_update(attempt, job)
@@ -77,8 +91,8 @@ class AttemptService:
 
     async def complete(self, identity: RunnerIdentity, result: AttemptResult) -> None:
         async with self.database.transaction() as db:
-            await self._lock_runner(db, identity)
-            attempt, job = await self._owned(db, identity, result)
+            await lock_runner(db, identity)
+            attempt, job = await lock_owned_attempt(db, identity, result)
             if attempt.status in TERMINAL:
                 self._same_result(attempt, result)
                 return
@@ -90,6 +104,7 @@ class AttemptService:
             job.output = {"task_output": result.output}
             job.error = result.error.model_dump() if result.error is not None else None
             job.duration_ms, job.http_status, job.end_time = result.duration_ms, result.http_status, now
+            await finish_experiment(db, job, identity.runner_id)
         # 离开事务（包括 commit）成功后，调用方才可返回 ACK。
 
     async def sync(self, identity: RunnerIdentity, snapshot: RunnerSync) -> dict:
@@ -98,9 +113,9 @@ class AttemptService:
         instructions = []
         seen = {(row.job_id, row.attempt_id) for row in [*snapshot.active_jobs, *snapshot.pending_results]}
         async with self.database.transaction() as db:
-            await self._lock_runner(db, identity)
+            await lock_runner(db, identity)
             for result in snapshot.pending_results:
-                attempt, job = await self._owned(db, identity, result)
+                attempt, job = await lock_owned_attempt(db, identity, result)
                 if attempt.status in TERMINAL:
                     self._same_result(attempt, result)
                 else:
@@ -108,7 +123,7 @@ class AttemptService:
                 instructions.append({"job_id": result.job_id, "attempt_id": result.attempt_id,
                                      "action": "retry_upload"})
             for local in snapshot.active_jobs:
-                attempt, job = await self._owned(db, identity, local)
+                attempt, job = await lock_owned_attempt(db, identity, local)
                 cancel = attempt.status in TERMINAL or attempt.status == "rejected"
                 if not cancel:
                     self._can_update(attempt, job)

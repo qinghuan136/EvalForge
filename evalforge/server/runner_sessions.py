@@ -4,7 +4,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from typing import TypeVar
 from uuid import uuid4
 
@@ -92,6 +92,11 @@ class RunnerSession:
     @property
     def phase(self) -> SessionState:
         return self._phase
+
+    @property
+    def can_dispatch(self) -> bool:
+        return (self.phase == SessionState.READY and not self._stop.done()
+                and self._registration is not None and "http_json" in self._registration.capabilities)
 
     async def _transition(self, event: SessionEvent, context: SessionContext) -> None:
         """唯一阶段提交入口；先由状态机判断，存储确认后才更新本地阶段。"""
@@ -202,6 +207,7 @@ class RunnerSession:
                     pending_uploads_count=len(self.pending_uploads)))
             except TransitionRejected:
                 raise RpcError(-32002, "Session is not ready") from None
+            self.manager.notify_work()
             return {"session_id": self.session_id, "status": "ready"}
         try:
             if self.phase not in {SessionState.SYNCING, SessionState.READY}:
@@ -224,6 +230,7 @@ class RunnerSession:
                     await service.started(self.identity, params)
                 else:
                     await service.complete(self.identity, params)
+                    self.manager.notify_work()
                 await self.check_current()
                 if event.method == "jobs.complete":
                     self.pending_uploads.discard((params.job_id, params.attempt_id))
@@ -358,9 +365,17 @@ class RunnerSessionManager:
     def __init__(self, connections: RunnerConnections, attempts: AttemptService | None = None):
         self.connections = connections
         self.attempts = attempts
+        self.on_work_available: Callable[[], None] | None = None
         self.instance_id = uuid4().hex
         self.sessions: dict[str, RunnerSession] = {}
         self._closing = False
+
+    def notify_work(self) -> None:
+        if self.on_work_available is not None:
+            self.on_work_available()
+
+    def ready_sessions(self) -> list[RunnerSession]:
+        return [session for session in self.sessions.values() if session.can_dispatch]
 
     def open(self, identity: RunnerIdentity, peer: JsonRpcPeer, settings: ServerSettings) -> RunnerSession:
         if self._closing:

@@ -33,7 +33,7 @@
 ```
 
 - 云端已实现 hello 注册、租约和新连接接管，真实会话阶段仍为 syncing。响应中的 status=ready 仅兼容握手约定，不允许提前派发任务。
-- 已接入 runner.sync、runner.ready、jobs.started、jobs.complete；调度器尚未接入。参见 [Attempt 业务与同步](server-attempts.md)。
+- 云端根据当前会话的真实 ready 阶段和 Runner 的执行容量决定何时派发。参见 [Attempt 业务与同步](server-attempts.md)。
 
 ### 2.2 `jobs.dispatch`
 
@@ -47,7 +47,7 @@
 
 - `accepted=true` 仅表示 Runner 已接收该尝试，**不代表执行成功**。
 - Runner 先持久化再确认接单。同一 job_id + attempt_id 的相同参数重复派发正常确认且不重复执行；参数不一致返回 accepted=false、reason=attempt_conflict。先去重，再判断容量。
-- Runner 若繁忙或未配置 `agent_target_id`，返回 `accepted=false`，`reason` 可为 `busy` / `target_not_found`；Cloud 负责重新调度。尚未完成同步时返回 `not_ready`；未接入执行层时返回 `executor_unavailable`。
+- `accepted=false` 且原因为 `busy` 或 `not_ready` 时，Cloud 将 Job 放回队列并延迟再尝试。目标不存在或执行层不可用时，Runner 分别返回 `target_not_found` 或 `executor_unavailable`，Cloud 将 Job 标记为 failed。回执超时、连接断开或回执格式无效时，仍处于 assigned 的 Job 和 Attempt 转为 unknown，等待重连对账。
 - `input` **原样作为目标 HTTP JSON 请求体**；目标 URL、鉴权等由 Runner 的本地配置决定。
 
 ### 2.3 `jobs.started`

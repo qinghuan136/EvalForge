@@ -18,6 +18,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from redis.exceptions import ConnectionError as RedisConnectionError
 from websockets.asyncio.client import connect
@@ -25,7 +26,10 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from api_support import APITestCase, SQLiteDatabase
 from attempt_support import seed_attempt, result_params
-from evalforge.db.models import Runner, RunnerCredential, User
+from evalforge.db.models import (
+    Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion, ExperimentRun, Runner, RunnerAttempt,
+    RunnerCredential, User,
+)
 
 
 class RunnerWebSocketTests(APITestCase):
@@ -163,6 +167,80 @@ class RunnerWebSocketTests(APITestCase):
             self.assertEqual(sync["jobs"][0]["action"], "retry_upload")
             await call(ws, "jobs.complete", result_params(key))
             await call(ws, "runner.ready", {"session_id": hello["session_id"]})
+
+    async def test_created_experiment_dispatches_frozen_input_after_ready_and_completes(self):
+        owner = await self.user()
+        async with self.database.transaction() as db:
+            dataset = Dataset(name="dispatch", user_id=owner.id)
+            db.add(dataset)
+            await db.flush()
+            dataset_id = dataset.id
+            example = DatasetExample(dataset_id=dataset_id)
+            db.add(example)
+            await db.flush()
+            example_id = example.id
+            versions = []
+            for kind, value in (("CREATE", "frozen"), ("PATCH", "latest")):
+                version = DatasetVersion(dataset_id=dataset_id)
+                db.add(version)
+                await db.flush()
+                versions.append(version.id)
+                db.add(DatasetExampleRevision(dataset_example_id=example_id, dataset_version_id=version.id,
+                                              revision_kind=kind, input={"value": value}, output={"answer": "hidden"}))
+        response = await self.client.post(f"/api/v1/datasets/{dataset_id}/experiments", json={
+            "name": "dispatch", "repetitions": 2, "dataset_version_id": versions[0],
+            "execution_config": {"runner_id": self.runner_id, "agent_target_id": "agent", "timeout_seconds": 12},
+        })
+        self.assertEqual(response.status_code, 201, response.text)
+        url = response.headers["location"]
+        self.assertEqual(response.json()["progress"]["queued"], 2)
+
+        async def send(ws, method, params):
+            await ws.send(json.dumps({"jsonrpc": "2.0", "id": method, "method": method, "params": params}))
+
+        async def recv(ws):
+            return json.loads(await asyncio.wait_for(ws.recv(), 4))
+
+        async with self.connection() as ws:
+            hello = await self.hello(ws)
+            await send(ws, "runner.sync", {"runner_id": self.runner_id, "active_jobs": [], "pending_results": []})
+            self.assertEqual((await recv(ws))["result"], {"jobs": []})
+            self.assertEqual((await self.client.get(url)).json()["progress"]["queued"], 2)
+            await send(ws, "runner.ready", {"session_id": hello["session_id"]})
+            ready, dispatch = await recv(ws), await recv(ws)
+            if dispatch["id"] == "runner.ready":
+                ready, dispatch = dispatch, ready
+            self.assertEqual(ready["result"]["status"], "ready")
+
+            for repetition in (1, 2):
+                self.assertEqual(dispatch["method"], "jobs.dispatch")
+                payload = dispatch["params"]
+                key = payload["job_id"], payload["attempt_id"]
+                self.assertEqual(payload, {
+                    "job_id": key[0], "attempt_id": key[1], "agent_target_id": "agent", "example_id": str(example_id),
+                    "input": {"value": "frozen"}, "timeout_seconds": 12,
+                })
+                async with self.database.transaction() as db:
+                    job = await db.scalar(select(ExperimentRun).where(ExperimentRun.job_id == key[0]))
+                    attempt = await db.scalar(select(RunnerAttempt).where(RunnerAttempt.attempt_id == key[1]))
+                    self.assertEqual((job.repetition_number, job.status, attempt.status), (repetition, "assigned", "assigned"))
+                    self.assertEqual(attempt.dispatch_json, payload)
+                # 模拟 Agent 先于接单响应完成；迟到的 accepted 不得回退终态。
+                await send(ws, "jobs.complete", result_params(key))
+                self.assertEqual((await recv(ws))["result"], {"acknowledged": True})
+                await ws.send(json.dumps({"jsonrpc": "2.0", "id": dispatch["id"], "result": {"accepted": True}}))
+                if repetition == 1:
+                    dispatch = await recv(ws)
+            result = (await self.client.get(url)).json()
+            self.assertEqual((result["status"], result["progress"]["succeeded"]), ("completed", 2))
+            async with asyncio.timeout(3):
+                while True:
+                    async with self.database.transaction() as db:
+                        attempt = await db.scalar(select(RunnerAttempt).where(RunnerAttempt.attempt_id == key[1]))
+                        self.assertEqual(attempt.status, "succeeded")
+                        if attempt.accepted_at is not None:
+                            break
+                    await asyncio.sleep(0.01)
 
     async def test_missing_hello_closes_idle_connection(self):
         self.app.state.settings = replace(self.app.state.settings, runner_hello_timeout_seconds=0.1)

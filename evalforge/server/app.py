@@ -13,16 +13,20 @@ from evalforge.redis import RedisSettings, RedisStore
 from .config import ServerSettings
 from .errors import install_handlers
 from .routes.auth import router as auth_router
+from .routes.experiments import router as experiments_router
 from .routes.runners import router as runners_router
 from .routes.runner_ws import router as runner_ws_router
 from .rpc import JsonRpcPeer
 from .runner_auth import RunnerAuth, RunnerIdentity
 from .runner_connections import RunnerConnections
 from .runner_sessions import RunnerSessionManager
+from .scheduler import Scheduler
 from .security import Passwords
 from .services.auth import AuthService
 from .services.runners import RunnerService
 from .services.attempts import AttemptService
+from .services.dispatch import DispatchService
+from .services.experiments import ExperimentService
 from .sessions import SessionStore
 
 
@@ -48,6 +52,11 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
             app.state.runner_auth = RunnerAuth(db)
             app.state.runner_sessions = RunnerSessionManager(connections, AttemptService(db))
             resources.push_async_callback(app.state.runner_sessions.close)
+            scheduler = Scheduler(app.state.runner_sessions, DispatchService(db))
+            app.state.runner_sessions.on_work_available = scheduler.wake
+            app.state.experiments = ExperimentService(db, scheduler.wake)
+            scheduler.start()
+            resources.push_async_callback(scheduler.close)
             # 注入资源由调用方管理；应用创建的资源由 AsyncExitStack 按逆序关闭。
             yield
 
@@ -61,11 +70,12 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
     @app.middleware("http")
     async def no_auth_cache(request: Request, call_next):
         response = await call_next(request)
-        if request.url.path.startswith(("/api/v1/auth/", "/api/v1/runners")):
+        if request.url.path.startswith(("/api/v1/auth/", "/api/v1/runners", "/api/v1/datasets/", "/api/v1/experiments/")):
             response.headers["Cache-Control"] = "no-store"
         return response
 
     app.include_router(auth_router)
+    app.include_router(experiments_router)
     app.include_router(runners_router)
     app.include_router(runner_ws_router)
     return app
