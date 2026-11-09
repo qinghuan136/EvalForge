@@ -69,7 +69,7 @@ class DeliveryStatus(StrEnum):
 
 
 TERMINAL_STATUSES = ("succeeded", "failed", "cancelled")
-UNRESOLVED_STATUSES = ("accepted", "running", "unknown")
+ACTIVE_STATUSES = ("accepted", "running")
 
 
 class Base(DeclarativeBase):

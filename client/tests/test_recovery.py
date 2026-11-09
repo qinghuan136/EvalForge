@@ -199,14 +199,13 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
                 await self.seed(path, running=True, cancel=cancel)
                 async with AsyncExitStack() as stack:
                     repo, jobs = await self.components(stack, path)
-                    peer = self.peer(sync={"jobs": [{"job_id": "j1", "attempt_id": "a1", "action": "cancel"}]})
+                    peer = self.peer()
                     _, task = await self.start_session(repo, jobs, peer)
                     row = await repo.get("j1", "a1")
                     self.assertEqual(row.execution_status, "unknown")
                     self.assertIsNone(row.result_json)
-                    self.assertEqual(row.cancel_reason, "original_cancel" if cancel else "cloud_sync")
-                    self.assertEqual(await peer.handlers["jobs.dispatch"](**dispatch_params("j2")),
-                                     {"accepted": False, "reason": "busy"})
+                    self.assertEqual(row.cancel_reason, "original_cancel" if cancel else None)
+                    self.assertEqual(peer.calls[1][1]["active_jobs"], [])
                     peer.closed.set()
                     await task
         self.assertEqual(self.requests, [])

@@ -27,7 +27,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 from api_support import APITestCase, SQLiteDatabase
 from attempt_support import seed_attempt, result_params
 from evalforge.db.models import (
-    Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion, ExperimentRun, Runner, RunnerAttempt,
+    Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment, ExperimentRun, Runner, RunnerAttempt,
     RunnerCredential, User,
 )
 
@@ -241,6 +241,45 @@ class RunnerWebSocketTests(APITestCase):
                         if attempt.accepted_at is not None:
                             break
                     await asyncio.sleep(0.01)
+
+    async def test_experiment_cancel_reaches_runner_and_survives_reconnect_until_final_result(self):
+        owner = await self.user()
+        key = await seed_attempt(self.database, owner.id, self.runner_id)
+        async with self.database.transaction() as db:
+            experiment = await db.scalar(select(Experiment))
+            experiment.execution_config = {"runner_id": self.runner_id, "agent_target_id": "agent", "timeout_seconds": 60}
+            experiment_id = experiment.id
+        path = f"/api/v1/experiments/{experiment_id}"
+        snapshot = {"runner_id": self.runner_id, "active_jobs": [{
+            "job_id": key[0], "attempt_id": key[1], "status": "running"}], "pending_results": []}
+
+        async def call(ws, method, params):
+            await ws.send(json.dumps({"jsonrpc": "2.0", "method": method, "id": method, "params": params}))
+            reply = json.loads(await asyncio.wait_for(ws.recv(), 4))
+            self.assertEqual(reply["id"], method)
+            return reply["result"]
+
+        async with self.connection() as ws:
+            hello = await self.hello(ws)
+            self.assertEqual((await call(ws, "runner.sync", snapshot))["jobs"][0]["action"], "continue")
+            await call(ws, "runner.ready", {"session_id": hello["session_id"]})
+            response = await self.client.post(path + "/cancel")
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.json()["status"], "cancelling")
+            request = json.loads(await asyncio.wait_for(ws.recv(), 4))
+            self.assertEqual(request["method"], "jobs.cancel")
+            self.assertEqual(request["params"], {"job_id": key[0], "attempt_id": key[1], "reason": "user_requested"})
+            await ws.send(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": {"accepted": True}}))
+            self.assertEqual((await self.client.get(path)).json()["status"], "cancelling")
+
+        async with self.connection() as ws:
+            await self.hello(ws)
+            self.assertEqual((await call(ws, "runner.sync", snapshot))["jobs"][0]["action"], "cancel")
+            # 客户端可能已取得结果，取消不能覆盖这次执行的真实终态。
+            self.assertEqual(await call(ws, "jobs.complete", result_params(key)), {"acknowledged": True})
+        result = (await self.client.get(path)).json()
+        self.assertEqual((result["status"], result["progress"]["succeeded"]), ("cancelled", 1))
+        self.assertEqual((await self.client.post(path + "/cancel")).json(), result)
 
     async def test_missing_hello_closes_idle_connection(self):
         self.app.state.settings = replace(self.app.state.settings, runner_hello_timeout_seconds=0.1)

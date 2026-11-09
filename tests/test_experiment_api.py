@@ -3,12 +3,12 @@
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-from sqlalchemy import event, func, select, update
+from sqlalchemy import delete, event, func, select, update
 from sqlalchemy.exc import OperationalError
 
 from api_support import APITestCase
 from evalforge.db.models import (
-    Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment,
+    BuiltinEvaluator, Dataset, DatasetEvaluators, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment,
     ExperimentDatasetExample, ExperimentRun, Runner, RunnerAttempt,
 )
 
@@ -35,6 +35,7 @@ class ExperimentAPITests(APITestCase):
             self.updated_revision = await self.revise(db, self.example_ids[0], self.v2, "PATCH")
             await self.revise(db, self.example_ids[1], self.v2, "DELETE")
         self.path = f"/api/v1/datasets/{self.dataset_id}/experiments"
+        self.evaluator_path = f"/api/v1/datasets/{self.dataset_id}/evaluators"
 
     @staticmethod
     async def version(db, dataset_id):
@@ -67,6 +68,111 @@ class ExperimentAPITests(APITestCase):
         self.assertEqual(response.status_code, status, response.text)
         self.assertEqual(response.json()["error"]["code"], code)
 
+    @staticmethod
+    def evaluator_payload(**changes):
+        return {"name": "category_match", "evaluator_key": "exact_match", "input_mapping": {
+            "path_mapping": {"actual": "$.output.items[0].label", "expected": "$.reference.category"},
+            "literal_mapping": {"case_sensitive": False},
+        }, **changes}
+
+    async def create_evaluator(self, path=None, **changes):
+        response = await self.client.post(path or self.evaluator_path, json=self.evaluator_payload(**changes))
+        self.assertEqual(response.status_code, 201, response.text)
+        return response.json()
+
+    async def test_evaluator_catalog_and_dataset_binding_list(self):
+        catalog_path = "/api/v1/evaluators/builtin"
+        self.assert_error(await self.new_client().get(catalog_path), 401, "not_authenticated")
+        catalog = await self.client.get(catalog_path)
+        self.assertEqual(catalog.status_code, 200, catalog.text)
+        self.assertEqual(catalog.headers["cache-control"], "no-store")
+        rules = {rule["key"]: rule for rule in catalog.json()}
+        self.assertEqual(len(rules), 5)
+        self.assertEqual(set(rules["exact_match"]["input_schema"]["required"]), {"actual", "expected"})
+        self.assertEqual(rules["exact_match"]["output_configs"][0]["name"], "exact_match")
+        first = await self.create_evaluator()
+        second = await self.create_evaluator(name="  answer_match  ")
+        self.assertEqual(second["name"], "answer_match")
+        self.assertEqual(first["output_configs"][0]["name"], "category_match")
+        page = await self.client.get(self.evaluator_path, params={"page": 2, "pagesize": 1})
+        self.assertEqual(page.status_code, 200, page.text)
+        self.assertEqual(page.json(), {"items": [second], "page": 2, "pagesize": 1, "total": 2})
+        async with self.database.transaction() as db:
+            rule, = (await db.scalars(select(BuiltinEvaluator))).all()
+            self.assertEqual(rule.key, "exact_match")
+            self.assertEqual(set((await db.scalars(select(DatasetEvaluators.evaluator_id))).all()), {rule.id})
+
+    async def test_dataset_evaluator_access_and_validation(self):
+        self.assert_error(await self.new_client().get(self.evaluator_path), 401, "not_authenticated")
+        csrf = self.client.headers.pop("X-CSRF-Token")
+        self.assert_error(await self.client.post(self.evaluator_path, json=self.evaluator_payload()), 403, "csrf_invalid")
+        self.client.headers["X-CSRF-Token"] = csrf
+        other = self.new_client()
+        await self.register("bob", other)
+        await self.login(other, username="bob")
+        self.assert_error(await other.get(self.evaluator_path), 404, "dataset_not_found")
+        self.assert_error(await other.post(self.evaluator_path, json=self.evaluator_payload()), 404, "dataset_not_found")
+        self.assert_error(await self.client.post(self.evaluator_path, json=self.evaluator_payload(evaluator_key="missing")),
+                          404, "builtin_evaluator_not_found")
+        invalid_mappings = (
+            {"path_mapping": {"actual": "$.output", "expected": "$.reference[*]"}},
+            {"path_mapping": {"actual": "$.other", "expected": "$.reference"}},
+            {"path_mapping": {"actual": "$.output"}},
+            {"path_mapping": {"actual": "$.output", "expected": "$.reference"}, "literal_mapping": {"actual": "dup"}},
+            {"literal_mapping": {"actual": "a", "expected": "a", "case_sensitive": "false"}},
+            {"literal_mapping": {"actual": "a", "expected": "a", "typo": False}},
+        )
+        for mapping in invalid_mappings:
+            with self.subTest(mapping=mapping):
+                response = await self.client.post(self.evaluator_path, json=self.evaluator_payload(input_mapping=mapping))
+                self.assert_error(response, 422, "invalid_input_mapping")
+        await self.create_evaluator()
+        self.assert_error(await self.client.post(self.evaluator_path, json=self.evaluator_payload()),
+                          409, "dataset_evaluator_name_conflict")
+
+    async def test_experiment_snapshots_order_and_scope_and_survives_configuration_changes(self):
+        first = await self.create_evaluator()
+        second = await self.create_evaluator(name="answer_match")
+        async with self.database.transaction() as db:
+            other = Dataset(name="另一个数据集", user_id=self.owner_id)
+            db.add(other)
+            await db.flush()
+            other_path = f"/api/v1/datasets/{other.id}/evaluators"
+        foreign = await self.create_evaluator(other_path)
+        ids = [second["dataset_evaluator_id"], first["dataset_evaluator_id"]]
+        self.assert_error(await self.client.post(self.path, json=self.payload(dataset_evaluator_ids=[ids[0], ids[0]])),
+                          422, "invalid_request")
+        self.assert_error(await self.client.post(self.path, json=self.payload(dataset_evaluator_ids=[foreign["dataset_evaluator_id"]])),
+                          404, "dataset_evaluator_not_found")
+        async with self.database.transaction() as db:
+            self.assertEqual(await db.scalar(select(func.count()).select_from(Experiment)), 0)
+        created = await self.create_experiment(dataset_evaluator_ids=ids)
+        expected = [{key: value for key, value in row.items() if key != "dataset_id"} for row in (second, first)]
+        self.assertEqual(created.json()["evaluators"], expected)
+        async with self.database.transaction() as db:
+            await db.execute(update(DatasetEvaluators).where(DatasetEvaluators.id == ids[0]).values(name="renamed"))
+            await db.execute(delete(DatasetEvaluators).where(DatasetEvaluators.id == ids[1]))
+        detail = await self.client.get(created.headers["location"])
+        self.assertEqual(detail.status_code, 200, detail.text)
+        self.assertEqual(detail.json()["evaluators"], expected)
+
+    async def test_binding_insert_failure_rolls_back_new_builtin_catalog_row(self):
+        engine = self.database.engine.sync_engine
+
+        def fail_binding_insert(_conn, _cursor, statement, params, _context, _many):
+            if statement.lstrip().upper().startswith("INSERT INTO DATASET_EVALUATORS"):
+                raise OperationalError(statement, params, RuntimeError("private failure details"))
+
+        event.listen(engine, "before_cursor_execute", fail_binding_insert)
+        try:
+            response = await self.client.post(self.evaluator_path, json=self.evaluator_payload())
+        finally:
+            event.remove(engine, "before_cursor_execute", fail_binding_insert)
+        self.assert_error(response, 503, "service_unavailable")
+        async with self.database.transaction() as db:
+            self.assertEqual(await db.scalar(select(func.count()).select_from(BuiltinEvaluator)), 0)
+        await self.create_evaluator()
+
     async def test_create_locks_version_and_revisions_and_queues_repetitions_without_dispatch(self):
         older = (await self.create_experiment(dataset_version_id=self.v1)).json()
         async with self.database.transaction() as db:
@@ -85,6 +191,7 @@ class ExperimentAPITests(APITestCase):
             "runner_id": self.runner_id, "agent_target_id": "order-agent", "timeout_seconds": 60,
         })
         self.assertEqual(detail["metadata"], {"tags": ["回归", None]})
+        self.assertEqual(detail["evaluators"], [])
         self.assertEqual(detail["status"], "pending")
         self.assertEqual(detail["progress"], {"example_count": 2, "job_count": 4, "queued": 4,
                                              "assigned": 0, "running": 0, "succeeded": 0,
@@ -143,12 +250,15 @@ class ExperimentAPITests(APITestCase):
     async def test_unauthenticated_requests_and_create_csrf_origin(self):
         anonymous = self.new_client()
         for response in (await anonymous.post(self.path, json=self.payload()),
-                         await anonymous.get(self.path), await anonymous.get("/api/v1/experiments/1")):
+                         await anonymous.get(self.path), await anonymous.get("/api/v1/experiments/1"),
+                         await anonymous.post("/api/v1/experiments/1/cancel")):
             self.assert_error(response, 401, "not_authenticated")
         self.assert_error(await self.client.post(self.path, json=self.payload(), headers={"X-CSRF-Token": "bad"}),
                           403, "csrf_invalid")
         self.assert_error(await self.client.post(self.path, json=self.payload(), headers={"Origin": "https://other.example"}),
                           403, "origin_forbidden")
+        self.assert_error(await self.client.post("/api/v1/experiments/1/cancel", headers={"X-CSRF-Token": "bad"}),
+                          403, "csrf_invalid")
 
     async def test_dataset_experiment_version_and_runner_ownership(self):
         detail = await self.create_experiment()
@@ -159,6 +269,7 @@ class ExperimentAPITests(APITestCase):
         self.assert_error(await bob.post(self.path, json=self.payload()), 404, "dataset_not_found")
         self.assert_error(await bob.get(self.path), 404, "dataset_not_found")
         self.assert_error(await bob.get(detail.headers["location"]), 404, "experiment_not_found")
+        self.assert_error(await bob.post(detail.headers["location"] + "/cancel"), 404, "experiment_not_found")
         async with self.database.transaction() as db:
             other = Dataset(name="另一个数据集", user_id=self.owner_id)
             ownerless = Dataset(name="没有归属的数据集")
@@ -176,6 +287,18 @@ class ExperimentAPITests(APITestCase):
             await db.execute(update(Runner).where(Runner.runner_id == self.runner_id).values(enabled=False))
         self.assert_error(await self.client.post(self.path, json=self.payload()), 409, "runner_disabled")
         self.assertEqual((await self.client.get(self.path)).json()["total"], 1)
+
+    async def test_cancel_pending_experiment_settles_all_queued_jobs_idempotently(self):
+        created = await self.create_experiment(repetitions=2)
+        path = created.headers["location"] + "/cancel"
+        response = await self.client.post(path)
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual((result["status"], result["progress"]["cancelled"], result["progress"]["queued"]),
+                         ("cancelled", 4, 0))
+        self.assertEqual((await self.client.post(path)).json(), result)
+        async with self.database.transaction() as db:
+            self.assertEqual(await db.scalar(select(func.count()).select_from(RunnerAttempt)), 0)
 
     async def test_request_validation_rejects_reserved_fields_invalid_ids_and_nonfinite_numbers(self):
         for changes in ({"status": "running"}, {"user_id": self.owner_id}, {"dataset_id": self.dataset_id},

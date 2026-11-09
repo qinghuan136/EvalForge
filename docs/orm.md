@@ -41,7 +41,7 @@ Experiment（整体状态、execution_config）
 - Run 默认 queued；assigned / running / unknown 均未产生最终结果。终态为 succeeded / failed / cancelled；output 包装成 `{"task_output": ...}`，有效 JSON null 与未产生结果的 SQL NULL 区分。
 - Run.error 改为 JSON `{code, message}`；HTTP 状态、客户端 duration_ms 单独保存。实际起止时间可空，不能用云端收到通知的时间伪造；latency_ms 优先 duration_ms，其次实际时间差，否则为空。
 - Attempt 保存 dispatch_json / result_json 与归属、取消意图、云端接收时间。runner_id 已建立到 runners.runner_id 的 RESTRICT 外键及普通索引；身份和凭证记录已定义，实际鉴权后续实现。
-- Attempt 的 assigned / accepted / running / unknown 占活动容量；部分唯一索引分别约束每个 Runner、每个 Job 最多一个活动 Attempt。明确拒绝用 rejected + rejection_reason；超时不等于拒绝。
+- Attempt 的 assigned / accepted / running 占活动容量。部分唯一索引约束每个 Runner、每个 Job 最多一个活动 Attempt。unknown 保留为已跳过的历史记录，明确拒绝用 rejected + rejection_reason。
 - 旧 ExperimentJob 的 table.info 标记 deprecated；Experiment.job 仅保留兼容关系。新实验不要求建立旧配置记录，也不新增远程配置子表。
 
 本阶段只定义 ORM 与约束。消息快照的字段形状、标识一致性、配置冻结、结果幂等与不可重写、采用哪次 Attempt、实验状态推进由后续写入服务实现；不自动重试或发送 ACK。评分表结构保持原样。
@@ -86,11 +86,11 @@ Experiment（整体状态、execution_config）
 | LLMEvaluator.prompt_id / prompt_version_tag_id | prompts.id / prompt_version_tags.id |
 | CodeEvaluator.language / sandbox_config_id | languages.name / sandbox_configs.id |
 | CodeEvaluator 的 sandbox_config_id + language | sandbox_configs 的 id + language |
-| DatasetEvaluators.project_id | projects.id |
+| DatasetEvaluators.project_id | projects.id（当前可空，按数据集归属校验访问） |
 | ExperimentPromptTask.custom_provider_id / prompt_version_id | generative_model_custom_providers.id / prompt_versions.id |
 
 字段的 Column.info、复合约束的 Table.info 保存目标信息，供后续补迁移时参考；它们本身不生成 SQL 约束。
-外部字段仍保留原字典的类型、可空性和索引；必填字段暂由调用方提供标识，当前数据库不校验其目标是否存在。
+外部字段保留引用类型和索引。`dataset_evaluators.project_id` 在尚未接入项目模块时允许为空。已有开发库若按旧版 ORM 建表，需要在自己的 Alembic 迁移中移除该列的 `NOT NULL`。
 users 为真实账号模型，不是占位表；未创建 Trace、Prompt、沙箱等占位表。
 
 ## 验证与迁移

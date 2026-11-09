@@ -80,7 +80,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             finished = await repo.finish("j1", "a1", self.result())
             self.assertEqual(finished.delivery_status, "pending")
             self.assertEqual(len(await repo.list_pending_results()), 1)
-            self.assertEqual(await repo.list_unresolved(), [])
+            self.assertEqual(await repo.list_active(), [])
         async with ClientDatabase(self.path) as db:
             repo = AttemptRepository(db)
             finished_again = await repo.finish("j1", "a1", self.result())
@@ -113,7 +113,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await repo.claim("j1", "running"))
             with self.assertRaises(InvalidAttemptState):
                 await repo.finish("j1", "running", self.result("running"))
-            self.assertEqual({r.attempt_id for r in await repo.list_unresolved()}, {"accepted", "running"})
+            self.assertEqual([r.attempt_id for r in await repo.list_active()], ["accepted"])
             self.assertEqual([r.attempt_id for r in await repo.list_pending_results()], ["done"])
 
     async def test_cancellation_intent_blocks_claim_and_can_finish_before_execution(self):
@@ -136,7 +136,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
                             {"input_json": float("nan")}, {"input_json": {"bad": object()}}):
                 with self.subTest(changes=changes), self.assertRaises(ValueError):
                     await self.accept(repo, **changes)
-            self.assertEqual(await repo.list_unresolved(), [])
+            self.assertEqual(await repo.list_active(), [])
             await self.accept(repo)
             with self.assertRaises(InvalidAttemptState):
                 await repo.acknowledge("j1", "a1")

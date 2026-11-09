@@ -1,15 +1,16 @@
 """创建固定版本的实验及待执行 Job，查询时批量聚合进度。"""
 
 from collections.abc import Callable
+from datetime import datetime, timezone
 
-from sqlalchemy import func, insert, select
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 
 from evalforge.db import Database
 from evalforge.db.models import (
-    Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment,
-    ExperimentDatasetExample, ExperimentRun, Runner,
+    DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment,
+    ExperimentDatasetExample, ExperimentRun, Runner, RunnerAttempt,
 )
 
 from ..errors import APIError
@@ -18,6 +19,9 @@ from ..schemas.experiments import (
     SavedExecutionConfig,
 )
 from .auth import locked_user
+from .attempts import ACTIVE, SETTLED_JOBS
+from .datasets import require_owned_dataset
+from .evaluators import load_evaluator_snapshots
 
 MAX_EXPERIMENT_JOBS = 10_000
 JOB_STATUSES = ("queued", "assigned", "running", "succeeded", "failed", "cancelled", "unknown")
@@ -34,7 +38,8 @@ def _detail(experiment: Experiment, progress: ExperimentProgress) -> ExperimentD
     config = {name: experiment.execution_config[name] for name in SavedExecutionConfig.__annotations__
               if name in experiment.execution_config}
     return ExperimentDetail(**_summary_fields(experiment, progress), description=experiment.description,
-                            metadata=experiment.metadata_, execution_config=config)
+                            metadata=experiment.metadata_, execution_config=config,
+                            evaluators=experiment.execution_config.get("evaluators", []))
 
 
 def _snapshot_query(dataset_id: int, version_id: int, limit: int):
@@ -60,19 +65,11 @@ class ExperimentService:
         self.database = database
         self.on_work_available = on_work_available
 
-    @staticmethod
-    async def _require_dataset(db: AsyncSession, owner_id: int, dataset_id: int, *, lock: bool = False):
-        query = select(Dataset.id).where(Dataset.id == dataset_id, Dataset.user_id == owner_id)
-        if lock:
-            query = query.with_for_update(read=True)
-        if await db.scalar(query) is None:
-            raise APIError(404, "dataset_not_found", "数据集不存在")
-
     async def create(self, owner_id: int, auth_version: int, dataset_id: int,
                      data: ExperimentCreate) -> ExperimentDetail:
         async with self.database.transaction() as db:
             await locked_user(db, owner_id, auth_version)
-            await self._require_dataset(db, owner_id, dataset_id, lock=True)
+            await require_owned_dataset(db, owner_id, dataset_id, lock=True)
             versions = select(DatasetVersion.id).where(DatasetVersion.dataset_id == dataset_id)
             if data.dataset_version_id is not None:
                 versions = versions.where(DatasetVersion.id == data.dataset_version_id)
@@ -96,10 +93,14 @@ class ExperimentService:
             if len(snapshot) > max_examples:
                 raise APIError(422, "experiment_job_limit_exceeded", "实验 Job 数量超过单次创建上限")
 
+            evaluators = await load_evaluator_snapshots(db, dataset_id, data.dataset_evaluator_ids)
+            execution_config = data.execution_config.model_dump()
+            if evaluators:
+                execution_config["evaluators"] = [evaluator.model_dump(mode="json") for evaluator in evaluators]
             experiment = Experiment(user_id=owner_id, dataset_id=dataset_id, dataset_version_id=version_id,
                                     name=data.name, description=data.description, repetitions=data.repetitions,
                                     status="pending", metadata_=data.metadata,
-                                    execution_config=data.execution_config.model_dump())
+                                    execution_config=execution_config)
             db.add(experiment)
             await db.flush()
             await db.execute(insert(ExperimentDatasetExample), [
@@ -141,7 +142,7 @@ class ExperimentService:
 
     async def list(self, owner_id: int, dataset_id: int, page: int, pagesize: int) -> ExperimentPage:
         async with self.database.transaction() as db:
-            await self._require_dataset(db, owner_id, dataset_id)
+            await require_owned_dataset(db, owner_id, dataset_id)
             scope = (Experiment.dataset_id == dataset_id, Experiment.user_id == owner_id)
             total = await db.scalar(select(func.count()).select_from(Experiment).where(*scope))
             experiments = (await db.scalars(select(Experiment).where(*scope)
@@ -160,3 +161,42 @@ class ExperimentService:
             if experiment is None:
                 raise APIError(404, "experiment_not_found", "实验不存在")
             return _detail(experiment, (await self._progress(db, [experiment_id]))[experiment_id])
+
+    async def cancel(self, owner_id: int, auth_version: int, experiment_id: int) -> ExperimentDetail:
+        async with self.database.transaction() as db:
+            await locked_user(db, owner_id, auth_version)
+            scope = (Experiment.id == experiment_id, Experiment.user_id == owner_id)
+            config = await db.scalar(select(Experiment.execution_config).where(*scope))
+            if config is None:
+                raise APIError(404, "experiment_not_found", "实验不存在")
+            # 先锁 Runner，再读取并锁定实验。离线或停用的 Runner 也可以取消。
+            runner_id = config.get("runner_id")
+            if isinstance(runner_id, str):
+                await db.scalar(select(Runner.runner_id).where(
+                    Runner.runner_id == runner_id, Runner.owner_user_id == owner_id,
+                ).with_for_update())
+            experiment = await db.scalar(select(Experiment).where(*scope).with_for_update())
+            if experiment is None:
+                raise APIError(404, "experiment_not_found", "实验不存在")
+            cancelling = experiment.status in {"pending", "running", "cancelling"}
+            if cancelling:
+                now = datetime.now(timezone.utc)
+                experiment.status = "cancelling"
+                jobs = select(ExperimentRun.id).where(ExperimentRun.experiment_id == experiment_id)
+                await db.execute(update(ExperimentRun).where(
+                    ExperimentRun.experiment_id == experiment_id, ExperimentRun.status == "queued",
+                ).values(status="cancelled", output={"task_output": None}, end_time=now))
+                await db.execute(update(RunnerAttempt).where(
+                    RunnerAttempt.experiment_run_id.in_(jobs), RunnerAttempt.status.in_(ACTIVE),
+                    RunnerAttempt.cancel_requested_at.is_(None),
+                ).values(cancel_requested_at=now, cancel_reason="user_requested"))
+            progress = (await self._progress(db, [experiment_id]))[experiment_id]
+            if cancelling:
+                if progress.job_count == sum(getattr(progress, status) for status in SETTLED_JOBS):
+                    experiment.status = "cancelled"
+                await db.flush()
+                await db.refresh(experiment, ["updated_at"])
+            result = _detail(experiment, progress)
+        if cancelling and self.on_work_available is not None:
+            self.on_work_available()
+        return result

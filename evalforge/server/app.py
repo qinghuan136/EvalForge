@@ -13,6 +13,7 @@ from evalforge.redis import RedisSettings, RedisStore
 from .config import ServerSettings
 from .errors import install_handlers
 from .routes.auth import router as auth_router
+from .routes.evaluators import router as evaluators_router
 from .routes.experiments import router as experiments_router
 from .routes.runners import router as runners_router
 from .routes.runner_ws import router as runner_ws_router
@@ -26,6 +27,7 @@ from .services.auth import AuthService
 from .services.runners import RunnerService
 from .services.attempts import AttemptService
 from .services.dispatch import DispatchService
+from .services.evaluators import DatasetEvaluatorService
 from .services.experiments import ExperimentService
 from .sessions import SessionStore
 
@@ -54,6 +56,7 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
             resources.push_async_callback(app.state.runner_sessions.close)
             scheduler = Scheduler(app.state.runner_sessions, DispatchService(db))
             app.state.runner_sessions.on_work_available = scheduler.wake
+            app.state.dataset_evaluators = DatasetEvaluatorService(db)
             app.state.experiments = ExperimentService(db, scheduler.wake)
             scheduler.start()
             resources.push_async_callback(scheduler.close)
@@ -70,11 +73,13 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
     @app.middleware("http")
     async def no_auth_cache(request: Request, call_next):
         response = await call_next(request)
-        if request.url.path.startswith(("/api/v1/auth/", "/api/v1/runners", "/api/v1/datasets/", "/api/v1/experiments/")):
+        if request.url.path.startswith(("/api/v1/auth/", "/api/v1/runners", "/api/v1/datasets/",
+                                        "/api/v1/experiments/", "/api/v1/evaluators/")):
             response.headers["Cache-Control"] = "no-store"
         return response
 
     app.include_router(auth_router)
+    app.include_router(evaluators_router)
     app.include_router(experiments_router)
     app.include_router(runners_router)
     app.include_router(runner_ws_router)

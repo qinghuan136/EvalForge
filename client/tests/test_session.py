@@ -212,7 +212,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                 await RunnerSession(self.config, repo).run(peer)
             self.assertEqual((await repo.get("j1", "a1")).delivery_status, "pending")
 
-    async def test_unknown_continue_rejected_and_cancel_retains_unknown(self):
+    async def test_unknown_is_not_in_active_snapshot(self):
         async with ClientDatabase(self.path) as db:
             repo = AttemptRepository(db)
             await self.seed(repo)
@@ -222,13 +222,13 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                              "runner.sync": {"jobs": [dict(job_id="j1", attempt_id="a1", action="continue")]}})
             with self.assertRaises(SessionError):
                 await session.run(peer)
-            peer.replies["runner.sync"]["jobs"][0]["action"] = "cancel"
+            peer.replies["runner.sync"] = {"jobs": []}
             task = asyncio.create_task(session.run(peer))
             try:
                 await self.wait_ready(session, task)
                 row = await repo.get("j1", "a1")
                 self.assertEqual(row.execution_status, "unknown")
-                self.assertEqual(row.cancel_requested, 1)
+                self.assertEqual(peer.calls[-2][1]["active_jobs"], [])
             finally:
                 peer.closed.set()
                 await task
@@ -246,7 +246,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                     snapshots.append(params)
                     if len(snapshots) == 2:
                         connected_twice.set()
-                    return {"jobs": [dict(job_id="j1", attempt_id="a1", action="cancel")]}
+                    return {"jobs": []}
                 peer.register("runner.hello", hello)
                 peer.register("runner.sync", sync)
                 async def ready(session_id):
@@ -275,7 +275,7 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaises(asyncio.CancelledError):
                         await task
                 self.assertEqual(recover.call_count, 1)
-        self.assertEqual([s["active_jobs"][0]["status"] for s in snapshots], ["unknown", "unknown"])
+        self.assertEqual([s["active_jobs"] for s in snapshots], [[], []])
 
     def test_configuration_uses_env_and_config_relative_paths_without_exposing_token(self):
         path = Path(self.temp.name) / "client.json"

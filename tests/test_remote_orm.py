@@ -87,7 +87,7 @@ class RemoteORMTests(unittest.TestCase):
             self.assertIsNone(history["a2"].result_json)
             self.assertEqual(history["a2"].dispatch_json["job_id"], run.job_id)
 
-    def test_only_one_active_attempt_per_runner_and_per_job_including_unknown(self):
+    def test_only_one_active_attempt_per_runner_and_per_job_excluding_unknown(self):
         with Session(self.engine) as session, session.begin():
             first_run, second_run = self.seed_run(session), self.seed_run(session)
             first = self.attempt(first_run)
@@ -102,14 +102,7 @@ class RemoteORMTests(unittest.TestCase):
         with Session(self.engine) as session, session.begin():
             first = session.get(RunnerAttempt, first_id)
             first.status, first.unknown_reason = "unknown", "runner_reported_unknown"
-        with Session(self.engine) as session:
-            session.add(self.attempt(session.get(ExperimentRun, second_run_id), "a2"))
-            with self.assertRaises(IntegrityError):
-                session.commit()
         with Session(self.engine) as session, session.begin():
-            first = session.get(RunnerAttempt, first_id)
-            first.status, first.result_json, first.result_received_at = "failed", self.result(first.experiment_run), NOW
-            session.flush()
             session.add(self.attempt(session.get(ExperimentRun, second_run_id), "a2"))
         with Session(self.engine) as session:
             self.assertEqual(session.scalar(select(func.count()).select_from(RunnerAttempt)), 2)
@@ -205,7 +198,7 @@ class RemoteORMTests(unittest.TestCase):
         self.assertEqual(len(indexes), 2)
         for sql in indexes:
             self.assertIn("WHERE status IN", sql)
-            self.assertIn("'unknown'", sql)
+            self.assertNotIn("'unknown'", sql)
         with Session(self.engine) as session, session.begin():
             session.delete(session.get(Experiment, experiment_id))
         with Session(self.engine) as session:

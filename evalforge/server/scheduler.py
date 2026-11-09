@@ -9,7 +9,7 @@ from redis.exceptions import RedisError
 from .errors import APIError
 from .rpc import RpcError, RpcProtocolError, RpcRequestTooLarge
 from .runner_sessions import RunnerSession, RunnerSessionManager
-from .services.dispatch import DispatchService, RETRYABLE_REJECTIONS
+from .services.dispatch import CancelRequest, DispatchService, RETRYABLE_REJECTIONS
 from .ws_transport import TransportClosed
 
 logger = logging.getLogger(__name__)
@@ -26,6 +26,7 @@ class Scheduler:
         self._tasks: dict[str, asyncio.Task] = {}
         self._capacity = asyncio.Semaphore(32)
         self._retry_after: dict[str, float] = {}
+        self._cancel_acks: dict[str, str] = {}  # session_id → 已确认接收取消指令的 attempt_id
 
     def start(self) -> None:
         self._loop = asyncio.create_task(self._run(), name="scheduler")
@@ -46,7 +47,10 @@ class Scheduler:
             self._wake.clear()
             now = asyncio.get_running_loop().time()
             self._retry_after = {key: deadline for key, deadline in self._retry_after.items() if deadline > now}
-            for session in self.sessions.ready_sessions():
+            sessions = self.sessions.ready_sessions()
+            session_ids = {session.session_id for session in sessions}
+            self._cancel_acks = {key: value for key, value in self._cancel_acks.items() if key in session_ids}
+            for session in sessions:
                 runner_id = session.identity.runner_id
                 if runner_id not in self._tasks and runner_id not in self._retry_after:
                     task = asyncio.create_task(self._dispatch_one(session), name=f"dispatch-{runner_id}")
@@ -79,12 +83,19 @@ class Scheduler:
 
     async def _send_one(self, session: RunnerSession) -> None:
         identity = session.identity
-        claim = await self.dispatch.claim(identity)
-        if claim is None:
+        action = await self.dispatch.next_action(identity)
+        if isinstance(action, CancelRequest):
+            await self._send_cancel(session, action)
             return
+        self._cancel_acks.pop(session.session_id, None)
+        if action is None:
+            return
+        claim = action
         if not await self._can_dispatch(session):
             # 从未进入 RPC，因此可以安全释放这次预留。
             await self.dispatch.record(identity, claim, outcome="rejected", reason="session_unavailable")
+            return
+        if not await self.dispatch.prepare_send(identity, claim):
             return
 
         sent_at = datetime.now(timezone.utc)
@@ -116,7 +127,28 @@ class Scheduler:
                 session.request_close(1011)
             raise
         if changed and outcome == "unknown":
-            # 触发重连对账；unknown 继续占用容量，迟到结果仍可补传。
+            # 触发重连对账，再给新会话派发后续 Job。
             session.request_close(1011)
         if changed and outcome == "rejected" and reason in RETRYABLE_REJECTIONS:
             self._retry_after[identity.runner_id] = asyncio.get_running_loop().time() + self.retry_delay
+        if outcome == "accepted":
+            self.wake()  # 接单期间写入的取消意图可以立即处理。
+
+    async def _send_cancel(self, session: RunnerSession, request: CancelRequest) -> None:
+        if self._cancel_acks.get(session.session_id) == request.key.attempt_id:
+            return
+        if not await self._can_dispatch(session):
+            return
+        try:
+            reply = await session.peer.call("jobs.cancel", {**request.key.model_dump(), "reason": request.reason},
+                                            timeout=self.dispatch_timeout)
+        except (TimeoutError, TransportClosed, RpcError, RpcProtocolError):
+            reply = None
+        if isinstance(reply, dict):
+            if reply.get("accepted") is True:
+                self._cancel_acks[session.session_id] = request.key.attempt_id
+                return  # 最终状态由 jobs.complete 写入。
+            if reply.get("reason") == "attempt_not_found":
+                session.request_close(1011)  # 重连快照可以区分缺失尝试和已有结果。
+                return
+        self._retry_after[session.identity.runner_id] = asyncio.get_running_loop().time() + self.retry_delay

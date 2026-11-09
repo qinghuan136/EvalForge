@@ -188,7 +188,7 @@
     "description": true,
     "input_mapping": false,
     "output_configs": true,
-    "project_id": false,
+    "project_id": true,
     "user_id": true,
     "created_at": false,
     "updated_at": false

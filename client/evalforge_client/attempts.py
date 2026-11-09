@@ -8,7 +8,7 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.sqlite import insert
 
 from .database import ClientDatabase
-from .models import RunnerAttempt, TERMINAL_STATUSES, UNRESOLVED_STATUSES, encode_json, utc_now
+from .models import ACTIVE_STATUSES, RunnerAttempt, TERMINAL_STATUSES, encode_json, utc_now
 
 
 class AttemptConflict(ValueError):
@@ -132,8 +132,8 @@ class AttemptRepository:
             ).values(execution_status="unknown", unknown_reason="client_restarted", updated_at=utc_now()))
             return result.rowcount
 
-    async def list_unresolved(self) -> list[RunnerAttempt]:
-        return await self._list(RunnerAttempt.execution_status.in_(UNRESOLVED_STATUSES))
+    async def list_active(self) -> list[RunnerAttempt]:
+        return await self._list(RunnerAttempt.execution_status.in_(ACTIVE_STATUSES))
 
     async def list_pending_results(self) -> list[RunnerAttempt]:
         return await self._list(RunnerAttempt.delivery_status == "pending")
@@ -142,10 +142,10 @@ class AttemptRepository:
         """同一个短事务获取完整快照，避免两次查询之间任务完成导致遗漏。"""
         async with self.database.session() as session:
             rows = list(await session.scalars(select(RunnerAttempt).where(
-                (RunnerAttempt.execution_status.in_(UNRESOLVED_STATUSES)) |
+                (RunnerAttempt.execution_status.in_(ACTIVE_STATUSES)) |
                 (RunnerAttempt.delivery_status == "pending")
             ).order_by(RunnerAttempt.accepted_at, RunnerAttempt.job_id, RunnerAttempt.attempt_id)))
-            return ([row for row in rows if row.execution_status in UNRESOLVED_STATUSES],
+            return ([row for row in rows if row.execution_status in ACTIVE_STATUSES],
                     [row for row in rows if row.delivery_status == "pending"])
 
     async def _list(self, condition) -> list[RunnerAttempt]:

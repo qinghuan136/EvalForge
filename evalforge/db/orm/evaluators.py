@@ -114,7 +114,7 @@ class DatasetEvaluators(HasId):
     output_configs: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON_VALUE)
     input_mapping: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE)
     user_id: Mapped[int | None] = deferred_reference("users.id", index=True)
-    project_id: Mapped[int] = deferred_reference("projects.id", nullable=False, index=True, ondelete="RESTRICT")
+    project_id: Mapped[int | None] = deferred_reference("projects.id", index=True, ondelete="RESTRICT")
     created_at: Mapped[datetime] = mapped_column(UTC_TIMESTAMP, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(UTC_TIMESTAMP, server_default=func.now(), onupdate=func.now())
 

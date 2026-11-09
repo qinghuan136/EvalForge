@@ -129,16 +129,37 @@ class AttemptServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.sync(self.identity, self.snapshot("running"))
         self.assertEqual([r.status for r in await self.rows()], ["running", "running"])
 
-    async def test_unknown_and_missing_do_not_release_capacity_or_restart_task(self):
-        response = await self.service.sync(self.identity, self.snapshot("unknown"))
-        self.assertEqual(response["jobs"][0]["action"], "cancel")
+    async def test_missing_attempt_is_skipped_and_late_reports_do_not_reactivate_it(self):
+        async with self.database.transaction() as db:
+            experiment = await db.scalar(select(Experiment))
+            experiment.execution_config = {"runner_id": self.identity.runner_id}
+        self.assertEqual(await self.service.sync(self.identity, self.snapshot()), {"jobs": []})
         self.assertEqual([r.status for r in await self.rows()], ["unknown", "unknown"])
-        await self.service.sync(self.identity, self.snapshot())
         self.assertEqual((await self.rows())[0].unknown_reason, "missing_from_client_snapshot")
+        async with self.database.transaction() as db:
+            self.assertEqual((await db.scalar(select(Experiment))).status, "completed")
+        response = await self.service.sync(self.identity, self.snapshot("running"))
+        self.assertEqual(response["jobs"][0]["action"], "cancel")
         await self.service.started(self.identity, AttemptKey(job_id=self.key[0], attempt_id=self.key[1]))
-        self.assertEqual((await self.rows())[0].status, "unknown")
+        self.assertEqual([r.status for r in await self.rows()], ["unknown", "unknown"])
         await self.service.complete(self.identity, self.result())
-        self.assertEqual((await self.rows())[0].status, "succeeded")
+        self.assertEqual([r.status for r in await self.rows()], ["succeeded", "succeeded"])
+        async with self.database.transaction() as db:
+            self.assertEqual((await db.scalar(select(Experiment))).status, "completed")
+
+    async def test_late_unknown_result_is_saved_without_overwriting_newer_attempt(self):
+        await self.service.sync(self.identity, self.snapshot())
+        async with self.database.transaction() as db:
+            job = await db.scalar(select(ExperimentRun))
+            db.add(RunnerAttempt(experiment_run_id=job.id, runner_id=self.identity.runner_id,
+                                 attempt_id="newer", status="unknown", unknown_reason="test", dispatch_json={}))
+        reply = await self.service.sync(self.identity, self.snapshot(pending=True))
+        self.assertEqual(reply["jobs"][0]["action"], "retry_upload")
+        await self.service.complete(self.identity, self.result())
+        attempt, job = await self.rows()
+        self.assertEqual(attempt.status, "succeeded")
+        self.assertEqual(job.status, "unknown")
+        self.assertIsNone(job.output)
 
     async def test_sync_cancel_intent_and_terminal_are_not_overwritten_by_running(self):
         async with self.database.transaction() as db:
@@ -158,11 +179,19 @@ class AttemptServiceTests(unittest.IsolatedAsyncioTestCase):
             attempt = await db.scalar(select(RunnerAttempt))
             attempt.cancel_requested_at = datetime.now(timezone.utc)
             attempt.cancel_reason = "user_requested"
+            experiment = await db.scalar(select(Experiment))
+            experiment.status = "cancelling"
+            experiment.execution_config = {"runner_id": self.identity.runner_id}
         response = await self.service.sync(self.identity, self.snapshot("unknown"))
         attempt, job = await self.rows()
         self.assertEqual(response["jobs"][0]["action"], "cancel")
         self.assertEqual((attempt.status, job.status), ("unknown", "unknown"))
         self.assertEqual(attempt.cancel_reason, "user_requested")
+        async with self.database.transaction() as db:
+            self.assertEqual((await db.scalar(select(Experiment))).status, "cancelled")
+        await self.service.complete(self.identity, self.result())
+        async with self.database.transaction() as db:
+            self.assertEqual((await db.scalar(select(Experiment))).status, "cancelled")
 
     async def test_sync_experiment_cancellation_returns_cancel_without_fabricating_result(self):
         async with self.database.transaction() as db:

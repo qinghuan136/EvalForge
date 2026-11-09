@@ -47,7 +47,7 @@ sequenceDiagram
 1. 参数必须包含 job_id、attempt_id、agent_target_id、example_id、input、timeout_seconds；未知字段、非法 JSON 或非正有限超时返回 JSON-RPC -32602。
 2. 已有同一 job_id + attempt_id：参数相同返回 accepted=true，不重做 running/终态/unknown；参数不同返回 attempt_conflict。
 3. 新任务的本地目标不存在：返回 target_not_found。
-4. 正在执行，或数据库存在 accepted/running/unknown：返回 busy，不保存被拒绝任务。
+4. 正在执行，或数据库存在 accepted/running：返回 busy，不保存被拒绝任务。unknown 保留在历史中，允许接收后续 Job。
 5. 空闲时先提交 accepted，再创建执行协程并确认接单。
 
 只有 claim 成功才能发 HTTP。完成后不论成功还是调用失败，都通过 finish 原子保存终态和 pending 结果。已完成但未 ACK 的记录不占执行容量。

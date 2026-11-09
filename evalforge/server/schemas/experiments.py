@@ -1,6 +1,5 @@
 """实验创建参数及查询响应；不暴露 ORM 内部字段。"""
 
-import math
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 
@@ -9,20 +8,10 @@ from pydantic.json_schema import SkipJsonSchema
 from typing_extensions import TypedDict
 
 from .auth import Schema
+from .common import PositiveDbId, StoredText, validate_database_json
+from .evaluators import EvaluatorSnapshot
 
-MAX_DB_ID = 2_147_483_647
-PositiveDbId = Annotated[int, Field(strict=True, ge=1, le=MAX_DB_ID)]
 ExperimentStatus = Literal["pending", "running", "cancelling", "completed", "failed", "cancelled"]
-
-
-def database_text(value: str) -> str:
-    if "\x00" in value:
-        raise ValueError("Text must not contain a null character")
-    value.encode("utf-8")  # PostgreSQL 文本与 JSONB 不能保存孤立代理字符。
-    return value
-
-
-StoredText = Annotated[str, AfterValidator(database_text)]
 
 
 class ExecutionConfig(Schema):
@@ -48,8 +37,9 @@ class ExperimentCreate(Schema):
     description: StoredText | None = Field(default=None, max_length=2000)
     dataset_version_id: PositiveDbId | SkipJsonSchema[None] = Field(default_factory=lambda: None)
     repetitions: int = Field(default=1, strict=True, ge=1, le=100)
-    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    metadata: Annotated[dict[str, JsonValue], AfterValidator(validate_database_json)] = Field(default_factory=dict)
     execution_config: ExecutionConfig
+    dataset_evaluator_ids: list[PositiveDbId] = Field(default_factory=list, max_length=100)
 
     @field_validator("name", mode="before")
     @classmethod
@@ -63,22 +53,12 @@ class ExperimentCreate(Schema):
             raise ValueError("Omit dataset_version_id to use the latest version")
         return value
 
-    @field_validator("metadata")
+    @field_validator("dataset_evaluator_ids")
     @classmethod
-    def valid_metadata(cls, value):
-        pending = [value]
-        while pending:
-            item = pending.pop()
-            if isinstance(item, dict):
-                pending.extend(item.keys())
-                pending.extend(item.values())
-            elif isinstance(item, list):
-                pending.extend(item)
-            elif isinstance(item, str):
-                database_text(item)
-            elif isinstance(item, float) and not math.isfinite(item):
-                raise ValueError("Metadata numbers must be finite")
-        return value
+    def unique_evaluator_ids(cls, ids: list[int]) -> list[int]:
+        if len(set(ids)) != len(ids):
+            raise ValueError("Dataset evaluator IDs must be unique")
+        return ids
 
 
 class ExperimentProgress(Schema):
@@ -121,6 +101,7 @@ class ExperimentDetail(ExperimentSummary):
     description: str | None
     metadata: dict[str, JsonValue]
     execution_config: SavedExecutionConfig
+    evaluators: list[EvaluatorSnapshot] = Field(default_factory=list)
 
 
 class ExperimentPage(Schema):

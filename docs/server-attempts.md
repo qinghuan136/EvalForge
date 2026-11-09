@@ -46,17 +46,17 @@ sequenceDiagram
 
 - `runner_attempts`：执行状态、开始上报时间、完整结果、结果接收时间、未知原因及同步产生的取消意图。
 - `experiment_runs`：Job 状态、开始/结束时间、输出、结构化错误、耗时和 HTTP 状态。输出包装为 `{"task_output": 原始输出}`，支持 JSON null。
-- 读取 `runners` 和 `experiments` 校验认证 Runner 与实验用户归属。V1 实验的最后一个 Job 进入终态时，同一事务将仍为 running 的实验更新为 completed。
+- 读取 `runners` 和 `experiments` 校验认证 Runner 与实验用户归属。所有 Job 均为终态或已跳过的 `unknown` 时，同一事务将 `running` 实验更新为 `completed`，将 `cancelling` 实验更新为 `cancelled`。
 - 每次操作使用独立短事务。按 Runner → Job → Attempt 加行锁；同 Runner 操作串行，终态重复结果只比较确认，冲突拒绝覆盖。
-- `started` 不覆盖终态，也不把 unknown 当作确认仍在运行；sync 的当前 running 快照可以确认仍存活的执行。
+- 已跳过的 Attempt 保持 `unknown`，迟到的 `started` 或 `running` 快照不会重新占位。迟到的最终结果可按原 Attempt 幂等补传。原 Attempt 仍是最新尝试且 Job 仍为 `unknown` 时，同时补齐 Job 结果。
 
 ## sync 与 ready
 
 - 一个连接只成功处理一次 sync；校验整个快照，任一项目不合法则回滚。
 - pending_results 不在 sync 中直接保存，统一返回 retry_upload；即使数据库已有相同结果，也重传并幂等确认。
 - active accepted / running 按可信归属对账；已有取消意图或服务端终态返回 cancel，不据此伪造 cancelled 结果。
-- 本地 unknown 返回 cancel，仅保留未知事实和取消意图，不重新执行，也不释放容量。
-- 云端活跃 Attempt 未出现在客户端快照中：标记 unknown，原因 missing_from_client_snapshot。第一版不自动重试或人工裁决。
+- 客户端只上报 `accepted` 和 `running` 活跃尝试。本地 `unknown` 作为历史保存，释放执行容量。云端兼容旧客户端上报的单条 `unknown`，将其跳过并返回 `cancel`。
+- 云端活跃 Attempt 未出现在客户端快照中时，标记 `unknown` 并记录 `missing_from_client_snapshot`。后续可继续领取其他 Job。
 - 会话内存保存 sync_processed 与历史 pending_uploads；历史结果事务提交成功并确认会话仍有效后才移除，重连重建。
 - ready 使用已有状态机：有效会话、sync 已处理、历史 pending 为空；Redis 条件更新成功后响应。重复 ready 幂等。
 - active Job 不阻塞 ready，但继续占用执行容量。快照后产生的新结果可在 syncing（sync 已完成）或 ready 阶段提交。

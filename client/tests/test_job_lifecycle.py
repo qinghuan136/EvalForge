@@ -47,7 +47,7 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
 
         async def agent(request):
             # 在产生外部调用之前，running 必须已经持久化。
-            rows = await self.repo.list_unresolved()
+            rows = await self.repo.list_active()
             self.assertEqual([r.execution_status for r in rows], ["running"])
             self.requests.append(request)
             self.entered.set()
@@ -100,7 +100,7 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn({"accepted": False, "reason": "busy"}, replies)
         await asyncio.wait_for(self.entered.wait(), 3)
         self.assertEqual(len(self.requests), 1)
-        self.assertEqual(len(await self.repo.list_unresolved()), 1)
+        self.assertEqual(len(await self.repo.list_active()), 1)
         self.release.set()
 
     async def test_invalid_params_and_unknown_target_never_accept_or_call_agent(self):
@@ -114,7 +114,7 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(caught.exception.code, -32602)
         self.assertEqual(await self.jobs.dispatch(dispatch_params(agent_target_id="missing")),
                          {"accepted": False, "reason": "target_not_found"})
-        self.assertEqual(await self.repo.list_unresolved(), [])
+        self.assertEqual(await self.repo.list_active(), [])
         self.assertEqual(self.requests, [])
 
     async def test_http_failures_become_persisted_failed_results_without_retry(self):
@@ -155,17 +155,20 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.repo.get("j1", "a1")).execution_status, "running")
         self.assertEqual(len(self.requests), 1)
 
-    async def test_unknown_blocks_new_jobs_and_is_never_reexecuted(self):
+    async def test_unknown_allows_new_jobs_and_is_never_reexecuted(self):
         values = dispatch_params()
         await self.repo.accept(job_id="j1", attempt_id="a1", agent_target_id="agent", example_id="e1",
                                input_json=values["input"], timeout_seconds=1)
         await self.repo.claim("j1", "a1")
         await self.repo.recover_interrupted()
         self.assertEqual(await self.jobs.dispatch(values), {"accepted": True})
-        self.assertEqual(await self.jobs.dispatch(dispatch_params("j2")), {"accepted": False, "reason": "busy"})
         with self.assertRaises(RpcError):
             await self.jobs.resume(await self.repo.get("j1", "a1"))
         self.assertEqual(self.requests, [])
+        self.assertEqual(await self.jobs.dispatch(dispatch_params("j2")), {"accepted": True})
+        self.assertEqual((await self.finished("j2")).execution_status, "succeeded")
+        self.assertEqual((await self.repo.get("j1", "a1")).execution_status, "unknown")
+        self.assertEqual(len(self.requests), 1)
 
     async def test_continue_of_accepted_attempt_starts_once(self):
         self.release.clear()

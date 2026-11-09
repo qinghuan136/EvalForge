@@ -26,13 +26,13 @@ class RunnerAttempt(HasId):
         CheckConstraint("status <> 'unknown' OR unknown_reason IS NOT NULL", name="unknown_reason"),
         CheckConstraint("status <> 'rejected' OR rejection_reason IS NOT NULL", name="rejection_reason"),
         CheckConstraint("cancel_reason IS NULL OR cancel_requested_at IS NOT NULL", name="cancel_intent"),
-        # 未知尝试也占用容量，不能因失联就派发另一个可能重复执行的任务。
+        # unknown 保留结果未知的历史，释放 Runner 和 Job 的活动名额。
         Index("uq_runner_attempts_active_runner", "runner_id", unique=True,
-              postgresql_where=text("status IN ('assigned','accepted','running','unknown')"),
-              sqlite_where=text("status IN ('assigned','accepted','running','unknown')")),
+              postgresql_where=text("status IN ('assigned','accepted','running')"),
+              sqlite_where=text("status IN ('assigned','accepted','running')")),
         Index("uq_runner_attempts_active_run", "experiment_run_id", unique=True,
-              postgresql_where=text("status IN ('assigned','accepted','running','unknown')"),
-              sqlite_where=text("status IN ('assigned','accepted','running','unknown')")),
+              postgresql_where=text("status IN ('assigned','accepted','running')"),
+              sqlite_where=text("status IN ('assigned','accepted','running')")),
     )
 
     attempt_id: Mapped[str] = mapped_column(unique=True, default=lambda: str(uuid4()))

@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 import json
 
-from sqlalchemy import select, update
+from sqlalchemy import case, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from evalforge.db import Database
@@ -13,7 +13,8 @@ from ..runner_auth import RunnerIdentity
 from ..schemas.attempts import AttemptKey, AttemptResult, RunnerSync
 
 TERMINAL = {"succeeded", "failed", "cancelled"}
-ACTIVE = {"assigned", "accepted", "running", "unknown"}
+ACTIVE = {"assigned", "accepted", "running"}
+SETTLED_JOBS = TERMINAL | {"unknown"}
 
 
 class AttemptError(ValueError):
@@ -49,13 +50,14 @@ async def lock_owned_attempt(db: AsyncSession, identity: RunnerIdentity,
 async def finish_experiment(db: AsyncSession, job: ExperimentRun, runner_id: str) -> None:
     # V1 一个实验绑定一个 Runner，最后一个终态写入和收尾受同一 Runner 行锁保护。
     incomplete = select(ExperimentRun.id).where(
-        ExperimentRun.experiment_id == Experiment.id, ExperimentRun.status.not_in(TERMINAL),
+        ExperimentRun.experiment_id == Experiment.id, ExperimentRun.status.not_in(SETTLED_JOBS),
     ).exists()
     await db.execute(update(Experiment).where(
-        Experiment.id == job.experiment_id, Experiment.status == "running",
+        Experiment.id == job.experiment_id, Experiment.status.in_(("running", "cancelling")),
         Experiment.execution_config["runner_id"].as_string() == runner_id,
         ~incomplete,
-    ).values(status="completed").execution_options(synchronize_session=False))
+    ).values(status=case((Experiment.status == "cancelling", "cancelled"), else_="completed"))
+        .execution_options(synchronize_session=False))
 
 
 class AttemptService:
@@ -72,22 +74,20 @@ class AttemptService:
 
     @staticmethod
     def _can_update(attempt: RunnerAttempt, job: ExperimentRun) -> None:
-        if attempt.status not in ACTIVE or job.status in TERMINAL:
+        if attempt.status not in ACTIVE or job.status in SETTLED_JOBS:
             raise AttemptError("Attempt cannot update this Job")
 
     async def started(self, identity: RunnerIdentity, key: AttemptKey) -> None:
         async with self.database.transaction() as db:
             await lock_runner(db, identity)
             attempt, job = await lock_owned_attempt(db, identity, key)
-            if attempt.status in TERMINAL:
-                return  # 迟到的 started 不覆盖终态。
+            if attempt.status in SETTLED_JOBS:
+                return  # 已跳过或结束的尝试不会被迟到的 started 重新激活。
             self._can_update(attempt, job)
             now = datetime.now(timezone.utc)
             attempt.started_reported_at = attempt.started_reported_at or now
             job.start_time = job.start_time or now
-            # 一条迟到的 started 不能证明 unknown 的执行仍然存活。
-            if attempt.status != "unknown":
-                attempt.status = job.status = "running"
+            attempt.status = job.status = "running"
 
     async def complete(self, identity: RunnerIdentity, result: AttemptResult) -> None:
         async with self.database.transaction() as db:
@@ -96,11 +96,22 @@ class AttemptService:
             if attempt.status in TERMINAL:
                 self._same_result(attempt, result)
                 return
-            self._can_update(attempt, job)
+            update_job = True
+            if attempt.status == "unknown":
+                # 迟到结果仍归原 Attempt。只有它仍是该 Job 最新的尝试，才可补齐 Job 结果。
+                newer = select(RunnerAttempt.id).where(
+                    RunnerAttempt.experiment_run_id == job.id, RunnerAttempt.id > attempt.id,
+                ).exists()
+                update_job = job.status == "unknown" and not await db.scalar(select(newer))
+            else:
+                self._can_update(attempt, job)
             now = datetime.now(timezone.utc)
-            attempt.status = job.status = result.status
+            attempt.status = result.status
             attempt.result_json, attempt.result_received_at = result.model_dump(), now
             attempt.unknown_reason = None
+            if not update_job:
+                return
+            job.status = result.status
             job.output = {"task_output": result.output}
             job.error = result.error.model_dump() if result.error is not None else None
             job.duration_ms, job.http_status, job.end_time = result.duration_ms, result.http_status, now
@@ -118,13 +129,13 @@ class AttemptService:
                 attempt, job = await lock_owned_attempt(db, identity, result)
                 if attempt.status in TERMINAL:
                     self._same_result(attempt, result)
-                else:
+                elif attempt.status != "unknown":
                     self._can_update(attempt, job)
                 instructions.append({"job_id": result.job_id, "attempt_id": result.attempt_id,
                                      "action": "retry_upload"})
             for local in snapshot.active_jobs:
                 attempt, job = await lock_owned_attempt(db, identity, local)
-                cancel = attempt.status in TERMINAL or attempt.status == "rejected"
+                cancel = attempt.status in SETTLED_JOBS or attempt.status == "rejected"
                 if not cancel:
                     self._can_update(attempt, job)
                     now = datetime.now(timezone.utc)
@@ -139,6 +150,7 @@ class AttemptService:
                         attempt.unknown_reason = "client_execution_unknown"
                         attempt.cancel_requested_at = attempt.cancel_requested_at or now
                         attempt.cancel_reason = attempt.cancel_reason or "client_execution_unknown"
+                        await finish_experiment(db, job, identity.runner_id)
                         cancel = True
                     elif local.status == "running":
                         attempt.status = job.status = "running"
@@ -149,15 +161,16 @@ class AttemptService:
                         attempt.status = "accepted"
                         attempt.accepted_at = attempt.accepted_at or now
                     else:
-                        # 本地 accepted 与云端已开始/unknown 矛盾，不能指令重新执行。
+                        # 本地 accepted 与云端已开始矛盾，不能指令重新执行。
                         attempt.status = job.status = "unknown"
                         attempt.unknown_reason = "sync_state_conflict"
                         attempt.cancel_requested_at = attempt.cancel_requested_at or now
                         attempt.cancel_reason = attempt.cancel_reason or "sync_state_conflict"
+                        await finish_experiment(db, job, identity.runner_id)
                         cancel = True
                 instructions.append({"job_id": local.job_id, "attempt_id": local.attempt_id,
                                      "action": "cancel" if cancel else "continue"})
-            # 反向对账：客户端没有报告的活跃尝试不能直接释放或重新派发。
+            # 缺失的活跃尝试标记 unknown，后续调度可领取其他 Job。
             rows = (await db.execute(select(RunnerAttempt, ExperimentRun)
                                      .join(ExperimentRun).join(Experiment)
                                      .where(RunnerAttempt.runner_id == identity.runner_id,
@@ -167,4 +180,5 @@ class AttemptService:
                 if (job.job_id, attempt.attempt_id) not in seen:
                     attempt.status = job.status = "unknown"
                     attempt.unknown_reason = "missing_from_client_snapshot"
+                    await finish_experiment(db, job, identity.runner_id)
         return {"jobs": instructions}

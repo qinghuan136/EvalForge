@@ -96,6 +96,36 @@ Engine 和连接池应在同一个事件循环内使用并关闭，不要跨多�
 实例未配置时，只能验证配置、驱动加载、会话管理及离线迁移；真实连接和数据库事务读写待实例就绪后验证。
 测试设置 `EVALFORGE_TEST_DATABASE_URL` 后会启用只读的 PostgreSQL 连接集成测试。
 
+### 已建库的 unknown 容量规则更新
+
+使用旧 ORM 建过表的 PostgreSQL 库，在维护窗口执行以下 SQL。新建库使用当前 ORM 生成索引即可。
+
+```sql
+BEGIN;
+
+DROP INDEX IF EXISTS uq_runner_attempts_active_runner;
+DROP INDEX IF EXISTS uq_runner_attempts_active_run;
+CREATE UNIQUE INDEX uq_runner_attempts_active_runner ON runner_attempts (runner_id)
+    WHERE status IN ('assigned', 'accepted', 'running');
+CREATE UNIQUE INDEX uq_runner_attempts_active_run ON runner_attempts (experiment_run_id)
+    WHERE status IN ('assigned', 'accepted', 'running');
+
+UPDATE experiments AS e
+SET status = CASE WHEN e.status = 'cancelling' THEN 'cancelled' ELSE 'completed' END,
+    updated_at = CURRENT_TIMESTAMP
+WHERE e.status IN ('running', 'cancelling')
+  AND e.execution_config ->> 'runner_id' IS NOT NULL
+  AND EXISTS (SELECT 1 FROM experiment_runs AS r WHERE r.experiment_id = e.id AND r.status = 'unknown')
+  AND NOT EXISTS (
+      SELECT 1 FROM experiment_runs AS r
+      WHERE r.experiment_id = e.id AND r.status IN ('queued', 'assigned', 'running')
+  );
+
+COMMIT;
+```
+
+索引调整后，`unknown` 保留为历史但释放容量。最后一条更新补齐旧规则下因 `unknown` 留在进行中的实验状态。
+
 ## 数据库基础设施阶段验证（ORM 实现之前）
 
 - Python 3.12.14；SQLAlchemy 2.1.6、asyncpg 0.32.0、Alembic 1.20.1、python-dotenv 1.2.4。

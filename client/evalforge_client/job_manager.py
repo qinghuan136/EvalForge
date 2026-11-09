@@ -90,7 +90,7 @@ class JobManager:
                 logger.warning("Dispatch rejected job_id=%r attempt_id=%r agent_target_id=%r reason=target_not_found",
                                values["job_id"], values["attempt_id"], values["agent_target_id"])
                 return {"accepted": False, "reason": "target_not_found"}
-            if self._running() or await self.attempts.list_unresolved():
+            if self._running() or await self.attempts.list_active():
                 logger.debug("Dispatch rejected job_id=%r attempt_id=%r reason=busy",
                              values["job_id"], values["attempt_id"])
                 return {"accepted": False, "reason": "busy"}
@@ -197,7 +197,7 @@ class JobManager:
             if row is None or self._closed or self._failed:
                 raise RpcError(-32000, "Executor is unavailable")
             if row.execution_status == "accepted":
-                if len(await self.attempts.list_unresolved()) != 1:
+                if len(await self.attempts.list_active()) != 1:
                     raise RpcError(-32000, "Runner capacity is occupied")
                 logger.info("Resuming accepted attempt job_id=%r attempt_id=%r cancel_requested=%s",
                             row.job_id, row.attempt_id, bool(row.cancel_requested))

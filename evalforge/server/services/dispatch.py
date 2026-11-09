@@ -1,4 +1,4 @@
-"""领取 Job 并保存派发回执；每次调用只持有一个短事务。"""
+"""为 Runner 领取 Job、读取取消意图并保存派发回执。"""
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -35,6 +35,12 @@ class DispatchClaim:
     payload: dict
 
 
+@dataclass(frozen=True)
+class CancelRequest:
+    key: AttemptKey
+    reason: str
+
+
 def fail_job(job: ExperimentRun, reason: str) -> None:
     job.status = "failed"
     job.output = {"task_output": None}
@@ -42,20 +48,33 @@ def fail_job(job: ExperimentRun, reason: str) -> None:
     job.end_time = datetime.now(timezone.utc)
 
 
+def cancel_unstarted_job(job: ExperimentRun) -> None:
+    job.status = "cancelled"
+    job.output = {"task_output": None}
+    job.end_time = datetime.now(timezone.utc)
+
+
 class DispatchService:
     def __init__(self, database: Database):
         self.database = database
 
-    async def claim(self, identity: RunnerIdentity) -> DispatchClaim | None:
+    async def next_action(self, identity: RunnerIdentity) -> DispatchClaim | CancelRequest | None:
         async with self.database.transaction() as db:
             try:
                 await lock_runner(db, identity)
             except AttemptError:
                 return None
-            occupied = await db.scalar(select(RunnerAttempt.id).where(
+            occupied = (await db.execute(select(
+                RunnerAttempt.attempt_id, RunnerAttempt.cancel_requested_at, RunnerAttempt.cancel_reason,
+                ExperimentRun.job_id, Experiment.user_id,
+            ).join(ExperimentRun, ExperimentRun.id == RunnerAttempt.experiment_run_id)
+             .join(Experiment, Experiment.id == ExperimentRun.experiment_id).where(
                 RunnerAttempt.runner_id == identity.runner_id, RunnerAttempt.status.in_(ACTIVE),
-            ).limit(1))
+            ).limit(1))).one_or_none()
             if occupied is not None:
+                if occupied.cancel_requested_at is not None and occupied.user_id == identity.owner_user_id:
+                    return CancelRequest(AttemptKey(job_id=occupied.job_id, attempt_id=occupied.attempt_id),
+                                         occupied.cancel_reason or "user_requested")
                 return None
 
             job, snapshot, revision = ExperimentRun, ExperimentDatasetExample, DatasetExampleRevision
@@ -93,6 +112,24 @@ class DispatchService:
                                  status="assigned", dispatch_json=payload))
             return DispatchClaim(key, payload)
 
+    async def prepare_send(self, identity: RunnerIdentity, claim: DispatchClaim) -> bool:
+        """在第一次发送 RPC 前确认预留仍可派发。"""
+        async with self.database.transaction() as db:
+            try:
+                await lock_runner(db, identity)
+                attempt, job = await lock_owned_attempt(db, identity, claim.key)
+            except AttemptError:
+                return False
+            if attempt.status != "assigned" or job.status != "assigned":
+                return False
+            if attempt.cancel_requested_at is None:
+                return True
+            # 当前派发协程尚未调用 RPC，可以确认这次预留未送达客户端。
+            attempt.status, attempt.rejection_reason = "rejected", "cancelled_before_dispatch"
+            cancel_unstarted_job(job)
+            await finish_experiment(db, job, identity.runner_id)
+            return False
+
     async def record(self, identity: RunnerIdentity, claim: DispatchClaim, *,
                      outcome: Literal["accepted", "rejected", "unknown"], reason: str | None = None,
                      dispatched_at: datetime | None = None) -> bool:
@@ -107,25 +144,24 @@ class DispatchService:
             if outcome == "accepted" and attempt.status in ({"assigned", "accepted", "running"} | TERMINAL):
                 attempt.accepted_at = attempt.accepted_at or datetime.now(timezone.utc)
             # started、complete 和新会话的 sync 都可能先于派发回执提交。
-            # 仅在本协程确认从未发送时，才可释放接管会话因快照缺失而标记的 unknown。
-            never_sent = (outcome == "rejected" and dispatched_at is None
-                          and attempt.dispatched_at is None
-                          and attempt.status == job.status == "unknown"
-                          and attempt.unknown_reason == "missing_from_client_snapshot")
-            if not never_sent and (attempt.status != "assigned" or job.status != "assigned"):
+            if attempt.status != "assigned" or job.status != "assigned":
                 return False
             if outcome == "accepted":
                 attempt.status = "accepted"
             elif outcome == "unknown":
                 attempt.status = job.status = "unknown"
                 attempt.unknown_reason = reason or "dispatch_outcome_unknown"
+                await finish_experiment(db, job, identity.runner_id)
             else:
                 if reason not in RETRYABLE_REJECTIONS and reason not in FAILURE_MESSAGES:
                     reason = "dispatch_rejected"
                 attempt.status = "rejected"
                 attempt.unknown_reason = None
                 attempt.rejection_reason = reason
-                if reason in RETRYABLE_REJECTIONS:
+                if attempt.cancel_requested_at is not None:
+                    cancel_unstarted_job(job)
+                    await finish_experiment(db, job, identity.runner_id)
+                elif reason in RETRYABLE_REJECTIONS:
                     job.status = "queued"
                 else:
                     fail_job(job, reason)

@@ -47,7 +47,7 @@
 
 - `accepted=true` 仅表示 Runner 已接收该尝试，**不代表执行成功**。
 - Runner 先持久化再确认接单。同一 job_id + attempt_id 的相同参数重复派发正常确认且不重复执行；参数不一致返回 accepted=false、reason=attempt_conflict。先去重，再判断容量。
-- `accepted=false` 且原因为 `busy` 或 `not_ready` 时，Cloud 将 Job 放回队列并延迟再尝试。目标不存在或执行层不可用时，Runner 分别返回 `target_not_found` 或 `executor_unavailable`，Cloud 将 Job 标记为 failed。回执超时、连接断开或回执格式无效时，仍处于 assigned 的 Job 和 Attempt 转为 unknown，等待重连对账。
+- `accepted=false` 且原因为 `busy` 或 `not_ready` 时，Cloud 将 Job 放回队列并延迟再尝试。目标不存在或执行层不可用时，Runner 分别返回 `target_not_found` 或 `executor_unavailable`，Cloud 将 Job 标记为 failed。回执超时、连接断开或回执格式无效时，仍处于 assigned 的 Job 和 Attempt 转为 `unknown`，释放容量并触发重连对账。
 - `input` **原样作为目标 HTTP JSON 请求体**；目标 URL、鉴权等由 Runner 的本地配置决定。
 
 ### 2.3 `jobs.started`
@@ -71,6 +71,7 @@
 ```
 
 - `accepted=true` 仅表示取消请求已接收并持久化。取消生效后通过 `jobs.complete(status="cancelled")` 报告；若已有执行结果则保留原结果，unknown 仅保留取消意图。
+- 用户取消实验时，Cloud 先持久化意图，再由持有会话的 Scheduler 发送指令。失败回执按调度退避重试，断线时通过 `runner.sync` 接续。Cloud 收到取消接收回执后继续等待最终结果。
 - 取消是**尽力而为**：可停止后续执行、尝试中止当前 HTTP 等待，但不能保证目标 Agent 已停止或撤销副作用。
 - 当前实现只停止客户端 HTTP 等待，不调用 Agent 取消接口。重复取消幂等；已获得响应后继续完成结果落盘，迟到取消不覆盖原结果。
 
@@ -100,7 +101,7 @@
 ```
 
 - 当前 `action`：`continue`（允许继续）、`cancel`（请求停止）、`retry_upload`（重传本地待确认结果）；`discard` 暂不实现。
-- `active_jobs` 上报本地 `accepted / running / unknown` 状态；`unknown` 不能用 `continue` 触发重执行。客户端进程启动把遗留 running 转为 unknown，网络重连不会自动改变执行状态。
+- `active_jobs` 上报本地 `accepted / running`。客户端进程启动将遗留 `running` 转为 `unknown` 并保留在本地历史。云端兼容旧客户端上报的单条 `unknown`。已被云端跳过的 Attempt 收到活跃快照时返回 `cancel`，最终结果仍可补传。
 - `pending_results` 为保存的完整 `jobs.complete` 业务参数列表，不含 JSON-RPC 封装。Cloud 须对快照中每个 Attempt 返回一条指令；历史待确认结果须明确返回 retry_upload，云端即使已存结果，也可幂等接收后重新确认。
 - 客户端完整校验指令后应用；遗漏、重复、未知 ID、不支持动作或状态冲突使本轮同步失败。快照后新增的最终结果等 ready 后按正常流程上报，不需要再次 sync。
 - hello 的 status=ready 仅表示握手通过；客户端完成 sync、补传历史结果后请求 runner.ready。同步完成与执行容量是否空闲分开判断；默认入口已接入单 Job HTTP 执行层并声明 http_json，未注入执行层的独立会话 capabilities 为空并拒绝派发。

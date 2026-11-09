@@ -1,9 +1,10 @@
-"""浏览器实验 REST 接口：创建、按数据集分页查询、详情。"""
+"""浏览器实验 REST 接口。"""
 
 from fastapi import APIRouter, Depends, Path, Query, Request, Response
 
 from ..dependencies import Authenticated, SessionContext, current_user, require_csrf
-from ..schemas.experiments import MAX_DB_ID, ExperimentCreate, ExperimentDetail, ExperimentPage
+from ..schemas.common import MAX_DB_ID
+from ..schemas.experiments import ExperimentCreate, ExperimentDetail, ExperimentPage
 from ..services.experiments import ExperimentService
 
 router = APIRouter(prefix="/api/v1", tags=["experiments"])
@@ -37,3 +38,11 @@ async def get_experiment(experiment_id: int = Path(ge=1, le=MAX_DB_ID),
                          identity: Authenticated = Depends(current_user),
                          service: ExperimentService = Depends(experiment_service)):
     return await service.get(identity.user.id, experiment_id)
+
+
+@router.post("/experiments/{experiment_id}/cancel", response_model=ExperimentDetail)
+async def cancel_experiment(experiment_id: int = Path(ge=1, le=MAX_DB_ID),
+                            identity: Authenticated = Depends(current_user),
+                            _csrf: SessionContext = Depends(require_csrf),
+                            service: ExperimentService = Depends(experiment_service)):
+    return await service.cancel(identity.user.id, identity.session.auth_version, experiment_id)
