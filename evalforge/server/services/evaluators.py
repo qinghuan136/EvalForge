@@ -1,7 +1,5 @@
 """List built-in rules, manage dataset bindings, and freeze experiment scoring configuration."""
 
-import re
-
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import func, insert, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -14,15 +12,13 @@ from evalforge.db.models import BuiltinEvaluator, DatasetEvaluators, Evaluator
 from ..errors import APIError
 from ..evaluators.builtin import BuiltinEvaluator as BuiltinRule
 from ..evaluators.builtin import get_builtin_evaluator, list_builtin_evaluators
+from ..evaluators.input_mapping import is_single_value_path
 from ..schemas.evaluators import (
     BuiltinEvaluatorDefinition, DatasetEvaluatorCreate, DatasetEvaluatorDetail,
     DatasetEvaluatorPage, EvaluatorSnapshot, InputMapping,
 )
 from .auth import locked_user
 from .datasets import require_owned_dataset
-
-_SINGLE_VALUE_PATH = re.compile(r"\$\.(?:input|reference|output|metadata)(?:\.[^\W\d][\w-]*|\[(?:0|[1-9][0-9]*)\])*")
-
 
 def builtin_catalog() -> list[BuiltinEvaluatorDefinition]:
     return [BuiltinEvaluatorDefinition(key=rule.key, description=rule.description,
@@ -41,7 +37,7 @@ def _validate_mapping(mapping: InputMapping, rule: type[BuiltinRule]) -> None:
     if any(field.is_required() and name not in configured for name, field in fields.items()):
         raise APIError(422, "invalid_input_mapping", "输入映射缺少评分器的必填参数")
     for path in paths.values():
-        if len(path) > 1024 or not _SINGLE_VALUE_PATH.fullmatch(path):
+        if not is_single_value_path(path):
             raise APIError(422, "invalid_input_mapping", "评分参数路径必须指向一个明确的值")
     for name, value in literals.items():
         try:

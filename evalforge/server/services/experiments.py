@@ -19,9 +19,10 @@ from ..schemas.experiments import (
     SavedExecutionConfig,
 )
 from .auth import locked_user
-from .attempts import ACTIVE, SETTLED_JOBS
+from .attempts import ACTIVE
 from .datasets import require_owned_dataset
 from .evaluators import load_evaluator_snapshots
+from .experiment_lifecycle import settle_experiment
 
 MAX_EXPERIMENT_JOBS = 10_000
 JOB_STATUSES = ("queued", "assigned", "running", "succeeded", "failed", "cancelled", "unknown")
@@ -190,12 +191,10 @@ class ExperimentService:
                     RunnerAttempt.experiment_run_id.in_(jobs), RunnerAttempt.status.in_(ACTIVE),
                     RunnerAttempt.cancel_requested_at.is_(None),
                 ).values(cancel_requested_at=now, cancel_reason="user_requested"))
-            progress = (await self._progress(db, [experiment_id]))[experiment_id]
-            if cancelling:
-                if progress.job_count == sum(getattr(progress, status) for status in SETTLED_JOBS):
-                    experiment.status = "cancelled"
+                await settle_experiment(db, experiment)
                 await db.flush()
                 await db.refresh(experiment, ["updated_at"])
+            progress = (await self._progress(db, [experiment_id]))[experiment_id]
             result = _detail(experiment, progress)
         if cancelling and self.on_work_available is not None:
             self.on_work_available()

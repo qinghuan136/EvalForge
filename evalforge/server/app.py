@@ -27,6 +27,7 @@ from .services.auth import AuthService
 from .services.runners import RunnerService
 from .services.attempts import AttemptService
 from .services.dispatch import DispatchService
+from .services.evaluations import EvaluationService
 from .services.evaluators import DatasetEvaluatorService
 from .services.experiments import ExperimentService
 from .sessions import SessionStore
@@ -52,9 +53,11 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
             connections = RunnerConnections(redis)
             app.state.runners = RunnerService(db, connections, config.runner_websocket_url)
             app.state.runner_auth = RunnerAuth(db)
-            app.state.runner_sessions = RunnerSessionManager(connections, AttemptService(db))
+            attempts = AttemptService(db)
+            app.state.runner_sessions = RunnerSessionManager(connections, attempts)
             resources.push_async_callback(app.state.runner_sessions.close)
-            scheduler = Scheduler(app.state.runner_sessions, DispatchService(db))
+            scheduler = Scheduler(app.state.runner_sessions, DispatchService(db), evaluations=EvaluationService(db))
+            attempts.on_task_succeeded = scheduler.notify_eval
             app.state.runner_sessions.on_work_available = scheduler.wake
             app.state.dataset_evaluators = DatasetEvaluatorService(db)
             app.state.experiments = ExperimentService(db, scheduler.wake)

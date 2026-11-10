@@ -16,7 +16,8 @@ from evalforge.db.models import (
 from ..runner_auth import RunnerIdentity
 from ..schemas.attempts import AttemptKey
 from ..schemas.experiments import ExecutionConfig
-from .attempts import ACTIVE, TERMINAL, AttemptError, finish_experiment, lock_owned_attempt, lock_runner
+from .attempts import ACTIVE, AttemptError, lock_owned_attempt, lock_runner
+from .experiment_lifecycle import TERMINAL, finish_experiment
 
 RETRYABLE_REJECTIONS = {"busy", "not_ready", "session_unavailable"}
 FAILURE_MESSAGES = {
@@ -96,10 +97,11 @@ class DispatchService:
             run, experiment, example_input = row
             experiment.status = "running"
             try:
-                config = ExecutionConfig.model_validate(experiment.execution_config)
+                runner_config = {key: value for key, value in experiment.execution_config.items() if key != "evaluators"}
+                config = ExecutionConfig.model_validate(runner_config)
             except ValidationError:
                 fail_job(run, "invalid_execution_config")
-                await finish_experiment(db, run, identity.runner_id)
+                await finish_experiment(db, run.experiment_id, identity.runner_id)
                 return None
             key = AttemptKey(job_id=run.job_id, attempt_id=str(uuid4()))
             payload = {
@@ -127,7 +129,7 @@ class DispatchService:
             # 当前派发协程尚未调用 RPC，可以确认这次预留未送达客户端。
             attempt.status, attempt.rejection_reason = "rejected", "cancelled_before_dispatch"
             cancel_unstarted_job(job)
-            await finish_experiment(db, job, identity.runner_id)
+            await finish_experiment(db, job.experiment_id, identity.runner_id)
             return False
 
     async def record(self, identity: RunnerIdentity, claim: DispatchClaim, *,
@@ -151,7 +153,7 @@ class DispatchService:
             elif outcome == "unknown":
                 attempt.status = job.status = "unknown"
                 attempt.unknown_reason = reason or "dispatch_outcome_unknown"
-                await finish_experiment(db, job, identity.runner_id)
+                await finish_experiment(db, job.experiment_id, identity.runner_id)
             else:
                 if reason not in RETRYABLE_REJECTIONS and reason not in FAILURE_MESSAGES:
                     reason = "dispatch_rejected"
@@ -160,10 +162,10 @@ class DispatchService:
                 attempt.rejection_reason = reason
                 if attempt.cancel_requested_at is not None:
                     cancel_unstarted_job(job)
-                    await finish_experiment(db, job, identity.runner_id)
+                    await finish_experiment(db, job.experiment_id, identity.runner_id)
                 elif reason in RETRYABLE_REJECTIONS:
                     job.status = "queued"
                 else:
                     fail_job(job, reason)
-                    await finish_experiment(db, job, identity.runner_id)
+                    await finish_experiment(db, job.experiment_id, identity.runner_id)
             return True

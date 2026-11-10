@@ -14,14 +14,14 @@
 | 位置 | 当前链路 | 接入时的边界 |
 | --- | --- | --- |
 | Task 领取 | `DispatchService.next_action()` 按 Runner 查找 `queued` Job，在事务中领取并创建 Attempt | Runtime 里的 Task ID 只作为候选。出队后仍需在数据库校验 Job 状态、实验状态和 Runner 容量。接入时需统一候选的补充来源，避免内存队列和现有扫描各自派发 |
-| 评分待办 | 实验保存了配置快照，评分执行链还待接入 | Task 成功提交后再入队。恢复时用成功的 TaskRun、评分快照和已有 annotation 重建缓冲。按 `(experiment_run_id, name)` 保存结果，内存去重只覆盖仍在队列中的工作 |
-| 完成与取消 | 当前 `finish_experiment()` 按 Task Job 状态收尾 | 正常完成需要同时检查数据库里的 Task 和评分结果。队列为空时可能仍有执行中的工作。取消后停止领取新工作，清理缓冲，并在提交评分前检查实验状态 |
+| 评分待办 | Scheduler 收到成功的 `run_id` 后，查库并启动缺失的评分项 | 若未来引入 Runtime 的 Eval 缓冲，仍可从成功的 TaskRun、评分快照和已有 annotation 重建 |
+| 完成与取消 | 由数据库里的 Task 状态与评分记录判断是否完成，保存评分前校验取消状态 | Runtime 未来若参与收尾，仍需区分本地缓冲为空、存在在途工作和数据库已收尾 |
 | 实例与生命周期 | 当前 Scheduler 只处理本进程持有的 Runner 会话 | 明确由哪个调度组件创建、补充和释放 Runtime。多实例之间的领取、归属和幂等仍由持久化状态协调 |
 
 [当前派发逻辑](../evalforge/server/services/dispatch.py#L61) · [当前收尾逻辑](../evalforge/server/services/attempts.py#L50) · [原架构规划](云端运行架构.md)
 
-### 已确认的配置冲突
+### 执行配置与评分快照
 
-实验创建会把评分配置存到 `experiments.execution_config["evaluators"]`。当前 `DispatchService` 用只声明 Runner 参数的 `ExecutionConfig` 校验整个对象，额外的 `evaluators` 会触发 `extra_forbidden`，使 Job 按 `invalid_execution_config` 失败。接入前需要分别解析 Runner 执行参数与评分配置快照，或为数据库存储单独定义一个包含两者的模型。`ExperimentRuntime` 已将二者分为独立字段，具体如何从存储构造它留给接入阶段。
+实验创建会把评分配置存到 `experiments.execution_config["evaluators"]`。派发校验 Runner 配置时会拆出这个字段，评分服务单独读取它。`ExperimentRuntime` 同样把两类配置分开保存。当前评分执行链见 [云端评分链路](server-evaluations.md)。
 
 [保存快照](../evalforge/server/services/experiments.py#L96) · [派发校验](../evalforge/server/services/dispatch.py#L98) · [Runner 参数定义](../evalforge/server/schemas/experiments.py#L17)

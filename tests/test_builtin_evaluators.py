@@ -3,6 +3,14 @@ import unittest
 from pydantic import ValidationError
 
 from evalforge.server.evaluators.builtin import get_builtin_evaluator, list_builtin_evaluators
+from evalforge.server.evaluators.execution import evaluate_builtin
+
+
+class BuiltinExecutionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_regex_can_score_in_a_child_process_from_package_entrypoint(self):
+        result, error = await evaluate_builtin("regex", {"pattern": r"工单\d+", "text": "已创建工单42"})
+        self.assertIsNone(error)
+        self.assertEqual((result.score, result.label), (1.0, "true"))
 
 
 class BuiltinEvaluatorTests(unittest.TestCase):

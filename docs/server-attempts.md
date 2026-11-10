@@ -46,7 +46,7 @@ sequenceDiagram
 
 - `runner_attempts`：执行状态、开始上报时间、完整结果、结果接收时间、未知原因及同步产生的取消意图。
 - `experiment_runs`：Job 状态、开始/结束时间、输出、结构化错误、耗时和 HTTP 状态。输出包装为 `{"task_output": 原始输出}`，支持 JSON null。
-- 读取 `runners` 和 `experiments` 校验认证 Runner 与实验用户归属。所有 Job 均为终态或已跳过的 `unknown` 时，同一事务将 `running` 实验更新为 `completed`，将 `cancelling` 实验更新为 `cancelled`。
+- 读取 `runners` 和 `experiments` 校验认证 Runner 与实验用户归属。所有 Job 均为终态或已跳过的 `unknown` 后，取消中的实验进入 `cancelled`。正常完成还要求所有成功 Task 的预期评分均有结果记录。成功 Job 提交后唤醒 Scheduler，ACK 以 Task 提交为准。见 [云端评分链路](server-evaluations.md)。
 - 每次操作使用独立短事务。按 Runner → Job → Attempt 加行锁；同 Runner 操作串行，终态重复结果只比较确认，冲突拒绝覆盖。
 - 已跳过的 Attempt 保持 `unknown`，迟到的 `started` 或 `running` 快照不会重新占位。迟到的最终结果可按原 Attempt 幂等补传。原 Attempt 仍是最新尝试且 Job 仍为 `unknown` 时，同时补齐 Job 结果。
 

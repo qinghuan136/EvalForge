@@ -1,9 +1,10 @@
 """执行尝试的归属、事务和幂等规则；不调度、不重试，也不记录入口日志。"""
 
+from collections.abc import Callable
 from datetime import datetime, timezone
 import json
 
-from sqlalchemy import case, select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from evalforge.db import Database
@@ -11,10 +12,9 @@ from evalforge.db.models import Experiment, ExperimentRun, Runner, RunnerAttempt
 
 from ..runner_auth import RunnerIdentity
 from ..schemas.attempts import AttemptKey, AttemptResult, RunnerSync
+from .experiment_lifecycle import SETTLED_JOBS, TERMINAL, finish_experiment
 
-TERMINAL = {"succeeded", "failed", "cancelled"}
 ACTIVE = {"assigned", "accepted", "running"}
-SETTLED_JOBS = TERMINAL | {"unknown"}
 
 
 class AttemptError(ValueError):
@@ -47,22 +47,10 @@ async def lock_owned_attempt(db: AsyncSession, identity: RunnerIdentity,
     return attempt, job
 
 
-async def finish_experiment(db: AsyncSession, job: ExperimentRun, runner_id: str) -> None:
-    # V1 一个实验绑定一个 Runner，最后一个终态写入和收尾受同一 Runner 行锁保护。
-    incomplete = select(ExperimentRun.id).where(
-        ExperimentRun.experiment_id == Experiment.id, ExperimentRun.status.not_in(SETTLED_JOBS),
-    ).exists()
-    await db.execute(update(Experiment).where(
-        Experiment.id == job.experiment_id, Experiment.status.in_(("running", "cancelling")),
-        Experiment.execution_config["runner_id"].as_string() == runner_id,
-        ~incomplete,
-    ).values(status=case((Experiment.status == "cancelling", "cancelled"), else_="completed"))
-        .execution_options(synchronize_session=False))
-
-
 class AttemptService:
-    def __init__(self, database: Database):
+    def __init__(self, database: Database, on_task_succeeded: Callable[[int], None] | None = None):
         self.database = database
+        self.on_task_succeeded = on_task_succeeded
 
     @staticmethod
     def _same_result(attempt: RunnerAttempt, result: AttemptResult) -> None:
@@ -115,13 +103,17 @@ class AttemptService:
             job.output = {"task_output": result.output}
             job.error = result.error.model_dump() if result.error is not None else None
             job.duration_ms, job.http_status, job.end_time = result.duration_ms, result.http_status, now
-            await finish_experiment(db, job, identity.runner_id)
+            run_id = job.id
+            await finish_experiment(db, job.experiment_id, identity.runner_id)
         # 离开事务（包括 commit）成功后，调用方才可返回 ACK。
+        if result.status == "succeeded" and self.on_task_succeeded is not None:
+            self.on_task_succeeded(run_id)
 
     async def sync(self, identity: RunnerIdentity, snapshot: RunnerSync) -> dict:
         if snapshot.runner_id != identity.runner_id:
             raise AttemptError("Runner identity mismatch")
         instructions = []
+        experiments_to_finish: set[int] = set()
         seen = {(row.job_id, row.attempt_id) for row in [*snapshot.active_jobs, *snapshot.pending_results]}
         async with self.database.transaction() as db:
             await lock_runner(db, identity)
@@ -150,7 +142,7 @@ class AttemptService:
                         attempt.unknown_reason = "client_execution_unknown"
                         attempt.cancel_requested_at = attempt.cancel_requested_at or now
                         attempt.cancel_reason = attempt.cancel_reason or "client_execution_unknown"
-                        await finish_experiment(db, job, identity.runner_id)
+                        experiments_to_finish.add(job.experiment_id)
                         cancel = True
                     elif local.status == "running":
                         attempt.status = job.status = "running"
@@ -166,7 +158,7 @@ class AttemptService:
                         attempt.unknown_reason = "sync_state_conflict"
                         attempt.cancel_requested_at = attempt.cancel_requested_at or now
                         attempt.cancel_reason = attempt.cancel_reason or "sync_state_conflict"
-                        await finish_experiment(db, job, identity.runner_id)
+                        experiments_to_finish.add(job.experiment_id)
                         cancel = True
                 instructions.append({"job_id": local.job_id, "attempt_id": local.attempt_id,
                                      "action": "cancel" if cancel else "continue"})
@@ -180,5 +172,8 @@ class AttemptService:
                 if (job.job_id, attempt.attempt_id) not in seen:
                     attempt.status = job.status = "unknown"
                     attempt.unknown_reason = "missing_from_client_snapshot"
-                    await finish_experiment(db, job, identity.runner_id)
+                    experiments_to_finish.add(job.experiment_id)
+            # 对账先处理所有 Job，再锁实验收尾，与评分保存的加锁顺序一致。
+            for experiment_id in sorted(experiments_to_finish):
+                await finish_experiment(db, experiment_id, identity.runner_id)
         return {"jobs": instructions}
