@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from contextlib import AbstractContextManager
 from typing import Protocol
 
 from . import __version__
@@ -9,6 +10,7 @@ from .attempts import AttemptRepository
 from .config import ClientConfig
 from .models import RunnerAttempt, TERMINAL_STATUSES
 from .rpc import JsonRpcPeer, RpcError
+from .stream_output import OutputAccumulator
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +26,7 @@ class SessionJobs(Protocol):
     async def dispatch(self, params: dict) -> dict: ...
     async def resume(self, attempt: RunnerAttempt) -> None: ...
     async def cancel(self, attempt: RunnerAttempt, reason: str | None = None) -> None: ...
+    def collect_output(self) -> AbstractContextManager[OutputAccumulator]: ...
 
 
 class RunnerSession:
@@ -167,6 +170,15 @@ class RunnerSession:
         logger.info("Result acknowledged session_id=%r job_id=%r attempt_id=%r",
                     self.session_id, row.job_id, row.attempt_id)
 
+    async def _report_output(self, peer: JsonRpcPeer, jobs: SessionJobs) -> None:
+        with jobs.collect_output() as output:
+            while True:
+                (job_id, attempt_id), chunks = await output.next_batch()
+                await peer.notify("jobs.output_chunk", {
+                    "job_id": job_id, "attempt_id": attempt_id,
+                    "chunks": [{"seq": chunk.seq, "text": chunk.text} for chunk in chunks],
+                })
+
     async def _serve_ready(self, peer, historical, reported_started):
         async def report_execution():
             while True:
@@ -191,6 +203,8 @@ class RunnerSession:
                 await asyncio.sleep(0.5)
 
         tasks = [asyncio.create_task(peer.wait_closed()), asyncio.create_task(report_execution())]
+        if self.jobs is not None and "http_sse" in self.jobs.capabilities:
+            tasks.append(asyncio.create_task(self._report_output(peer, self.jobs), name="evalforge-output-preview"))
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:

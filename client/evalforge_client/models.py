@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
 
-from sqlalchemy import CheckConstraint, Integer, MetaData, REAL, Text
+from sqlalchemy import Boolean, CheckConstraint, Integer, MetaData, REAL, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
 
@@ -113,6 +113,8 @@ class RunnerAttempt(Base):
     example_id: Mapped[str] = mapped_column(Text)
     input_json: Mapped[Any] = mapped_column(JSONText(), nullable=False)
     timeout_seconds: Mapped[float] = mapped_column(REAL)
+    stream_output: Mapped[bool] = mapped_column(Boolean(create_constraint=True, name="stream_output"),
+                                               default=False, server_default="0")
     execution_status: Mapped[str] = mapped_column(Text, default="accepted", server_default="accepted")
     cancel_requested: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     cancel_reason: Mapped[str | None] = mapped_column(Text)

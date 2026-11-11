@@ -4,6 +4,8 @@ import asyncio
 import json
 import logging
 import math
+from collections.abc import Iterator
+from contextlib import contextmanager
 from functools import partial
 from time import monotonic
 
@@ -11,12 +13,13 @@ from .attempts import AttemptConflict, AttemptRepository
 from .http_executor import HttpExecutor, HttpExecutionResult
 from .models import RunnerAttempt, encode_json
 from .rpc import RpcError
+from .stream_output import OutputAccumulator, OutputChunk
 
 logger = logging.getLogger(__name__)
 
 
 class JobManager:
-    capabilities = ["http_json"]
+    capabilities = ["http_json", "http_sse"]
 
     def __init__(self, attempts: AttemptRepository, executor: HttpExecutor):
         self.attempts, self.executor = attempts, executor
@@ -25,6 +28,7 @@ class JobManager:
         self._http_task: asyncio.Task | None = None
         self._cancel_tasks: dict[tuple[str, str], asyncio.Task] = {}
         self._key: tuple[str, str] | None = None
+        self._output: OutputAccumulator | None = None
         self._closed = True
         self._failed = False
 
@@ -47,11 +51,26 @@ class JobManager:
         logger.info("JobManager stopped")
         # 退出不伪造业务取消结果；遗留 running 由下次进程启动转成 unknown。
 
+    @contextmanager
+    def collect_output(self) -> Iterator[OutputAccumulator]:
+        """每条 ready 连接使用新的预览缓冲；断线期间的片段不补传。"""
+        if self._output is not None:
+            raise RuntimeError("An output consumer is already attached")
+        self._output = output = OutputAccumulator()
+        try:
+            yield output
+        finally:
+            self._output = None
+
+    def _offer_output(self, key: tuple[str, str], chunk: OutputChunk) -> None:
+        if self._output is not None:
+            self._output.offer(key, chunk)
+
     @staticmethod
     def _parameters(params: dict) -> dict:
         required = {"job_id", "attempt_id", "agent_target_id", "example_id", "input", "timeout_seconds"}
         try:
-            if not isinstance(params, dict) or params.keys() != required:
+            if not isinstance(params, dict) or not required <= params.keys() <= required | {"stream_output"}:
                 raise ValueError()
             for name in ("job_id", "attempt_id", "agent_target_id", "example_id"):
                 if not isinstance(params[name], str) or not params[name].strip():
@@ -59,7 +78,11 @@ class JobManager:
             timeout = params["timeout_seconds"]
             if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0:
                 raise ValueError()
+            stream_output = params.get("stream_output", False)
+            if type(stream_output) is not bool:
+                raise ValueError()
             values = dict(params)
+            values["stream_output"] = stream_output
             values["input_json"] = json.loads(encode_json(values.pop("input")))
             return values
         except (ValueError, TypeError, RecursionError, OverflowError):
@@ -137,8 +160,11 @@ class JobManager:
                         row.job_id, row.attempt_id, row.agent_target_id)
             # 与取消共享锁，保证 running 提交后、HTTP Task 建立前不会遗漏取消信号。
             started = monotonic()
+            options = {}
+            if row.stream_output:
+                options = {"stream_output": True, "on_chunk": partial(self._offer_output, (row.job_id, row.attempt_id))}
             http_task = self._http_task = asyncio.create_task(self.executor.execute(
-                row.agent_target_id, row.input_json, timeout_seconds=row.timeout_seconds,
+                row.agent_target_id, row.input_json, timeout_seconds=row.timeout_seconds, **options,
             ), name="evalforge-agent-http")
         try:
             outcome = await http_task

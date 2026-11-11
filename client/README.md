@@ -21,8 +21,10 @@ python -m venv .venv
 最终打印相同的中文 JSON 数据；退出时关闭双方连接。它验证通信两层，不模拟 Job 执行。
 
 `python -m evalforge_client` 已提供配置加载、启动恢复、连接和 hello/sync 链路。
-会话 ready 后可以接收单个 Job，调用本地 HTTP Agent，保存结果并上报确认；hello 声明 `http_json` 能力。
+会话 ready 后可以接收单个 Job，调用本地 HTTP Agent，保存结果并上报确认；hello 声明 `http_json` 和 `http_sse` 能力。
 完整流程见 [Job 执行层核心链路](../docs/client/Job执行层核心链路.md)。已补齐本地 HTTP 等待取消、取消竞态与断线/重启恢复，见 [取消与恢复](../docs/client/取消与恢复.md)。
+
+派发带 `stream_output: true` 时，Runner 仍使用 `agent_target_id` 配置的 URL 和原始 JSON 请求体，发送 `Accept: text/event-stream`。Agent 返回 `delta` 文本事件及一个终止流的 `result` JSON 事件。预览片段通过 `jobs.output_chunk` 尽力上报，最终 JSON 仍经 SQLite 和 `jobs.complete` 确认。云端已支持流式派发，预览片段接收待接入。见 [流式输出设计](../docs/Agent流式输出设计.md)。
 
 ## 启动客户端
 
@@ -66,12 +68,13 @@ $env:EVALFORGE_RUNNER_TOKEN = "你的 Runner 凭据"
 | `transport.py` | 已实现：连接、Bearer 握手认证头、文本消息、保活、关闭、重连退避 |
 | `rpc.py` | 已实现：两个 JSON-RPC 库的双向连接适配、超时与断线清理 |
 | `app.py`、`config.py` | 已实现：配置读取、进程恢复、组件生命周期、连接循环和退出 |
-| `models.py` | 已实现：17 字段的 RunnerAttempt ORM、JSON 转换、状态和一致性约束 |
+| `models.py` | RunnerAttempt ORM、JSON 转换、状态和一致性约束 |
 | `database.py`、`attempts.py` | 已实现：异步 Session、版本化建表、Attempt 仓储 |
-| `session.py` | 已实现：hello/sync、接单门禁、started/complete 通知与 ACK |
+| `session.py` | hello/sync、接单门禁、started/complete 请求与 ACK、预览片段通知 |
 | `store.py` | 保留原生 SQL 接口：SQLite 文件连接、事务、关闭 |
 | `job_manager.py` | 单 Job 容量、派发去重、持久化接收、HTTP 执行与结果保存 |
-| `http_executor.py`、`targets.py` | 已实现：单次 HTTP Agent 调用、本地目标和请求头校验 |
+| `http_executor.py`、`targets.py` | 单次 HTTP Agent 调用、JSON/SSE 读取、本地目标和请求头校验 |
+| `stream_output.py` | SSE 分帧、片段结构、会话内的有界预览缓冲 |
 | `config.example.json` | 可加载的配置示例；凭据从指定环境变量读取 |
 | `tests/test_rpc.py`、`test_transport.py`、`test_store.py`、`test_database.py` | 通信、本地存储与 ORM 仓储测试 |
 | `tests/test_session.py` | 会话、结果补交、同步期间完成和真实回环重连测试 |

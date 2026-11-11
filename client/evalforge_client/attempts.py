@@ -36,22 +36,26 @@ class AttemptRepository:
 
     async def accept(
         self, *, job_id: str, attempt_id: str, agent_target_id: str, example_id: str,
-        input_json: Any, timeout_seconds: float,
+        input_json: Any, timeout_seconds: float, stream_output: bool = False,
     ) -> RunnerAttempt:
         for value in (job_id, attempt_id, agent_target_id, example_id):
             if not isinstance(value, str) or not value.strip():
                 raise ValueError("Attempt identifiers must be non-empty strings")
         if type(timeout_seconds) not in (int, float) or not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be finite and positive")
+        if type(stream_output) is not bool:
+            raise ValueError("stream_output must be a boolean")
         payload = encode_json(input_json)
         async with self.database.session() as session:
             await session.execute(insert(RunnerAttempt).values(
                 job_id=job_id, attempt_id=attempt_id, agent_target_id=agent_target_id,
                 example_id=example_id, input_json=json.loads(payload), timeout_seconds=timeout_seconds,
+                stream_output=stream_output,
             ).on_conflict_do_nothing(index_elements=["job_id", "attempt_id"]))
             row = await self._require(session, job_id, attempt_id)
             if (row.agent_target_id != agent_target_id or row.example_id != example_id
-                    or row.timeout_seconds != timeout_seconds or encode_json(row.input_json) != payload):
+                    or row.timeout_seconds != timeout_seconds or row.stream_output != stream_output
+                    or encode_json(row.input_json) != payload):
                 raise AttemptConflict("Attempt already exists with different dispatch parameters")
             return row
 

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -35,13 +36,13 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_schema_matches_design_and_pragmas_and_survives_reopen(self):
         async with ClientDatabase(self.path, busy_timeout_ms=1234) as db:
             async with db.engine.connect() as conn:
-                self.assertEqual((await conn.exec_driver_sql("PRAGMA user_version")).scalar_one(), 1)
+                self.assertEqual((await conn.exec_driver_sql("PRAGMA user_version")).scalar_one(), 2)
                 self.assertEqual((await conn.exec_driver_sql("PRAGMA foreign_keys")).scalar_one(), 1)
                 self.assertEqual((await conn.exec_driver_sql("PRAGMA busy_timeout")).scalar_one(), 1234)
                 self.assertEqual((await conn.exec_driver_sql("PRAGMA synchronous")).scalar_one(), 2)
                 columns = await conn.run_sync(lambda c: inspect(c).get_columns("runner_attempts"))
                 self.assertEqual({c["name"] for c in columns}, set(RunnerAttempt.__table__.columns.keys()))
-                self.assertEqual(len(columns), 17)
+                self.assertEqual(len(columns), 18)
                 self.assertEqual(await conn.run_sync(lambda c: inspect(c).get_table_names()), ["runner_attempts"])
             row = await self.accept(AttemptRepository(db))
             self.assertTrue(row.accepted_at.endswith("+00:00"))
@@ -49,6 +50,32 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             row = await AttemptRepository(db).get("j1", "a1")
             self.assertEqual(row.input_json["message"], "你好'")
             self.assertEqual(row.execution_status, "accepted")
+
+    async def test_v1_migration_preserves_pending_results_and_defaults_to_json(self):
+        self.path.parent.mkdir()
+        result = self.result()
+        with closing(sqlite3.connect(self.path)) as conn, conn:
+            conn.execute("""CREATE TABLE runner_attempts (
+                job_id TEXT, attempt_id TEXT, agent_target_id TEXT NOT NULL, example_id TEXT NOT NULL,
+                input_json TEXT NOT NULL, timeout_seconds REAL NOT NULL, execution_status TEXT NOT NULL,
+                cancel_requested INTEGER NOT NULL, cancel_reason TEXT, result_json TEXT, delivery_status TEXT NOT NULL,
+                unknown_reason TEXT, accepted_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+                acknowledged_at TEXT, updated_at TEXT NOT NULL, PRIMARY KEY (job_id, attempt_id)
+            )""")
+            conn.execute("""INSERT INTO runner_attempts VALUES (
+                'j1', 'a1', 'order-agent', 'e1', 'null', 30, 'succeeded', 0, NULL, ?, 'pending',
+                NULL, 'old', 'old', 'old', NULL, 'old'
+            )""", (json.dumps(result),))
+            conn.execute("PRAGMA user_version=1")
+        async with ClientDatabase(self.path) as db:
+            repo = AttemptRepository(db)
+            row, = await repo.list_pending_results()
+            self.assertIs(row.stream_output, False)
+            self.assertEqual(row.result_json, result)
+            self.assertEqual((await repo.acknowledge("j1", "a1")).delivery_status, "acknowledged")
+            self.assertIs((await self.accept(repo, "a2", stream_output=True)).stream_output, True)
+        with closing(sqlite3.connect(self.path)) as conn:
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
 
     async def test_duplicate_dispatch_preserves_state_and_rejects_changed_parameters(self):
         async with ClientDatabase(self.path) as db:
@@ -59,7 +86,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(duplicate.execution_status, "running")
             self.assertEqual(duplicate.accepted_at, original.accepted_at)
             for changes in ({"input_json": {}}, {"agent_target_id": "other"},
-                            {"example_id": "e2"}, {"timeout_seconds": 31}):
+                            {"example_id": "e2"}, {"timeout_seconds": 31}, {"stream_output": True}):
                 with self.subTest(changes=changes), self.assertRaises(AttemptConflict):
                     await self.accept(repo, **changes)
             self.assertEqual((await repo.get("j1", "a1")).input_json, original.input_json)
@@ -215,7 +242,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_version_and_unversioned_table_are_not_modified(self):
         self.path.parent.mkdir()
-        for version in (0, 1, 99):
+        for version in (0, 1, 2, 99):
             with closing(sqlite3.connect(self.path)) as conn, conn:
                 conn.execute("CREATE TABLE IF NOT EXISTS runner_attempts (preserved TEXT)")
                 conn.execute("DELETE FROM runner_attempts")

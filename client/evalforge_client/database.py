@@ -11,7 +11,7 @@ from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from .models import Base
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SchemaVersionError(RuntimeError):
@@ -70,14 +70,23 @@ class ClientDatabase:
                             raise SchemaVersionError("Unversioned runner_attempts table requires explicit migration")
                         await connection.run_sync(Base.metadata.create_all)
                         await connection.exec_driver_sql(f"PRAGMA user_version={SCHEMA_VERSION}")
-                    elif version != SCHEMA_VERSION:
+                    elif version not in (1, SCHEMA_VERSION):
                         raise SchemaVersionError(f"Unsupported SQLite schema version: {version}")
                     else:
                         if "runner_attempts" not in tables:
                             raise SchemaVersionError("Missing runner_attempts table")
                         columns = await connection.run_sync(lambda conn: inspect(conn).get_columns("runner_attempts"))
-                        if {column["name"] for column in columns} != set(Base.metadata.tables["runner_attempts"].columns.keys()):
-                            raise SchemaVersionError("runner_attempts columns do not match schema version 1")
+                        expected = set(Base.metadata.tables["runner_attempts"].columns.keys())
+                        if version == 1:
+                            expected.remove("stream_output")
+                        if {column["name"] for column in columns} != expected:
+                            raise SchemaVersionError(f"runner_attempts columns do not match schema version {version}")
+                        if version == 1:
+                            await connection.exec_driver_sql(
+                                "ALTER TABLE runner_attempts ADD COLUMN stream_output BOOLEAN NOT NULL DEFAULT 0 "
+                                "CONSTRAINT ck_runner_attempts_stream_output CHECK (stream_output IN (0, 1))"
+                            )
+                            await connection.exec_driver_sql(f"PRAGMA user_version={SCHEMA_VERSION}")
                 self._open = True
             except BaseException:
                 await self.engine.dispose()

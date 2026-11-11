@@ -108,7 +108,8 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         for params in (None, {}, {k: v for k, v in values.items() if k != "input"},
                        {**values, "url": "http://other.example"}, dispatch_params(job_id=" "),
                        dispatch_params(timeout_seconds=True), dispatch_params(timeout_seconds=0),
-                       dispatch_params(timeout_seconds=float("inf")), dispatch_params(input={1: "bad"})):
+                       dispatch_params(timeout_seconds=float("inf")), dispatch_params(input={1: "bad"}),
+                       dispatch_params(stream_output=1), dispatch_params(stream_output="true")):
             with self.subTest(params=params), self.assertRaises(RpcError) as caught:
                 await self.jobs.dispatch(params)
             self.assertEqual(caught.exception.code, -32602)
@@ -255,7 +256,7 @@ class JobSessionTests(unittest.IsolatedAsyncioTestCase):
                         return row is not None and row.delivery_status == "acknowledged"
                     try:
                         await wait_until(ready)
-                        self.assertEqual(peer.calls[0][1]["capabilities"], ["http_json"])
+                        self.assertEqual(peer.calls[0][1]["capabilities"], ["http_json", "http_sse"])
                         self.assertEqual(await peer.handlers["jobs.dispatch"](**dispatch_params(input=None)), {"accepted": True})
                         await wait_until(acknowledged)
                         self.assertEqual([name for name, _ in peer.calls],
@@ -291,7 +292,7 @@ class JobSessionTests(unittest.IsolatedAsyncioTestCase):
             async def cloud(socket):
                 async with JsonRpcPeer(WebSocketConnection(socket)) as peer:
                     async def hello(**params):
-                        self.assertEqual(params["capabilities"], ["http_json"])
+                        self.assertEqual(params["capabilities"], ["http_json", "http_sse"])
                         return {"session_id": "s", "status": "ready"}
                     async def sync(**params):
                         return {"jobs": []}
