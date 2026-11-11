@@ -34,6 +34,7 @@ FAILURE_MESSAGES = {
 class DispatchClaim:
     key: AttemptKey
     payload: dict
+    experiment_id: int
 
 
 @dataclass(frozen=True)
@@ -59,7 +60,7 @@ class DispatchService:
     def __init__(self, database: Database):
         self.database = database
 
-    async def next_action(self, identity: RunnerIdentity) -> DispatchClaim | CancelRequest | None:
+    async def next_action(self, identity: RunnerIdentity, *, supports_streaming: bool = False) -> DispatchClaim | CancelRequest | None:
         async with self.database.transaction() as db:
             try:
                 await lock_runner(db, identity)
@@ -79,7 +80,7 @@ class DispatchService:
                 return None
 
             job, snapshot, revision = ExperimentRun, ExperimentDatasetExample, DatasetExampleRevision
-            row = (await db.execute(
+            eligible = (
                 select(job, Experiment, revision.input)
                 .join(Experiment, Experiment.id == job.experiment_id)
                 .join(snapshot, (snapshot.experiment_id == job.experiment_id)
@@ -88,9 +89,12 @@ class DispatchService:
                 .where(job.status == "queued", Experiment.status.in_(("pending", "running")),
                        Experiment.user_id == identity.owner_user_id,
                        Experiment.execution_config["runner_id"].as_string() == identity.runner_id)
-                .order_by(job.created_at, job.id).limit(1)
-                .with_for_update(of=(job, Experiment), skip_locked=True)
-            )).one_or_none()
+            )
+            if not supports_streaming:
+                # 在取队首前筛选。历史实验没有该字段，和显式 false 一样可派发。
+                eligible = eligible.where(Experiment.execution_config["stream_output"].as_boolean().is_not(True))
+            row = (await db.execute(eligible.order_by(job.created_at, job.id).limit(1)
+                                    .with_for_update(of=(job, Experiment), skip_locked=True))).one_or_none()
             if row is None:
                 return None
 
@@ -109,10 +113,12 @@ class DispatchService:
                 "example_id": str(run.dataset_example_id), "input": example_input,
                 "timeout_seconds": config.timeout_seconds,
             }
+            if config.stream_output:
+                payload["stream_output"] = True
             run.status = "assigned"
             db.add(RunnerAttempt(attempt_id=key.attempt_id, experiment_run_id=run.id, runner_id=identity.runner_id,
                                  status="assigned", dispatch_json=payload))
-            return DispatchClaim(key, payload)
+            return DispatchClaim(key, payload, experiment.id)
 
     async def prepare_send(self, identity: RunnerIdentity, claim: DispatchClaim) -> bool:
         """在第一次发送 RPC 前确认预留仍可派发。"""

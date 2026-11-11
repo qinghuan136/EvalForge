@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, WebSocket
 from sqlalchemy.exc import SQLAlchemyError
@@ -55,27 +54,9 @@ async def runner_websocket(socket: WebSocket):
 
     session = None
 
-    async def authorize():
-        await auth.check(identity)
-        if session is not None:
-            await session.check_current()
-
-    connection = WebSocketConnection(socket, authorize)
+    connection = WebSocketConnection(socket)
     await socket.accept()
     peer = JsonRpcPeer(connection)
-    stopping = asyncio.Event()
-
-    async def watch_authorization():
-        while True:
-            remaining = (identity.expires_at - datetime.now(timezone.utc)).total_seconds()
-            delay = min(config.runner_auth_check_seconds, max(0, remaining))
-            try:
-                await asyncio.wait_for(stopping.wait(), timeout=delay)
-                return
-            except TimeoutError:
-                pass
-            await connection.check_authorization()
-
     try:
         session = socket.app.state.runner_sessions.open(identity, peer, config)
         peer.register("runner.hello", session.hello)
@@ -83,20 +64,19 @@ async def runner_websocket(socket: WebSocket):
         peer.register("runner.ready", session.ready)
         peer.register("jobs.started", session.started)
         peer.register("jobs.complete", session.complete)
+        peer.register("jobs.output_chunk", session.output_chunk)
         # 额外方法由调用方注册，不能覆盖上述内置方法。
         setup = socket.app.state.configure_runner_rpc
         if setup is not None:
             setup(peer, identity)
         async with peer:
             closed = asyncio.create_task(peer.wait_closed())
-            watcher = asyncio.create_task(watch_authorization())
-            tasks = [closed, watcher, session.task]
+            tasks = [closed, session.task]
             try:
                 done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 for task in done:
                     task.result()
             finally:
-                stopping.set()
                 session.request_close()
                 await connection.close(session.close_code)
                 closed.cancel()

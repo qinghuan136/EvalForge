@@ -81,7 +81,7 @@ Guard = Callable[[SessionContext], bool]
 Rule = tuple[Guard, SessionState]
 
 # (当前状态, 事件): (条件, 目标状态)。没有列出的转换一律拒绝。
-# HELLO_CONFIRMED / LEASE_RENEWED 均在对应存储操作确认成功后提交。
+# HELLO_CONFIRMED 在存储确认后提交；LEASE_RENEWED 只校验续租结果，不改变阶段。
 SESSION_TRANSITIONS: Mapping[tuple[SessionState, SessionEvent], Rule] = MappingProxyType({
     (SessionState.CONNECTED, SessionEvent.HELLO_CONFIRMED): (hello_confirmed, SessionState.SYNCING),
     (SessionState.SYNCING, SessionEvent.READY_REQUESTED): (sync_finished, SessionState.READY),

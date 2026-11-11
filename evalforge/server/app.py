@@ -12,6 +12,7 @@ from evalforge.redis import RedisSettings, RedisStore
 
 from .config import ServerSettings
 from .errors import install_handlers
+from .experiment_events import ExperimentEventStore
 from .routes.auth import router as auth_router
 from .routes.evaluators import router as evaluators_router
 from .routes.experiments import router as experiments_router
@@ -54,13 +55,15 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
             app.state.runners = RunnerService(db, connections, config.runner_websocket_url)
             app.state.runner_auth = RunnerAuth(db)
             attempts = AttemptService(db)
-            app.state.runner_sessions = RunnerSessionManager(connections, attempts)
+            app.state.experiment_events = ExperimentEventStore(redis)
+            app.state.runner_sessions = RunnerSessionManager(
+                connections, attempts, runner_auth=app.state.runner_auth, event_store=app.state.experiment_events)
             resources.push_async_callback(app.state.runner_sessions.close)
             scheduler = Scheduler(app.state.runner_sessions, DispatchService(db), evaluations=EvaluationService(db))
             attempts.on_task_succeeded = scheduler.notify_eval
             app.state.runner_sessions.on_work_available = scheduler.wake
             app.state.dataset_evaluators = DatasetEvaluatorService(db)
-            app.state.experiments = ExperimentService(db, scheduler.wake)
+            app.state.experiments = ExperimentService(db, connections, scheduler.wake)
             scheduler.start()
             resources.push_async_callback(scheduler.close)
             # 注入资源由调用方管理；应用创建的资源由 AsyncExitStack 按逆序关闭。

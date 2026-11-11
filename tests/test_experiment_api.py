@@ -11,6 +11,7 @@ from evalforge.db.models import (
     BuiltinEvaluator, Dataset, DatasetEvaluators, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment,
     ExperimentDatasetExample, ExperimentRun, Runner, RunnerAttempt,
 )
+from evalforge.server.runner_connections import RUNNER_SESSION_PREFIX, RegisteredConnection, RunnerConnections
 
 
 class ExperimentAPITests(APITestCase):
@@ -21,7 +22,7 @@ class ExperimentAPITests(APITestCase):
         self.owner_id = (await self.user()).id
         async with self.database.transaction() as db:
             dataset = Dataset(name="订单测试集", user_id=self.owner_id)
-            runner = Runner(name="离线开发机", owner_user_id=self.owner_id)
+            runner = Runner(name="开发机", owner_user_id=self.owner_id)
             db.add_all([dataset, runner])
             await db.flush()
             self.dataset_id, self.runner_id = dataset.id, runner.runner_id
@@ -36,6 +37,13 @@ class ExperimentAPITests(APITestCase):
             await self.revise(db, self.example_ids[1], self.v2, "DELETE")
         self.path = f"/api/v1/datasets/{self.dataset_id}/experiments"
         self.evaluator_path = f"/api/v1/datasets/{self.dataset_id}/evaluators"
+        self.connections = RunnerConnections(self.redis)
+        await self.connect_runner(["http_json"])
+
+    async def connect_runner(self, capabilities):
+        await self.connections.register(self.runner_id, RegisteredConnection(
+            session_id="test-session", phase="syncing", capabilities=capabilities,
+        ), 60)
 
     @staticmethod
     async def version(db, dataset_id):
@@ -188,7 +196,7 @@ class ExperimentAPITests(APITestCase):
         self.assertEqual(detail["dataset_version_id"], newest)
         self.assertEqual(detail["name"], "订单回归")
         self.assertEqual(detail["execution_config"], {
-            "runner_id": self.runner_id, "agent_target_id": "order-agent", "timeout_seconds": 60,
+            "runner_id": self.runner_id, "agent_target_id": "order-agent", "timeout_seconds": 60, "stream_output": False,
         })
         self.assertEqual(detail["metadata"], {"tags": ["回归", None]})
         self.assertEqual(detail["evaluators"], [])
@@ -219,6 +227,44 @@ class ExperimentAPITests(APITestCase):
         response = await self.client.get(created.headers["location"])
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json(), detail)
+
+    async def test_stream_output_is_persisted_and_legacy_experiments_read_as_false(self):
+        await self.connect_runner(["http_json", "http_sse"])
+        config = self.payload()["execution_config"]
+        created = await self.create_experiment(execution_config={**config, "stream_output": True})
+        experiment_id = created.json()["experiment_id"]
+        path = created.headers["location"]
+        self.assertIs(created.json()["execution_config"]["stream_output"], True)
+        self.assertIs((await self.client.get(path)).json()["execution_config"]["stream_output"], True)
+        async with self.database.transaction() as db:
+            row = await db.get(Experiment, experiment_id)
+            self.assertIs(row.execution_config["stream_output"], True)
+            row.execution_config = {key: value for key, value in row.execution_config.items() if key != "stream_output"}
+        self.assertIs((await self.client.get(path)).json()["execution_config"]["stream_output"], False)
+        async with self.database.transaction() as db:
+            self.assertNotIn("stream_output", (await db.get(Experiment, experiment_id)).execution_config)
+
+    async def test_submit_requires_online_runner_and_streaming_capability(self):
+        config = self.payload()["execution_config"]
+        streaming = self.payload(execution_config={**config, "stream_output": True})
+        self.assert_error(await self.client.post(self.path, json=streaming), 409, "runner_streaming_unsupported")
+        # 残留的无租期键不等于在线，和 WSS 会话有效性规则一致。
+        await self.redis.persist(RUNNER_SESSION_PREFIX + self.runner_id)
+        self.assert_error(await self.client.post(self.path, json=self.payload()), 409, "runner_offline")
+        await self.connections.invalidate(self.runner_id)
+        for payload in (self.payload(), streaming):
+            self.assert_error(await self.client.post(self.path, json=payload), 409, "runner_offline")
+        self.assertEqual((await self.client.get(self.path)).json()["total"], 0)
+
+    async def test_stream_output_rejects_non_boolean_values(self):
+        config = self.payload()["execution_config"]
+        for value in ("true", 1, 0, None):
+            with self.subTest(value=value):
+                response = await self.client.post(self.path, json=self.payload(
+                    execution_config={**config, "stream_output": value},
+                ))
+                self.assert_error(response, 422, "invalid_request")
+        self.assertEqual((await self.client.get(self.path)).json()["total"], 0)
 
     async def test_list_orders_and_pages_across_versions_and_aggregates_job_states(self):
         self.assertEqual((await self.client.get(self.path)).json(), {"items": [], "page": 1, "pagesize": 20, "total": 0})

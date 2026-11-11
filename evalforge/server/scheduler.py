@@ -8,6 +8,7 @@ from itertools import islice
 from redis.exceptions import RedisError
 
 from .errors import APIError
+from .experiment_events import PreviewTarget
 from .rpc import RpcError, RpcProtocolError, RpcRequestTooLarge
 from .runner_sessions import RunnerSession, RunnerSessionManager
 from .services.dispatch import CancelRequest, DispatchService, RETRYABLE_REJECTIONS
@@ -142,7 +143,7 @@ class Scheduler:
 
     async def _send_one(self, session: RunnerSession) -> None:
         identity = session.identity
-        action = await self.dispatch.next_action(identity)
+        action = await self.dispatch.next_action(identity, supports_streaming=session.supports_streaming)
         if isinstance(action, CancelRequest):
             await self._send_cancel(session, action)
             return
@@ -157,10 +158,15 @@ class Scheduler:
         if not await self.dispatch.prepare_send(identity, claim):
             return
 
+        preview_target = None
+        if claim.payload.get("stream_output"):
+            preview_target = PreviewTarget(claim.experiment_id, claim.key.job_id, claim.key.attempt_id)
+        session.set_preview_target(preview_target)
         sent_at = datetime.now(timezone.utc)
         try:
             reply = await session.peer.call("jobs.dispatch", claim.payload, timeout=self.dispatch_timeout)
         except RpcRequestTooLarge:
+            session.clear_preview_target(claim.key)
             await self.dispatch.record(identity, claim, outcome="rejected", reason="dispatch_payload_too_large")
             return
         except TimeoutError:
@@ -179,6 +185,8 @@ class Scheduler:
                 outcome = "rejected"
             else:
                 outcome, reason = "unknown", "invalid_dispatch_reply"
+        if outcome != "accepted":
+            session.clear_preview_target(claim.key)
         try:
             changed = await self.dispatch.record(identity, claim, outcome=outcome, reason=reason, dispatched_at=sent_at)
         except Exception:

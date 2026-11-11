@@ -1,11 +1,8 @@
 """ASGI WebSocket 文本适配；一个读取者、串行发送、限制消息大小。"""
 
 import asyncio
-from collections.abc import Awaitable, Callable
 
 from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
-
-from .errors import APIError
 
 MAX_MESSAGE_BYTES = 1024 * 1024
 
@@ -15,32 +12,15 @@ class TransportClosed(ConnectionError):
 
 
 class WebSocketConnection:
-    def __init__(self, socket: WebSocket, authorize: Callable[[], Awaitable[None]], *,
-                 max_size: int = MAX_MESSAGE_BYTES):
-        self.socket, self.authorize, self.max_size = socket, authorize, max_size
+    def __init__(self, socket: WebSocket, *, max_size: int = MAX_MESSAGE_BYTES):
+        self.socket, self.max_size = socket, max_size
         self._send_lock = asyncio.Lock()
         self._closed = False
-
-    async def check_authorization(self) -> None:
-        check = asyncio.create_task(self.authorize())
-        try:
-            # 断线时让短认证事务完成清理，再传播取消；避免遗留后台连接关闭任务。
-            await asyncio.shield(check)
-        except asyncio.CancelledError:
-            await asyncio.gather(check, return_exceptions=True)
-            raise
-        except APIError as exc:
-            await self.close(1011 if exc.status >= 500 else 1008)
-            raise TransportClosed("Runner authorization expired") from None
-        except Exception:
-            await self.close(1011)
-            raise TransportClosed("Runner authorization unavailable") from None
 
     async def send_text(self, message: str) -> None:
         if not isinstance(message, str):
             raise TypeError("Only text messages are supported")
         await self._check_size(message)
-        await self.check_authorization()
         async with self._send_lock:
             if self._closed:
                 raise TransportClosed("WebSocket closed")
@@ -66,7 +46,6 @@ class WebSocketConnection:
             await self.close(1003)
             raise TransportClosed("JSON text required")
         await self._check_size(text)
-        await self.check_authorization()
         return text
 
     async def _check_size(self, text: str) -> None:

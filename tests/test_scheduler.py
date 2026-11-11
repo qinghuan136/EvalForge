@@ -8,15 +8,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import fakeredis.aioredis
 from sqlalchemy import select
 
 from api_support import SQLiteDatabase
 from attempt_support import result_params
 from evalforge.db.models import (
-    Base, Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion, ExperimentRun,
+    Base, Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment, ExperimentRun,
     ExperimentRunAnnotation, Runner, RunnerAttempt, User,
 )
 from evalforge.server.runner_auth import RunnerIdentity
+from evalforge.server.runner_connections import RegisteredConnection, RunnerConnections
 from evalforge.server.scheduler import Scheduler
 from evalforge.server.schemas.attempts import AttemptResult
 from evalforge.server.schemas.evaluators import DatasetEvaluatorCreate
@@ -29,15 +31,24 @@ from evalforge.server.services.experiments import ExperimentService
 
 
 class Session:
-    def __init__(self, identity, call):
+    def __init__(self, identity, call, *, supports_streaming=False):
         self.identity = identity
         self.session_id = identity.runner_id
         self.peer = SimpleNamespace(call=call)
         self.can_dispatch = True
+        self.supports_streaming = supports_streaming
         self.close_code = None
+        self.preview_target = None
 
     async def check_current(self):
         pass
+
+    def set_preview_target(self, target):
+        self.preview_target = target
+
+    def clear_preview_target(self, key):
+        if self.preview_target is not None and self.preview_target.key == (key.job_id, key.attempt_id):
+            self.preview_target = None
 
     def request_close(self, code):
         self.can_dispatch = False
@@ -50,6 +61,10 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(temp.cleanup)
         self.database = SQLiteDatabase("sqlite+aiosqlite:///" + str(Path(temp.name) / "scheduler.sqlite"))
         self.addAsyncCleanup(self.database.close)
+        redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+        self.addAsyncCleanup(redis.aclose)
+        self.connections = RunnerConnections(redis)
+        self.experiments = ExperimentService(self.database, self.connections)
         async with self.database.engine.begin() as connection:
             await connection.run_sync(Base.metadata.create_all)
         async with self.database.transaction() as db:
@@ -76,16 +91,54 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(scheduler.close)
         return scheduler
 
-    async def create_experiment(self, runner_id, *, repetitions=1, evaluator_ids=()):
+    async def create_experiment(self, runner_id, *, repetitions=1, evaluator_ids=(), stream_output=False):
         async with self.database.transaction() as db:
             db.add(Runner(runner_id=runner_id, name=runner_id, owner_user_id=self.owner_id))
-        detail = await ExperimentService(self.database).create(
+        capabilities = ["http_json", "http_sse"] if stream_output else ["http_json"]
+        await self.connections.register(runner_id, RegisteredConnection(
+            session_id="initial", phase="ready", capabilities=capabilities,
+        ), 60)
+        detail = await self.experiments.create(
             self.owner_id, 1, self.dataset_id, ExperimentCreate(name=runner_id, repetitions=repetitions,
                 dataset_evaluator_ids=list(evaluator_ids),
-                execution_config={"runner_id": runner_id, "agent_target_id": "agent"}),
+                execution_config={"runner_id": runner_id, "agent_target_id": "agent", "stream_output": stream_output}),
         )
         identity = RunnerIdentity(runner_id, self.owner_id, 1, datetime.max.replace(tzinfo=timezone.utc), b"")
         return identity, detail.experiment_id
+
+    async def test_downgraded_runner_skips_older_streaming_job_then_upgrade_can_dispatch_it(self):
+        identity, streaming_id = await self.create_experiment("switch", stream_output=True)
+        normal = await self.experiments.create(self.owner_id, 1, self.dataset_id, ExperimentCreate(
+            name="normal", execution_config={"runner_id": identity.runner_id, "agent_target_id": "agent"},
+        ))
+        async with self.database.transaction() as db:
+            normal_experiment = await db.get(Experiment, normal.experiment_id)
+            normal_experiment.execution_config = {k: v for k, v in normal_experiment.execution_config.items()
+                                                  if k != "stream_output"}
+            jobs = {job.experiment_id: job.job_id for job in await db.scalars(select(ExperimentRun))}
+
+        old_call = AsyncMock(return_value={"accepted": True})
+        old_session = Session(identity, old_call)
+        await self.scheduler._dispatch_one(old_session)
+        method, payload = old_call.call_args.args
+        self.assertEqual((method, payload["job_id"]), ("jobs.dispatch", jobs[normal.experiment_id]))
+        self.assertNotIn("stream_output", payload)
+        result = AttemptResult.model_validate(result_params((payload["job_id"], payload["attempt_id"])))
+        await AttemptService(self.database).complete(identity, result)
+
+        await self.scheduler._dispatch_one(old_session)
+        old_call.assert_awaited_once()
+        detail = await self.experiments.get(self.owner_id, streaming_id)
+        self.assertEqual((detail.progress.queued, detail.progress.assigned), (1, 0))
+
+        new_call = AsyncMock(return_value={"accepted": True})
+        await self.scheduler._dispatch_one(Session(identity, new_call, supports_streaming=True))
+        method, payload = new_call.call_args.args
+        self.assertEqual((method, payload["job_id"]), ("jobs.dispatch", jobs[streaming_id]))
+        self.assertIs(payload["stream_output"], True)
+        async with self.database.transaction() as db:
+            attempt = await db.scalar(select(RunnerAttempt).where(RunnerAttempt.attempt_id == payload["attempt_id"]))
+            self.assertEqual(attempt.dispatch_json, payload)
 
     async def create_metric(self, name, actual="$.output.reply"):
         config = DatasetEvaluatorCreate(name=name, evaluator_key="exact_match", input_mapping={
@@ -127,7 +180,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(recovered.wait(), 5)
             await service.complete(identity, params)
             await asyncio.wait_for(scored.wait(), 5)
-            detail = await ExperimentService(self.database).get(self.owner_id, experiment_id)
+            detail = await self.experiments.get(self.owner_id, experiment_id)
             self.assertEqual((detail.status, detail.progress.succeeded), ("running", 1))
             await service.complete(identity, params)
             scheduler.notify_eval(calls[0][0])
@@ -135,7 +188,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(persisted.wait(), 10)
         await scheduler.close()
         self.assertEqual(len(calls), 1)
-        detail = await ExperimentService(self.database).get(self.owner_id, experiment_id)
+        detail = await self.experiments.get(self.owner_id, experiment_id)
         self.assertEqual(detail.status, "completed")
         async with self.database.transaction() as db:
             score = await db.scalar(select(ExperimentRunAnnotation))
@@ -178,7 +231,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(annotations["missing_path"][0])
         self.assertIsNotNone(annotations["missing_path"][1])
         self.assertEqual(await evaluation.find_missing(), [])
-        self.assertEqual((await ExperimentService(self.database).get(self.owner_id, experiment_id)).status, "completed")
+        self.assertEqual((await self.experiments.get(self.owner_id, experiment_id)).status, "completed")
 
     async def test_score_prepared_before_cancellation_is_discarded_at_save(self):
         metric_id = await self.create_metric("answer_match")
@@ -189,7 +242,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         evaluation = EvaluationService(self.database)
         item, = await evaluation.find_missing()
 
-        detail = await ExperimentService(self.database).cancel(self.owner_id, 1, experiment_id)
+        detail = await self.experiments.cancel(self.owner_id, 1, experiment_id)
         self.assertEqual(detail.status, "cancelled")
         await evaluation.run(item)
         async with self.database.transaction() as db:
@@ -222,12 +275,12 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                              [("rejected", "busy"), ("rejected", "target_not_found")])
             job = await db.scalar(select(ExperimentRun))
             self.assertEqual((job.status, job.error["code"]), ("failed", "target_not_found"))
-        detail = await ExperimentService(self.database).get(self.owner_id, experiment_id)
+        detail = await self.experiments.get(self.owner_id, experiment_id)
         self.assertEqual(detail.status, "completed")
 
     async def test_cancel_between_claim_and_send_settles_reserved_job_without_rpc(self):
         identity, experiment_id = await self.create_experiment("preflight", repetitions=2)
-        service = ExperimentService(self.database)
+        service = self.experiments
         prepare_send = self.dispatch.prepare_send
         call = AsyncMock()
 
@@ -244,7 +297,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_dispatch_rejection_during_cancel_does_not_requeue_job(self):
         identity, experiment_id = await self.create_experiment("in-flight")
-        service = ExperimentService(self.database)
+        service = self.experiments
 
         async def call(method, payload, *, timeout):
             self.assertEqual(method, "jobs.dispatch")
@@ -288,8 +341,8 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                              ("unknown", "dispatch_timeout"))
             self.assertEqual(attempts["fast"].status, "accepted")
             skipped = attempts["slow"].dispatch_json["job_id"]
-        slow_detail = await ExperimentService(self.database).get(self.owner_id, slow_experiment)
-        fast_detail = await ExperimentService(self.database).get(self.owner_id, fast_experiment)
+        slow_detail = await self.experiments.get(self.owner_id, slow_experiment)
+        fast_detail = await self.experiments.get(self.owner_id, fast_experiment)
         self.assertEqual((slow_detail.status, slow_detail.progress.unknown, slow_detail.progress.queued),
                          ("running", 1, 1))
         self.assertEqual((fast_detail.status, fast_detail.progress.assigned), ("running", 1))
@@ -298,6 +351,6 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(next_claim.key.job_id, skipped)
         result = AttemptResult.model_validate(result_params((next_claim.key.job_id, next_claim.key.attempt_id)))
         await AttemptService(self.database).complete(slow_id, result)
-        slow_detail = await ExperimentService(self.database).get(self.owner_id, slow_experiment)
+        slow_detail = await self.experiments.get(self.owner_id, slow_experiment)
         self.assertEqual((slow_detail.status, slow_detail.progress.unknown, slow_detail.progress.succeeded),
                          ("completed", 1, 1))

@@ -3,9 +3,9 @@
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, Field, JsonValue, field_validator
+from pydantic import AfterValidator, Field, JsonValue, StrictBool, field_validator
 from pydantic.json_schema import SkipJsonSchema
-from typing_extensions import TypedDict
+from typing_extensions import Required, TypedDict
 
 from .auth import Schema
 from .common import PositiveDbId, StoredText, validate_database_json
@@ -18,6 +18,7 @@ class ExecutionConfig(Schema):
     runner_id: StoredText = Field(min_length=1, max_length=128)
     agent_target_id: StoredText = Field(min_length=1, max_length=128)
     timeout_seconds: float = Field(default=60.0, strict=True, gt=0, le=3600, allow_inf_nan=False)
+    stream_output: StrictBool = False
 
     @field_validator("runner_id")
     @classmethod
@@ -91,10 +92,11 @@ class ExperimentSummary(Schema):
 
 
 class SavedExecutionConfig(TypedDict, total=False):
-    # 历史实验允许没有配置，查询时不凭空填默认值。
+    # 历史实验可能没有执行目标，只为新增的流式开关提供兼容默认值。
     runner_id: str
     agent_target_id: str
     timeout_seconds: float
+    stream_output: Required[bool]
 
 
 class ExperimentDetail(ExperimentSummary):

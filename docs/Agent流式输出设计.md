@@ -1,29 +1,54 @@
 # Agent 流式输出设计
 
-本文记录拟实施的第一版。用户创建实验时选择流式模式，Runner 逐片读取 Agent 的 SSE 响应，云端实时接收片段并累积预览。最终结果沿用 `jobs.complete` 落库，随后触发评分。
+流式执行分两条链路：**`delta` 走 Redis，供实时预览；`result` 走 SQLite → PostgreSQL，作为最终输出和评分输入。** Runner、云端接收及 Redis 发布已实现；浏览器 SSE 待接入。
 
-## 执行开关与兼容
+## 整体架构
 
-- 实验 `execution_config` 保存 `stream_output`，默认 `false`，同一实验的所有 Job 使用保存时选定的模式。
-- 云端沿用 `jobs.dispatch`。流式任务携带 `stream_output: true`，仅派给在 `runner.hello` 声明 `http_sse` 的 Runner。普通任务保持原报文。缺少对应能力时，流式任务继续排队。
-- Runner 接单时把模式写进 SQLite 的 Attempt，并纳入重复派发校验。升级时将旧记录按 `false` 迁移。普通执行读完整 JSON，流式执行按 SSE 事件读取，遇到不匹配的响应类型时报告错误。请求体继续使用样本的原始 JSON。
-
-## 片段与最终结果
-
-```text
-Agent SSE → Runner 累积 → 完整 output → SQLite → jobs.complete → PostgreSQL → Eval
-                 └──→ WSS 片段通知 → 云端累积预览 → 后续前端订阅
+```mermaid
+flowchart TD
+    Create["创建 Experiment：stream_output=true"] --> Scheduler
+    Agent["本地 Agent：HTTP SSE"] --> Http
+    subgraph Client["客户端 Runner"]
+        Job["JobManager"] --> Http["HttpExecutor：解析 SSE"]
+        Http -->|"delta：带序号的片段"| Buffer["OutputAccumulator：内存待发队列"]
+        Buffer --> Report["RunnerSession：有片即发，顺手合批"]
+        Http -->|"result：最终 JSON"| SQLite[("SQLite：待确认结果")]
+        SQLite --> Upload["RunnerSession：提交结果"]
+    end
+    subgraph Cloud["云端"]
+        Scheduler["Scheduler：派发前登记预览坐标"] -->|"WSS jobs.dispatch"| Job
+        Scheduler -.-> Session["RunnerSession：按 Attempt 校验"]
+        Session --> Hub["ExperimentEventStore"]
+        Attempt["AttemptService"] --> PG[("PostgreSQL：最终结果")]
+        PG --> Eval["成功后安排评分"]
+    end
+    subgraph Redis["共享 Redis"]
+        Snapshot[("Attempt 预览快照")]
+        PubSub["实验 Pub/Sub 频道"]
+    end
+    Report -->|"WSS jobs.output_chunk"| Session
+    Upload -->|"WSS jobs.complete"| Attempt
+    Hub --> Snapshot
+    Hub --> PubSub
+    Snapshot -.-> Browser["浏览器 SSE：待接入"]
+    PubSub -.-> Browser
 ```
 
-- Agent 协议先约定两类事件。`delta` 提供文本片段，`result` 提供最终 JSON 并结束流。正常结束前断流按失败处理。
-- Runner 的 `OutputChunk` 携带片段序号和内容，`OutputAccumulator` 累积本次输出。客户端按批发送 `jobs.output_chunk` 通知，附带 `job_id` 和 `attempt_id`。片段发送允许丢失，Agent 读取和最终结果提交独立推进。
-- 云端校验会话和 Attempt 归属，按 `(job_id, attempt_id)` 累积预览，保留从开头收到的内容，并记录最后序号、缺片和截断状态。缓冲设置容量上限，结束后短期保留。未来前端可用快照的序号衔接增量。跨进程切换或 Runner 断线可能丢失部分预览。
-- 云端按 `jobs.complete` 提交的完整输出结算，沿用 ACK、重连补传和 Eval。提交后关闭该 Attempt 的预览写入。
+## 组件与链路
 
-## 实施顺序
+| 位置 | 组件 | 职责 |
+| --- | --- | --- |
+| 云端派发 | [ExperimentService](../evalforge/server/services/experiments.py)、[Scheduler](../evalforge/server/scheduler.py) | 创建实验时保存 `stream_output`，默认关闭；所选 Runner 须在线，流式还要求 `http_json` 和 `http_sse`。会话 ready 后派发，发送前登记 `(experiment_id, job_id, attempt_id)`。 |
+| 客户端执行 | [JobManager](../client/evalforge_client/job_manager.py)、[HttpExecutor](../client/evalforge_client/http_executor.py) | 将模式写入本地 Attempt。用原目标 URL 和样本 JSON 调用 Agent，带上 `Accept: text/event-stream`。解析 `delta` 和 `result`；流结束时仍没有合法的 `result`，记为执行失败。 |
+| 客户端上报 | [OutputAccumulator](../client/evalforge_client/stream_output.py)、[RunnerSession](../client/evalforge_client/session.py) | 每片带 `seq`，内存队列最多 64 片。有片就唤醒发送协程，每批最多 16 片，发完不固定等待。`jobs.output_chunk` 是无 ACK 的通知，首片可以早于 `jobs.started`。 |
+| 云端接收 | [WSS 路由](../evalforge/server/routes/runner_ws.py)、[RunnerSession](../evalforge/server/runner_sessions.py) | 在内存里比对 `(job_id, attempt_id)`，直接交给 Hub，不进会话业务队列，也不逐批重查身份。每条会话最多一批在写 Redis；忙时可以丢片。 |
+| 云端预览 | [ExperimentEventStore](../evalforge/server/experiment_events.py) | 用一个 Redis 脚本按 Attempt 更新快照，再把整批新片段发布到 `evalforge:experiment:<experiment_id>:events`。同一次 Attempt 按 `seq` 去重，跳号标记缺片。 |
+| 云端结算 | [AttemptService](../evalforge/server/services/attempts.py) | Runner 先将终态写入 SQLite，再调用 `jobs.complete`；云端提交 PostgreSQL 后返回 ACK，成功结果进入评分。重连可以补交未确认的结果。 |
 
-1. **配置和派发。** 接入实验开关、Runner 能力、SQLite 迁移与兼容派发。
-2. **Runner 读取流。** 实现 SSE 解析、片段累积和最终 JSON 提交，覆盖断流、超时和取消。
-3. **云端实时预览。** 接入批量片段通知、Attempt 归属校验和进程内累积缓冲。用一个分段响应的 Agent 验证云端能在 `jobs.complete` 前读到片段，最终输出可正常评分。
+## 预览保留与多实例
 
-前端订阅、跨实例预览转发和首片延迟等统计留作后续工作。借鉴 Phoenix 的片段与最终结果分流设计，并复用 EvalForge 的最终结果协议。 [现有 Runner 协议](EvalForge_Runner_JSON-RPC_Protocol_v1.md#25-jobscomplete) · [现有评分链路](server-evaluations.md)
+- **快照**：按实验和 Attempt 保留已收到的前缀，最多 256 KiB 或 1,024 片，最后一次有效更新后保留 10 分钟。达到上限时标记截断，新片仍可实时发布。
+- **实时通知**：Pub/Sub 不保存历史。队列满、Redis 写入慢或连接断开时允许丢预览；重连不重新授权旧 Attempt。完成落库、派发未受理或关闭连接后撤销上报资格；已经在途的批次仍归原 Attempt。
+- **浏览器 SSE（待接入）**：浏览器可以连到任意实例。该实例先订阅实验频道，再读 Redis 快照，用每个 Attempt 的 `seq` 衔接实时片段。创建实验接口不需要为订阅改动。
+
+相关：[Runner 上报协议](EvalForge_Runner_JSON-RPC_Protocol_v1.md#28-jobsoutput_chunk) · [云端评分链路](server-evaluations.md)

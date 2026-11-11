@@ -30,6 +30,7 @@ from evalforge.db.models import (
     Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment, ExperimentRun, Runner, RunnerAttempt,
     RunnerCredential, User,
 )
+from evalforge.server.experiment_events import PreviewTarget
 
 
 class RunnerWebSocketTests(APITestCase):
@@ -66,7 +67,7 @@ class RunnerWebSocketTests(APITestCase):
         data = response.json()
         self.runner_id, self.credential_id = data["runner"]["runner_id"], data["credential"]["id"]
         self.token = data["credential"]["token"]
-        self.app.state.settings = replace(self.config, runner_auth_check_seconds=0.05)
+        self.app.state.settings = replace(self.config, runner_session_heartbeat_seconds=0.05)
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen()
@@ -96,10 +97,10 @@ class RunnerWebSocketTests(APITestCase):
         return connect(self.url + kwargs.pop("suffix", ""), ssl=self.ssl, proxy=None,
                        additional_headers=headers, **kwargs)
 
-    async def hello(self, ws, request_id=1):
+    async def hello(self, ws, request_id=1, *, capabilities=("http_json",)):
         await ws.send(json.dumps({"jsonrpc": "2.0", "method": "runner.hello", "id": request_id,
                                   "params": {"runner_id": self.runner_id, "version": "0.1.0",
-                                             "capabilities": ["http_json"], "max_concurrent_jobs": 1}}))
+                                             "capabilities": capabilities, "max_concurrent_jobs": 1}}))
         reply = json.loads(await asyncio.wait_for(ws.recv(), 2))
         self.assertIn("result", reply, reply)
         return reply["result"]
@@ -169,6 +170,12 @@ class RunnerWebSocketTests(APITestCase):
             await call(ws, "runner.ready", {"session_id": hello["session_id"]})
 
     async def test_created_experiment_dispatches_frozen_input_after_ready_and_completes(self):
+        await self.assert_dispatches_frozen_input(stream_output=False)
+
+    async def test_created_streaming_experiment_dispatches_with_streaming_flag_and_completes(self):
+        await self.assert_dispatches_frozen_input(stream_output=True)
+
+    async def assert_dispatches_frozen_input(self, *, stream_output):
         owner = await self.user()
         async with self.database.transaction() as db:
             dataset = Dataset(name="dispatch", user_id=owner.id)
@@ -187,14 +194,6 @@ class RunnerWebSocketTests(APITestCase):
                 versions.append(version.id)
                 db.add(DatasetExampleRevision(dataset_example_id=example_id, dataset_version_id=version.id,
                                               revision_kind=kind, input={"value": value}, output={"answer": "hidden"}))
-        response = await self.client.post(f"/api/v1/datasets/{dataset_id}/experiments", json={
-            "name": "dispatch", "repetitions": 2, "dataset_version_id": versions[0],
-            "execution_config": {"runner_id": self.runner_id, "agent_target_id": "agent", "timeout_seconds": 12},
-        })
-        self.assertEqual(response.status_code, 201, response.text)
-        url = response.headers["location"]
-        self.assertEqual(response.json()["progress"]["queued"], 2)
-
         async def send(ws, method, params):
             await ws.send(json.dumps({"jsonrpc": "2.0", "id": method, "method": method, "params": params}))
 
@@ -202,7 +201,17 @@ class RunnerWebSocketTests(APITestCase):
             return json.loads(await asyncio.wait_for(ws.recv(), 4))
 
         async with self.connection() as ws:
-            hello = await self.hello(ws)
+            capabilities = ["http_json", "http_sse"] if stream_output else ["http_json"]
+            hello = await self.hello(ws, capabilities=capabilities)
+            response = await self.client.post(f"/api/v1/datasets/{dataset_id}/experiments", json={
+                "name": "dispatch", "repetitions": 2, "dataset_version_id": versions[0],
+                "execution_config": {"runner_id": self.runner_id, "agent_target_id": "agent",
+                                     "timeout_seconds": 12, "stream_output": stream_output},
+            })
+            self.assertEqual(response.status_code, 201, response.text)
+            url = response.headers["location"]
+            experiment_id = response.json()["experiment_id"]
+            self.assertEqual(response.json()["progress"]["queued"], 2)
             await send(ws, "runner.sync", {"runner_id": self.runner_id, "active_jobs": [], "pending_results": []})
             self.assertEqual((await recv(ws))["result"], {"jobs": []})
             self.assertEqual((await self.client.get(url)).json()["progress"]["queued"], 2)
@@ -219,12 +228,25 @@ class RunnerWebSocketTests(APITestCase):
                 self.assertEqual(payload, {
                     "job_id": key[0], "attempt_id": key[1], "agent_target_id": "agent", "example_id": str(example_id),
                     "input": {"value": "frozen"}, "timeout_seconds": 12,
+                    **({"stream_output": True} if stream_output else {}),
                 })
                 async with self.database.transaction() as db:
                     job = await db.scalar(select(ExperimentRun).where(ExperimentRun.job_id == key[0]))
                     attempt = await db.scalar(select(RunnerAttempt).where(RunnerAttempt.attempt_id == key[1]))
                     self.assertEqual((job.repetition_number, job.status, attempt.status), (repetition, "assigned", "assigned"))
                     self.assertEqual(attempt.dispatch_json, payload)
+                if stream_output:
+                    # 首片在 accepted / started / complete 之前到达，仍应有正确的坐标和快照。
+                    chunks = [{"seq": 1, "text": "订单"}, {"seq": 2, "text": "已完成 🧪"}]
+                    await ws.send(json.dumps({"jsonrpc": "2.0", "method": "jobs.output_chunk", "params": {
+                        "job_id": key[0], "attempt_id": key[1], "chunks": chunks,
+                    }}))
+                    store = self.app.state.experiment_events
+                    target = PreviewTarget(experiment_id, *key)
+                    async with asyncio.timeout(2):
+                        while (snapshot := await store.read_preview(target)) is None:
+                            await asyncio.sleep(0.01)
+                    self.assertEqual([chunk.model_dump() for chunk in snapshot.chunks], chunks)
                 # 模拟 Agent 先于接单响应完成；迟到的 accepted 不得回退终态。
                 await send(ws, "jobs.complete", result_params(key))
                 self.assertEqual((await recv(ws))["result"], {"acknowledged": True})
@@ -302,7 +324,7 @@ class RunnerWebSocketTests(APITestCase):
         async with self.connection() as ws:
             await self.hello(ws)
             connections = self.app.state.runner_sessions.connections
-            with patch.object(connections, "is_current", side_effect=RedisConnectionError("private redis URI")):
+            with patch.object(connections, "renew", side_effect=RedisConnectionError("private redis URI")):
                 with self.assertRaises(ConnectionClosed) as caught:
                     await asyncio.wait_for(ws.recv(), 2)
             self.assertEqual(caught.exception.rcvd.code, 1011)
@@ -450,9 +472,10 @@ asyncio.run(main())
 
     async def test_idle_connections_close_after_deletion_and_browser_logout_does_not_revoke(self):
         async with self.connection() as ws:
+            await self.hello(ws)
             logout = await self.client.post("/api/v1/auth/logout-all")
             self.assertEqual(logout.status_code, 204)
-            await ws.ping()
+            await (await ws.ping())
             await self.login()
             deleted = await self.client.delete(f"/api/v1/runners/{self.runner_id}")
             self.assertEqual(deleted.status_code, 204)
@@ -469,6 +492,7 @@ asyncio.run(main())
         self.assertEqual(caught.exception.response.status_code, 503)
         self.assertNotIn(b"private", caught.exception.response.body)
         async with self.connection() as ws:
+            await self.hello(ws)
             with patch.object(self.database, "transaction", side_effect=error):
                 with self.assertRaises(ConnectionClosed) as caught:
                     await asyncio.wait_for(ws.recv(), 2)
@@ -476,13 +500,28 @@ asyncio.run(main())
 
     async def test_idle_connection_expires_without_waiting_for_an_application_message(self):
         async with self.connection() as ws:
-            # 握手完成后令凭证到期，避免把 DNS / TLS 握手耗时当成测试前置条件。
+            await self.hello(ws)
             async with self.database.transaction() as db:
                 credential = await db.get(RunnerCredential, self.credential_id)
                 credential.expires_at = credential.created_at + timedelta(microseconds=1)
             with self.assertRaises(ConnectionClosed) as caught:
                 await asyncio.wait_for(ws.recv(), 3)
             self.assertEqual(caught.exception.rcvd.code, 1008)
+
+    async def test_application_messages_do_not_check_credentials_or_session_in_transport(self):
+        self.app.state.settings = replace(self.config, runner_session_heartbeat_seconds=30)
+        auth = self.app.state.runner_auth
+        connections = self.app.state.runner_sessions.connections
+        async with self.connection() as ws:
+            await self.hello(ws)
+            with patch.object(auth, "check", wraps=auth.check) as check, \
+                 patch.object(connections, "is_current", wraps=connections.is_current) as is_current:
+                for request_id in range(3):
+                    await ws.send(json.dumps({"jsonrpc": "2.0", "method": "test.unknown", "id": request_id}))
+                    reply = json.loads(await asyncio.wait_for(ws.recv(), 2))
+                    self.assertEqual((reply["id"], reply["error"]["code"]), (request_id, -32601))
+                check.assert_not_awaited()
+                is_current.assert_not_awaited()
 
     async def test_plain_ws_is_rejected_before_token_validation(self):
         sent = []

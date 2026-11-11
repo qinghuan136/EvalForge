@@ -4,6 +4,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 
 from .errors import APIError
 from .schemas.runners import RunnerConnection
@@ -32,11 +33,29 @@ return 1
 class RegisteredConnection(BaseModel):
     session_id: str = Field(min_length=1)
     phase: Literal["connected", "syncing", "ready"]
+    capabilities: list[str] = Field(default_factory=list, max_length=32)
 
 
 class RunnerConnections:
     def __init__(self, redis: Redis):
         self.redis = redis
+
+    @staticmethod
+    def _decode(encoded: str | bytes) -> RegisteredConnection:
+        try:
+            return RegisteredConnection.model_validate_json(encoded)
+        except ValidationError:
+            raise APIError(503, "runner_session_unavailable", "Runner 会话信息暂时不可用") from None
+
+    async def read_current(self, runner_id: str) -> RegisteredConnection | None:
+        """在同一次 Redis 事务中读取注册和剩余租期，只有有效租约算在线。"""
+        key = RUNNER_SESSION_PREFIX + runner_id
+        try:
+            async with self.redis.pipeline(transaction=True) as pipe:
+                encoded, ttl_ms = await pipe.get(key).pttl(key).execute()
+        except RedisError:
+            raise APIError(503, "runner_session_unavailable", "Runner 会话信息暂时不可用") from None
+        return None if encoded is None or ttl_ms <= 0 else self._decode(encoded)
 
     async def read(self, runner_ids: list[str]) -> list[RunnerConnection]:
         if not runner_ids:
@@ -47,10 +66,7 @@ class RunnerConnections:
             if encoded is None:
                 result.append(RunnerConnection())
                 continue
-            try:
-                record = RegisteredConnection.model_validate_json(encoded)
-            except ValidationError:
-                raise APIError(503, "runner_session_unavailable", "Runner 会话信息暂时不可用") from None
+            record = self._decode(encoded)
             result.append(RunnerConnection(online=True, phase=record.phase))
         return result
 

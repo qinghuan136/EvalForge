@@ -14,6 +14,7 @@ from evalforge.db.models import (
 )
 
 from ..errors import APIError
+from ..runner_connections import RunnerConnections
 from ..schemas.experiments import (
     ExperimentCreate, ExperimentDetail, ExperimentPage, ExperimentProgress, ExperimentSummary,
     SavedExecutionConfig,
@@ -38,6 +39,7 @@ def _summary_fields(experiment: Experiment, progress: ExperimentProgress) -> dic
 def _detail(experiment: Experiment, progress: ExperimentProgress) -> ExperimentDetail:
     config = {name: experiment.execution_config[name] for name in SavedExecutionConfig.__annotations__
               if name in experiment.execution_config}
+    config.setdefault("stream_output", False)
     return ExperimentDetail(**_summary_fields(experiment, progress), description=experiment.description,
                             metadata=experiment.metadata_, execution_config=config,
                             evaluators=experiment.execution_config.get("evaluators", []))
@@ -62,8 +64,10 @@ def _snapshot_query(dataset_id: int, version_id: int, limit: int):
 
 
 class ExperimentService:
-    def __init__(self, database: Database, on_work_available: Callable[[], None] | None = None):
+    def __init__(self, database: Database, connections: RunnerConnections,
+                 on_work_available: Callable[[], None] | None = None):
         self.database = database
+        self.connections = connections
         self.on_work_available = on_work_available
 
     async def create(self, owner_id: int, auth_version: int, dataset_id: int,
@@ -86,6 +90,12 @@ class ExperimentService:
                 raise APIError(404, "runner_not_found", "Runner 不存在")
             if not enabled:
                 raise APIError(409, "runner_disabled", "Runner 已禁用")
+
+            connection = await self.connections.read_current(data.execution_config.runner_id)
+            if connection is None:
+                raise APIError(409, "runner_offline", "请先连接实验指定的 Runner")
+            if data.execution_config.stream_output and not {"http_json", "http_sse"}.issubset(connection.capabilities):
+                raise APIError(409, "runner_streaming_unsupported", "当前 Runner 不支持流式执行，请升级后重连")
 
             max_examples = MAX_EXPERIMENT_JOBS // data.repetitions
             snapshot = (await db.execute(_snapshot_query(dataset_id, version_id, max_examples + 1))).all()

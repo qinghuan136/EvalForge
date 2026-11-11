@@ -4,12 +4,9 @@ import asyncio
 import json
 import unittest
 from contextlib import asynccontextmanager
-from unittest.mock import Mock
-
-from starlette.websockets import WebSocket
 
 from evalforge.server.rpc import JsonRpcPeer, RpcError, RpcProtocolError
-from evalforge.server.ws_transport import TransportClosed, WebSocketConnection
+from evalforge.server.ws_transport import TransportClosed
 
 
 class Channel:
@@ -50,25 +47,6 @@ async def peers(**options):
 
 
 class ServerRPCTests(unittest.IsolatedAsyncioTestCase):
-    async def test_cancelled_authorization_waits_for_transaction_cleanup(self):
-        entered, release, cleaned = asyncio.Event(), asyncio.Event(), asyncio.Event()
-        async def authorize():
-            entered.set()
-            try:
-                await release.wait()
-            finally:
-                cleaned.set()
-        connection = WebSocketConnection(Mock(spec=WebSocket), authorize)
-        task = asyncio.create_task(connection.check_authorization())
-        await asyncio.wait_for(entered.wait(), 1)
-        task.cancel()
-        await asyncio.sleep(0)
-        self.assertFalse(task.done())
-        release.set()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
-        self.assertTrue(cleaned.is_set())
-
     async def test_nested_reverse_calls_and_out_of_order_replies(self):
         async with peers() as (a, b):
             release = asyncio.Event()

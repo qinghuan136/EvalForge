@@ -73,7 +73,7 @@ guard 不通过时返回 allowed=False、next_state=None、reason="guard_rejecte
 
 1. hello：先用 validate_session_event() 拒绝错误阶段，再以 connected 注册；确认当前会话后，预览 HELLO_CONFIRMED，Redis 比较当前阶段并更新为预览目标，成功后更新本地阶段并响应。
 2. ready：根据 sync_processed 和历史 pending_uploads 计算目标阶段；复用同一转换入口，在 Redis 原子更新成功后再更新本地阶段、返回 ACK。
-3. 续租：Redis 确认续租成功后，提交 LEASE_RENEWED；失败走 CLOSE，不能由状态机复活租约。
+3. 续租：心跳用 LEASE_RENEWED 校验续租结果，不修改会话阶段；失败时通知管理协程走 CLOSE。
 4. 关闭：通过 CLOSE 进入本地终态，再按 session_id 条件清理 Redis；不在 Redis 长期保存 closed。
 
 context 只能由云端构建，不能直接相信客户端提交的布尔值。预览只对当前快照有效，不是预约或锁；is_current 是瞬时校验结果，外部操作仍须原子比较，提交时上下文变化需要重新判断。规则函数不提供锁、事务、TTL 或身份认证。

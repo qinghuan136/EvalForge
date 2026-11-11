@@ -6,7 +6,7 @@ import os
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import fakeredis.aioredis
 
@@ -32,12 +32,12 @@ class RunnerSessionTests(unittest.IsolatedAsyncioTestCase):
         self.connections = RunnerConnections(self.redis)
         self.manager = self.new_manager()
         self.settings = ServerSettings(runner_hello_timeout_seconds=0.3, runner_session_ttl_seconds=1,
-                                       runner_session_renew_seconds=0.05, runner_session_operation_timeout_seconds=0.1)
+                                       runner_session_heartbeat_seconds=0.05, runner_session_operation_timeout_seconds=0.1)
         self.identity = RunnerIdentity("runner-1", 1, 7, datetime.now(timezone.utc) + timedelta(days=1), b"x" * 32)
         self.key = RUNNER_SESSION_PREFIX + self.identity.runner_id
 
     def new_manager(self):
-        manager = RunnerSessionManager(self.connections)
+        manager = RunnerSessionManager(self.connections, runner_auth=AsyncMock())
         self.addAsyncCleanup(manager.close)
         return manager
 
@@ -325,6 +325,33 @@ class RunnerSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.close_code, 1011)
         self.assertIsNone(await self.redis.get(self.key))
 
+    async def test_shutdown_waits_for_in_flight_heartbeat_check_without_renewing(self):
+        session = self.session(runner_session_ttl_seconds=3, runner_session_operation_timeout_seconds=1)
+        entered, release, cleaned = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+        async def check(identity):
+            entered.set()
+            try:
+                await release.wait()
+            finally:
+                cleaned.set()
+
+        self.manager.runner_auth.check.side_effect = check
+        await self.hello(session)
+        with patch.object(self.connections, "renew", wraps=self.connections.renew) as renew:
+            try:
+                await asyncio.wait_for(entered.wait(), 0.8)
+                session.request_close(1001)
+                await asyncio.sleep(0)
+                self.assertFalse(session.task.done())
+            finally:
+                release.set()
+                await asyncio.wait_for(session.task, 1)
+            renew.assert_not_awaited()
+        self.assertTrue(cleaned.is_set())
+        self.assertEqual(session.close_code, 1001)
+        self.assertIsNone(await self.redis.get(self.key))
+
     async def test_corrupt_or_nonexpiring_registration_is_not_a_valid_lease(self):
         session = self.session()
         await self.hello(session)
@@ -378,21 +405,21 @@ class RunnerSessionTests(unittest.IsolatedAsyncioTestCase):
 class RunnerSessionConfigTests(unittest.TestCase):
     def test_timeouts_capacity_and_renewal_margin_are_validated(self):
         for changes in ({"runner_hello_timeout_seconds": 0}, {"runner_session_queue_size": True},
-                        {"runner_session_ttl_seconds": 1.5}, {"runner_session_renew_seconds": float("nan")},
+                        {"runner_session_ttl_seconds": 1.5}, {"runner_session_heartbeat_seconds": float("nan")},
                         {"runner_session_operation_timeout_seconds": float("inf")},
-                        {"runner_session_ttl_seconds": 25}):
+                        {"runner_session_ttl_seconds": 10}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 ServerSettings(**changes)
 
     def test_session_settings_are_read_from_environment(self):
         with patch.dict(os.environ, {"EVALFORGE_RUNNER_HELLO_TIMEOUT_SECONDS": "2",
                                      "EVALFORGE_RUNNER_SESSION_TTL_SECONDS": "30",
-                                     "EVALFORGE_RUNNER_SESSION_RENEW_SECONDS": "5",
+                                     "EVALFORGE_RUNNER_SESSION_HEARTBEAT_SECONDS": "4",
                                      "EVALFORGE_RUNNER_SESSION_OPERATION_TIMEOUT_SECONDS": "1",
                                      "EVALFORGE_RUNNER_SESSION_QUEUE_SIZE": "4"}, clear=True):
             settings = ServerSettings.from_env("nonexistent-runner-session-test.env")
         self.assertEqual(settings.runner_hello_timeout_seconds, 2)
         self.assertEqual(settings.runner_session_ttl_seconds, 30)
-        self.assertEqual(settings.runner_session_renew_seconds, 5)
+        self.assertEqual(settings.runner_session_heartbeat_seconds, 4)
         self.assertEqual(settings.runner_session_operation_timeout_seconds, 1)
         self.assertEqual(settings.runner_session_queue_size, 4)

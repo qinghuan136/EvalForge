@@ -35,10 +35,9 @@ class ServerSettings:
     login_limit: int = 10
     register_limit: int = 5
     runner_websocket_url: str = "wss://localhost:8000/api/v1/runner/ws"
-    runner_auth_check_seconds: float = 5
+    runner_session_heartbeat_seconds: float = 5
     runner_hello_timeout_seconds: float = 10
     runner_session_ttl_seconds: int = 60
-    runner_session_renew_seconds: float = 20
     runner_session_operation_timeout_seconds: float = 5
     runner_session_queue_size: int = 32
 
@@ -55,13 +54,13 @@ class ServerSettings:
                      "runner_session_ttl_seconds", "runner_session_queue_size"):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ValueError(f"Invalid server {name}")
-        for name in ("runner_auth_check_seconds", "runner_hello_timeout_seconds",
-                     "runner_session_renew_seconds", "runner_session_operation_timeout_seconds"):
+        for name in ("runner_session_heartbeat_seconds", "runner_hello_timeout_seconds",
+                     "runner_session_operation_timeout_seconds"):
             value = getattr(self, name)
             if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"Invalid {name}")
-        if self.runner_session_renew_seconds + self.runner_session_operation_timeout_seconds >= self.runner_session_ttl_seconds:
-            raise ValueError("Runner renewal interval plus operation timeout must be shorter than session TTL")
+        if self.runner_session_heartbeat_seconds + self.runner_session_operation_timeout_seconds >= self.runner_session_ttl_seconds:
+            raise ValueError("Runner heartbeat interval plus operation timeout must be shorter than session TTL")
         try:
             url = urlsplit(self.runner_websocket_url)
             local_ws = (url.scheme == "ws" and not self.cookie_secure
@@ -87,10 +86,10 @@ class ServerSettings:
             raise ValueError("EVALFORGE_COOKIE_SECURE must be true or false")
         try:
             ttl = int(values.get("EVALFORGE_SESSION_TTL_SECONDS", "86400"))
-            auth_interval = float(values.get("EVALFORGE_RUNNER_AUTH_CHECK_SECONDS", "5"))
+            heartbeat_interval = float(values.get("EVALFORGE_RUNNER_SESSION_HEARTBEAT_SECONDS",
+                                                  values.get("EVALFORGE_RUNNER_AUTH_CHECK_SECONDS", "5")))
             hello_timeout = float(values.get("EVALFORGE_RUNNER_HELLO_TIMEOUT_SECONDS", "10"))
             runner_ttl = int(values.get("EVALFORGE_RUNNER_SESSION_TTL_SECONDS", "60"))
-            renew_interval = float(values.get("EVALFORGE_RUNNER_SESSION_RENEW_SECONDS", "20"))
             operation_timeout = float(values.get("EVALFORGE_RUNNER_SESSION_OPERATION_TIMEOUT_SECONDS", "5"))
             queue_size = int(values.get("EVALFORGE_RUNNER_SESSION_QUEUE_SIZE", "32"))
         except (ValueError, TypeError):
@@ -99,8 +98,7 @@ class ServerSettings:
             allowed_origins=tuple(value.strip() for value in values.get("EVALFORGE_ALLOWED_ORIGINS", "https://localhost:8000").split(",")),
             cookie_secure=secure == "true", session_ttl_seconds=ttl,
             runner_websocket_url=values.get("EVALFORGE_RUNNER_WS_URL", "wss://localhost:8000/api/v1/runner/ws"),
-            runner_auth_check_seconds=auth_interval,
+            runner_session_heartbeat_seconds=heartbeat_interval,
             runner_hello_timeout_seconds=hello_timeout, runner_session_ttl_seconds=runner_ttl,
-            runner_session_renew_seconds=renew_interval,
             runner_session_operation_timeout_seconds=operation_timeout, runner_session_queue_size=queue_size,
         )
