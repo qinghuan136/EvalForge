@@ -9,7 +9,7 @@ from sqlalchemy.exc import OperationalError
 from api_support import APITestCase
 from evalforge.db.models import (
     BuiltinEvaluator, Dataset, DatasetEvaluators, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment,
-    ExperimentDatasetExample, ExperimentRun, Runner, RunnerAttempt,
+    ExperimentDatasetExample, Job, Runner, RunnerAttempt,
 )
 from evalforge.server.runner_connections import RUNNER_SESSION_PREFIX, RegisteredConnection, RunnerConnections
 
@@ -216,7 +216,7 @@ class ExperimentAPITests(APITestCase):
                 select(links.dataset_example_id, links.dataset_example_revision_id)
                 .where(links.experiment_id == older["experiment_id"]))).all()}
             self.assertEqual(original, dict(zip(self.example_ids, self.original_revisions)))
-            jobs = (await db.scalars(select(ExperimentRun).where(ExperimentRun.experiment_id == detail["experiment_id"]))).all()
+            jobs = (await db.scalars(select(Job).where(Job.experiment_id == detail["experiment_id"]))).all()
             self.assertEqual({(row.dataset_example_id, row.repetition_number) for row in jobs},
                              {(example_id, number) for example_id in snapshot for number in (1, 2)})
             self.assertEqual(len({row.job_id for row in jobs}), 4)
@@ -272,8 +272,8 @@ class ExperimentAPITests(APITestCase):
         second = (await self.create_experiment()).json()
         async with self.database.transaction() as db:
             await db.execute(update(Experiment).values(created_at=datetime(2026, 11, 8, tzinfo=timezone.utc)))
-            rows = (await db.scalars(select(ExperimentRun).where(ExperimentRun.experiment_id == second["experiment_id"])
-                                    .order_by(ExperimentRun.id))).all()
+            rows = (await db.scalars(select(Job).where(Job.experiment_id == second["experiment_id"])
+                                    .order_by(Job.id))).all()
             rows[0].status, rows[0].output = "succeeded", {"task_output": None}
             rows[1].status = "unknown"
             experiment = await db.get(Experiment, second["experiment_id"])
@@ -392,6 +392,6 @@ class ExperimentAPITests(APITestCase):
         self.assert_error(response, 503, "service_unavailable")
         self.assertNotIn("private failure details", response.text)
         async with self.database.transaction() as db:
-            for table in (Experiment, ExperimentDatasetExample, ExperimentRun):
+            for table in (Experiment, ExperimentDatasetExample, Job):
                 self.assertEqual(await db.scalar(select(func.count()).select_from(table)), 0)
         await self.create_experiment()

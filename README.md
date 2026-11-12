@@ -5,7 +5,7 @@
 Python 3.11+。V0 离线实验执行仅使用标准库，无需启动 Phoenix、数据库或模型服务。
 项目已另外安装 PostgreSQL 基础设施（SQLAlchemy + asyncpg + Alembic），使用方式见 [数据库说明](docs/database.md)。
 云端 Redis 异步连接基础设施已就绪（redis-py），配置、资源管理与检查命令见 [Redis 说明](docs/redis.md)。
-当前 21 张表已实现 ORM（含停用保留的旧配置），云端主链为 Experiment → ExperimentRun（Job）→ RunnerAttempt；结构和迁移边界见 [ORM 说明](docs/orm.md)。
+当前 21 张表已实现 ORM（含停用保留的旧配置），云端主链为 Experiment → Job → RunnerAttempt；每个 Job 的评分保存为 JobEvaluation；结构和迁移边界见 [ORM 说明](docs/orm.md)。
 新增用户、Runner 与凭证三张表，字段及 Mermaid ER 图见 [身份与凭证设计](docs/auth-schema.md)。
 云端七个浏览器鉴权接口与五个 Runner 管理接口已实现，见 [鉴权服务](docs/server-auth.md)与 [Runner 管理](docs/server-runners.md)。[WSS / JSON-RPC 接入](docs/server-wss.md)已接通认证、会话、Attempt 同步与结果上报。
 对象关系、协程、消息流及存储边界见 [当前项目架构图解](docs/当前项目架构图解.md)（内含 Mermaid 图）。

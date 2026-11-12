@@ -9,15 +9,15 @@
 | --- | --- |
 | `evalforge/db/base.py` | ORM 基类、JSONB / 时区时间类型、约束命名、暂缓外键标记 |
 | `evalforge/db/orm/datasets.py` | Dataset、Version、Example、Revision |
-| `evalforge/db/orm/experiments.py` | Experiment、样本快照关联、TaskRun、EvalRun |
+| `evalforge/db/orm/experiments.py` | Experiment、样本快照关联、Job、JobEvaluation |
 | `evalforge/db/orm/attempts.py` | 云端 Attempt、完整派发/结果快照、活动容量约束 |
 | `evalforge/db/orm/auth.py` | User、Runner、RunnerCredential；字段和 ER 图见 [鉴权数据结构](auth-schema.md) |
 | `evalforge/db/orm/evaluators.py` | 评分器公共定义、三个子类型、源码版本、数据集使用配置 |
-| `evalforge/db/orm/jobs.py` | 旧后台配置已停用；保留 Prompt、EVAL_ONLY 和原评分关联的表与外键 |
+| `evalforge/db/orm/experiment_configs.py` | 旧 ExperimentConfig 已停用；保留 Prompt、EVAL_ONLY 和原评分关联的表与外键 |
 | `evalforge/db/models.py` | 统一导入和注册入口，Alembic 由此获得完整 metadata |
 
 ```python
-from evalforge.db.models import Dataset, DatasetVersion, ExperimentRun
+from evalforge.db.models import Dataset, DatasetVersion, Job, JobEvaluation
 
 dataset = Dataset(name="价格测试集", metadata_={"purpose": "regression"})
 version = DatasetVersion(dataset=dataset, description="初始版本")
@@ -25,24 +25,25 @@ version = DatasetVersion(dataset=dataset, description="初始版本")
 ```
 
 现有 `evalforge/models.py` 继续保留 dataclass，不改动 V0 的 Task / Evaluator 接口。
-`TaskRun` 在 ORM 中对应 `ExperimentRun`，`EvalRun` 对应 `ExperimentRunAnnotation`。
+云端 `Job`、`JobEvaluation`、`ExperimentConfig` 仍分别映射到 `experiment_runs`、`experiment_run_annotations`、`experiment_jobs`。表名和外键列沿用原名。
 Result 不建独立表。Runner 身份使用独立的 runners 表，与本地 V0 的执行器概念分开。
 
 ## 云端远程执行模型
 
 ```text
 Experiment（整体状态、execution_config）
-  → ExperimentRun（逻辑 Job、排队到最终结果）
-    → RunnerAttempt（一次派发尝试，可保留多次历史）
+  → Job（从排队到最终结果）
+    ├─ RunnerAttempt（一次派发尝试，可保留多次历史）
+    └─ JobEvaluation（已保存的一项评分）
 ```
 
 - Experiment.status：pending / running / cancelling / completed / failed / cancelled；默认 pending。execution_config 默认为 {}，可保存 runner_id、agent_target_id、timeout_seconds；不保存客户端 URL/请求头。
-- ExperimentRun.job_id 为对外唯一标识，attempt_id 为尝试标识；默认 ORM 插入时生成 UUID 字符串。内部主键保持整数。构造对象本身尚未生成这些默认值，发消息前须先 flush，或显式提供 ID。
-- Run 默认 queued；assigned / running / unknown 均未产生最终结果。终态为 succeeded / failed / cancelled；output 包装成 `{"task_output": ...}`，有效 JSON null 与未产生结果的 SQL NULL 区分。
-- Run.error 改为 JSON `{code, message}`；HTTP 状态、客户端 duration_ms 单独保存。实际起止时间可空，不能用云端收到通知的时间伪造；latency_ms 优先 duration_ms，其次实际时间差，否则为空。
+- `Job.id` 是整数主键，在评分代码里称为 `job_pk`。`Job.job_id` 是协议使用的 UUID 字符串；`attempt_id` 是一次派发尝试的独立标识。
+- Job 默认 queued；assigned / running / unknown 均未产生最终结果。终态为 succeeded / failed / cancelled；output 包装成 `{"task_output": ...}`，有效 JSON null 与未产生结果的 SQL NULL 区分。
+- Job.error 改为 JSON `{code, message}`；HTTP 状态、客户端 duration_ms 单独保存。实际起止时间可空，不能用云端收到通知的时间伪造；latency_ms 优先 duration_ms，其次实际时间差，否则为空。
 - Attempt 保存 dispatch_json / result_json 与归属、取消意图、云端接收时间。runner_id 已建立到 runners.runner_id 的 RESTRICT 外键及普通索引；身份和凭证记录已定义，实际鉴权后续实现。
 - Attempt 的 assigned / accepted / running 占活动容量。部分唯一索引约束每个 Runner、每个 Job 最多一个活动 Attempt。unknown 保留为已跳过的历史记录，明确拒绝用 rejected + rejection_reason。
-- 旧 ExperimentJob 的 table.info 标记 deprecated；Experiment.job 仅保留兼容关系。新实验不要求建立旧配置记录，也不新增远程配置子表。
+- 旧 ExperimentConfig 的 table.info 标记 deprecated；Experiment.legacy_config 仅保留兼容关系。新实验不要求建立旧配置记录，也不新增远程配置子表。
 
 本阶段只定义 ORM 与约束。消息快照的字段形状、标识一致性、配置冻结、结果幂等与不可重写、采用哪次 Attempt、实验状态推进由后续写入服务实现；不自动重试或发送 ACK。评分表结构保持原样。
 
@@ -51,11 +52,11 @@ Experiment（整体状态、execution_config）
 - PostgreSQL JSON 字段使用 JSONB，时间字段使用 TIMESTAMP WITH TIME ZONE；写入时间应带时区。
 - `metadata_` 是 Python 属性名，对应数据库列 `metadata`。
 - Evaluator 使用 joined-table inheritance，通过 `(kind, id)` 复合外键关联子表。
-- ExperimentPromptTask 通过 `(type, id)` 关联 ExperimentJob。
+- ExperimentPromptTask 通过 `(type, id)` 关联 ExperimentConfig。
 - ExperimentEvalOnlyConfig 使用 single-table inheritance，共用 experiment_jobs，不增加表。
 - JSON 配置暂存普通 dict / list；完整配置校验、名称格式校验和版本写入服务后续实现。
 - JSON 原地修改需重新赋值属性以确保 SQLAlchemy 跟踪，例如 `row.metadata_ = {**row.metadata_, "key": "value"}`。
-- 异步查询需要的关联请显式预加载，如 `selectinload(Experiment.runs)`，避免隐式关系加载触发额外 I/O。
+- 异步查询需要的关联请显式预加载，如 `selectinload(Experiment.jobs)`，避免隐式关系加载触发额外 I/O。
 
 ## 已实现的约束
 

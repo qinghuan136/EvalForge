@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.schema import CreateTable
 
 from evalforge.db.models import (
-    Base, Dataset, DatasetExample, DatasetVersion, Experiment, ExperimentRun,
+    Base, Dataset, DatasetExample, DatasetVersion, Experiment, Job,
     Runner, RunnerAttempt, RunnerCredential, User,
 )
 
@@ -144,15 +144,15 @@ class AuthORMTests(unittest.TestCase):
             dataset = Dataset(name="test")
             experiment = Experiment(dataset=dataset, dataset_version=DatasetVersion(dataset=dataset),
                                     user=runner.owner, name="test", repetitions=1)
-            run = ExperimentRun(experiment=experiment, dataset_example=DatasetExample(dataset=dataset), repetition_number=1)
-            attempt = RunnerAttempt(experiment_run=run, runner=runner, dispatch_json={},
+            run = Job(experiment=experiment, dataset_example=DatasetExample(dataset=dataset), repetition_number=1)
+            attempt = RunnerAttempt(job=run, runner=runner, dispatch_json={},
                                     status="rejected", rejection_reason="busy")
             session.add(attempt)
             session.flush()
             runner_id, experiment_id, attempt_id = runner.runner_id, experiment.id, attempt.id
         with Session(self.engine) as session:
             attempt = session.get(RunnerAttempt, attempt_id)
-            self.assertEqual(attempt.runner.owner_user_id, attempt.experiment_run.experiment.user_id)
+            self.assertEqual(attempt.runner.owner_user_id, attempt.job.experiment.user_id)
             session.delete(attempt.runner)
             with self.assertRaises(IntegrityError):
                 session.commit()

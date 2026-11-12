@@ -27,7 +27,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 from api_support import APITestCase, SQLiteDatabase
 from attempt_support import seed_attempt, result_params
 from evalforge.db.models import (
-    Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment, ExperimentRun, Runner, RunnerAttempt,
+    Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment, Job, Runner, RunnerAttempt,
     RunnerCredential, User,
 )
 from evalforge.server.experiment_events import PreviewTarget
@@ -231,7 +231,7 @@ class RunnerWebSocketTests(APITestCase):
                     **({"stream_output": True} if stream_output else {}),
                 })
                 async with self.database.transaction() as db:
-                    job = await db.scalar(select(ExperimentRun).where(ExperimentRun.job_id == key[0]))
+                    job = await db.scalar(select(Job).where(Job.job_id == key[0]))
                     attempt = await db.scalar(select(RunnerAttempt).where(RunnerAttempt.attempt_id == key[1]))
                     self.assertEqual((job.repetition_number, job.status, attempt.status), (repetition, "assigned", "assigned"))
                     self.assertEqual(attempt.dispatch_json, payload)

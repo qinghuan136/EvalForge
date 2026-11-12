@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session as SyncSession
 
 from api_support import APITestCase
 from evalforge.db.models import (
-    Dataset, DatasetExample, DatasetVersion, Experiment, ExperimentRun, Runner, RunnerAttempt, RunnerCredential,
+    Dataset, DatasetExample, DatasetVersion, Experiment, Job, Runner, RunnerAttempt, RunnerCredential,
 )
 from evalforge.server.runner_connections import RUNNER_SESSION_PREFIX
 from evalforge.server.config import ServerSettings
@@ -159,8 +159,8 @@ class RunnerAPITests(APITestCase):
             dataset = Dataset(name="dataset")
             experiment = Experiment(dataset=dataset, dataset_version=DatasetVersion(dataset=dataset),
                                     user_id=1, name="test", repetitions=1)
-            run = ExperimentRun(experiment=experiment, dataset_example=DatasetExample(dataset=dataset), repetition_number=1)
-            attempt = RunnerAttempt(experiment_run=run, runner_id=runner_id, dispatch_json={}, status="accepted")
+            run = Job(experiment=experiment, dataset_example=DatasetExample(dataset=dataset), repetition_number=1)
+            attempt = RunnerAttempt(job=run, runner_id=runner_id, dispatch_json={}, status="accepted")
             db.add(attempt)
             await db.flush()
             attempt_id = attempt.id

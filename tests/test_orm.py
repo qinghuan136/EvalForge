@@ -15,8 +15,8 @@ from evalforge.db.models import (
     Base, BuiltinEvaluator, CodeEvaluator, CodeEvaluatorVersion, Dataset,
     DatasetEvaluators, DatasetExample, DatasetExampleRevision, DatasetVersion,
     Evaluator, Experiment, ExperimentDatasetEvaluator, ExperimentDatasetExample,
-    ExperimentEvalOnlyConfig, ExperimentJob, ExperimentPromptTask, ExperimentRun,
-    ExperimentRunAnnotation, LLMEvaluator,
+    ExperimentEvalOnlyConfig, ExperimentConfig, ExperimentPromptTask, Job,
+    JobEvaluation, LLMEvaluator,
 )
 from evalforge.models import Dataset as InMemoryDataset, Example
 
@@ -60,8 +60,8 @@ class SchemaContractTests(unittest.TestCase):
         self.assertIn("TIMESTAMP WITH TIME ZONE", sql)
         self.assertIn("FOREIGN KEY(kind, id) REFERENCES evaluators (kind, id)", sql)
         self.assertIn("FOREIGN KEY(type, id) REFERENCES experiment_jobs (type, id)", sql)
-        self.assertNotIn("score", ExperimentRun.__table__.c)
-        self.assertNotIn("evaluator_id", ExperimentRunAnnotation.__table__.c)
+        self.assertNotIn("score", Job.__table__.c)
+        self.assertNotIn("evaluator_id", JobEvaluation.__table__.c)
 
     def test_in_memory_contract_is_still_independent(self):
         dataset = InMemoryDataset("offline", [Example("one", {}, None)])
@@ -94,11 +94,11 @@ class PersistenceTests(unittest.TestCase):
         experiment.experiment_dataset_examples.append(ExperimentDatasetExample(
             dataset_example=example, dataset_example_revision=revision,
         ))
-        run = ExperimentRun(
+        run = Job(
             experiment=experiment, dataset_example=example, repetition_number=1,
             status="succeeded", output={"task_output": None}, start_time=NOW, end_time=NOW + timedelta(milliseconds=150),
         )
-        run.annotations.append(ExperimentRunAnnotation(
+        run.evaluations.append(JobEvaluation(
             name="correctness", annotator_kind="CODE", score=0, label="wrong",
             start_time=NOW, end_time=NOW,
         ))
@@ -116,8 +116,8 @@ class PersistenceTests(unittest.TestCase):
             experiment = session.get(Experiment, experiment_id)
             self.assertEqual(experiment.dataset.name, "prices")
             self.assertEqual(experiment.experiment_dataset_examples[0].dataset_example_revision.output, {"price": 100})
-            self.assertEqual(experiment.runs[0].output, {"task_output": None})
-            self.assertEqual(experiment.runs[0].annotations[0].score, 0)
+            self.assertEqual(experiment.jobs[0].output, {"task_output": None})
+            self.assertEqual(experiment.jobs[0].evaluations[0].score, 0)
             self.assertEqual(experiment.dataset.metadata_, {"purpose": "test"})
 
     def test_unique_run_and_annotation_keys_are_enforced(self):
@@ -125,14 +125,14 @@ class PersistenceTests(unittest.TestCase):
             *_, experiment, run = self.seed_experiment(session)
             experiment_id, example_id, run_id = experiment.id, run.dataset_example_id, run.id
         with Session(self.engine) as session:
-            session.add(ExperimentRun(
+            session.add(Job(
                 experiment_id=experiment_id, dataset_example_id=example_id, repetition_number=1,
                 status="succeeded", output={"task_output": "duplicate"}, start_time=NOW, end_time=NOW,
             ))
             with self.assertRaises(IntegrityError):
                 session.commit()
         with Session(self.engine) as session:
-            session.add(ExperimentRunAnnotation(
+            session.add(JobEvaluation(
                 experiment_run_id=run_id, name="correctness", annotator_kind="CODE", score=1,
                 start_time=NOW, end_time=NOW,
             ))
@@ -180,7 +180,7 @@ class PersistenceTests(unittest.TestCase):
             session.delete(session.get(Dataset, dataset_id))
         with Session(self.engine) as session:
             for model in (Dataset, DatasetVersion, DatasetExample, DatasetExampleRevision,
-                          Experiment, ExperimentDatasetExample, ExperimentRun, ExperimentRunAnnotation):
+                          Experiment, ExperimentDatasetExample, Job, JobEvaluation):
                 self.assertEqual(session.scalar(select(func.count()).select_from(model)), 0)
 
     def test_evaluator_joined_inheritance_and_code_versions(self):
@@ -230,9 +230,9 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(prompt.status, "STOPPED")
             self.assertEqual(prompt.max_concurrency, 10)
         with Session(self.engine) as session:
-            self.assertIsInstance(session.get(ExperimentJob, prompt_id), ExperimentPromptTask)
-            self.assertIsInstance(session.get(ExperimentJob, eval_id), ExperimentEvalOnlyConfig)
-            self.assertEqual(session.get(ExperimentJob, prompt_id).dataset_evaluator_links[0].dataset_evaluator.name, "match")
+            self.assertIsInstance(session.get(ExperimentConfig, prompt_id), ExperimentPromptTask)
+            self.assertIsInstance(session.get(ExperimentConfig, eval_id), ExperimentEvalOnlyConfig)
+            self.assertEqual(session.get(ExperimentConfig, prompt_id).dataset_evaluator_links[0].dataset_evaluator.name, "match")
             self.assertEqual(session.scalar(select(func.count()).select_from(ExperimentPromptTask)), 1)
 
     def test_prompt_connection_and_provider_are_mutually_exclusive(self):

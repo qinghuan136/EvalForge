@@ -4,7 +4,7 @@ from sqlalchemy import case, column, func, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from evalforge.db.base import JSON_VALUE
-from evalforge.db.models import Experiment, ExperimentRun, ExperimentRunAnnotation
+from evalforge.db.models import Experiment, Job, JobEvaluation
 
 SCORABLE_EXPERIMENT_STATES = ("running", "completed")
 
@@ -19,12 +19,12 @@ def missing_evaluations(db: AsyncSession):
         entries = func.json_each(array).table_valued(column("value", JSON_VALUE))
     evaluator = entries.alias("evaluator_snapshot")
     name = evaluator.c.value["name"].as_string()
-    saved = select(ExperimentRunAnnotation.id).where(
-        ExperimentRunAnnotation.experiment_run_id == ExperimentRun.id,
-        ExperimentRunAnnotation.name == name,
+    saved = select(JobEvaluation.id).where(
+        JobEvaluation.experiment_run_id == Job.id,
+        JobEvaluation.name == name,
     ).exists()
-    return (select(ExperimentRun.id.label("run_id"), name.label("name"), evaluator.c.value.label("snapshot"))
-            .select_from(ExperimentRun).join(Experiment, Experiment.id == ExperimentRun.experiment_id)
+    return (select(Job.id.label("job_pk"), name.label("name"), evaluator.c.value.label("snapshot"))
+            .select_from(Job).join(Experiment, Experiment.id == Job.experiment_id)
             .join(evaluator, true())
-            .where(ExperimentRun.status == "succeeded", Experiment.status.in_(SCORABLE_EXPERIMENT_STATES),
+            .where(Job.status == "succeeded", Experiment.status.in_(SCORABLE_EXPERIMENT_STATES),
                    name.is_not(None), ~saved))

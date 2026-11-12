@@ -10,7 +10,7 @@ from sqlalchemy import select
 
 from evalforge.db import Database
 from evalforge.db.models import (
-    DatasetExampleRevision, Experiment, ExperimentDatasetExample, ExperimentRun, RunnerAttempt,
+    DatasetExampleRevision, Experiment, ExperimentDatasetExample, Job, RunnerAttempt,
 )
 
 from ..runner_auth import RunnerIdentity
@@ -43,14 +43,14 @@ class CancelRequest:
     reason: str
 
 
-def fail_job(job: ExperimentRun, reason: str) -> None:
+def fail_job(job: Job, reason: str) -> None:
     job.status = "failed"
     job.output = {"task_output": None}
     job.error = {"code": reason, "message": FAILURE_MESSAGES[reason]}
     job.end_time = datetime.now(timezone.utc)
 
 
-def cancel_unstarted_job(job: ExperimentRun) -> None:
+def cancel_unstarted_job(job: Job) -> None:
     job.status = "cancelled"
     job.output = {"task_output": None}
     job.end_time = datetime.now(timezone.utc)
@@ -68,9 +68,9 @@ class DispatchService:
                 return None
             occupied = (await db.execute(select(
                 RunnerAttempt.attempt_id, RunnerAttempt.cancel_requested_at, RunnerAttempt.cancel_reason,
-                ExperimentRun.job_id, Experiment.user_id,
-            ).join(ExperimentRun, ExperimentRun.id == RunnerAttempt.experiment_run_id)
-             .join(Experiment, Experiment.id == ExperimentRun.experiment_id).where(
+                Job.job_id, Experiment.user_id,
+            ).join(Job, Job.id == RunnerAttempt.experiment_run_id)
+             .join(Experiment, Experiment.id == Job.experiment_id).where(
                 RunnerAttempt.runner_id == identity.runner_id, RunnerAttempt.status.in_(ACTIVE),
             ).limit(1))).one_or_none()
             if occupied is not None:
@@ -79,44 +79,44 @@ class DispatchService:
                                          occupied.cancel_reason or "user_requested")
                 return None
 
-            job, snapshot, revision = ExperimentRun, ExperimentDatasetExample, DatasetExampleRevision
+            jobs, snapshot, revision = Job, ExperimentDatasetExample, DatasetExampleRevision
             eligible = (
-                select(job, Experiment, revision.input)
-                .join(Experiment, Experiment.id == job.experiment_id)
-                .join(snapshot, (snapshot.experiment_id == job.experiment_id)
-                                & (snapshot.dataset_example_id == job.dataset_example_id))
+                select(jobs, Experiment, revision.input)
+                .join(Experiment, Experiment.id == jobs.experiment_id)
+                .join(snapshot, (snapshot.experiment_id == jobs.experiment_id)
+                                & (snapshot.dataset_example_id == jobs.dataset_example_id))
                 .join(revision, revision.id == snapshot.dataset_example_revision_id)
-                .where(job.status == "queued", Experiment.status.in_(("pending", "running")),
+                .where(jobs.status == "queued", Experiment.status.in_(("pending", "running")),
                        Experiment.user_id == identity.owner_user_id,
                        Experiment.execution_config["runner_id"].as_string() == identity.runner_id)
             )
             if not supports_streaming:
                 # 在取队首前筛选。历史实验没有该字段，和显式 false 一样可派发。
                 eligible = eligible.where(Experiment.execution_config["stream_output"].as_boolean().is_not(True))
-            row = (await db.execute(eligible.order_by(job.created_at, job.id).limit(1)
-                                    .with_for_update(of=(job, Experiment), skip_locked=True))).one_or_none()
+            row = (await db.execute(eligible.order_by(jobs.created_at, jobs.id).limit(1)
+                                    .with_for_update(of=(jobs, Experiment), skip_locked=True))).one_or_none()
             if row is None:
                 return None
 
-            run, experiment, example_input = row
+            job, experiment, example_input = row
             experiment.status = "running"
             try:
                 runner_config = {key: value for key, value in experiment.execution_config.items() if key != "evaluators"}
                 config = ExecutionConfig.model_validate(runner_config)
             except ValidationError:
-                fail_job(run, "invalid_execution_config")
-                await finish_experiment(db, run.experiment_id, identity.runner_id)
+                fail_job(job, "invalid_execution_config")
+                await finish_experiment(db, job.experiment_id, identity.runner_id)
                 return None
-            key = AttemptKey(job_id=run.job_id, attempt_id=str(uuid4()))
+            key = AttemptKey(job_id=job.job_id, attempt_id=str(uuid4()))
             payload = {
                 **key.model_dump(), "agent_target_id": config.agent_target_id,
-                "example_id": str(run.dataset_example_id), "input": example_input,
+                "example_id": str(job.dataset_example_id), "input": example_input,
                 "timeout_seconds": config.timeout_seconds,
             }
             if config.stream_output:
                 payload["stream_output"] = True
-            run.status = "assigned"
-            db.add(RunnerAttempt(attempt_id=key.attempt_id, experiment_run_id=run.id, runner_id=identity.runner_id,
+            job.status = "assigned"
+            db.add(RunnerAttempt(attempt_id=key.attempt_id, experiment_run_id=job.id, runner_id=identity.runner_id,
                                  status="assigned", dispatch_json=payload))
             return DispatchClaim(key, payload, experiment.id)
 

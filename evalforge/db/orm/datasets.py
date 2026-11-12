@@ -51,7 +51,7 @@ class DatasetExample(HasId):
     dataset: Mapped["Dataset"] = relationship(back_populates="examples")
     revisions: Mapped[list["DatasetExampleRevision"]] = relationship(back_populates="dataset_example", cascade="all, delete-orphan", passive_deletes=True)
     experiment_dataset_examples: Mapped[list["ExperimentDatasetExample"]] = relationship(back_populates="dataset_example", passive_deletes="all")
-    runs: Mapped[list["ExperimentRun"]] = relationship(back_populates="dataset_example", passive_deletes="all")
+    jobs: Mapped[list["Job"]] = relationship(back_populates="dataset_example", passive_deletes="all")
 
 
 class DatasetExampleRevision(HasId):

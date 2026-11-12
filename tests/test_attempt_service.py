@@ -10,7 +10,7 @@ from sqlalchemy.exc import OperationalError
 
 from api_support import SQLiteDatabase
 from attempt_support import result_params, seed_attempt
-from evalforge.db.models import Base, Experiment, ExperimentRun, Runner, RunnerAttempt, User
+from evalforge.db.models import Base, Experiment, Job, Runner, RunnerAttempt, User
 from evalforge.server.runner_auth import RunnerIdentity
 from evalforge.server.schemas.attempts import AttemptKey, AttemptResult, RunnerSync
 from evalforge.server.services.attempts import AttemptError, AttemptService
@@ -42,7 +42,7 @@ class AttemptServiceTests(unittest.IsolatedAsyncioTestCase):
     async def rows(self):
         async with self.database.transaction() as db:
             return (await db.scalar(select(RunnerAttempt).where(RunnerAttempt.attempt_id == self.key[1])),
-                    await db.scalar(select(ExperimentRun).where(ExperimentRun.job_id == self.key[0])))
+                    await db.scalar(select(Job).where(Job.job_id == self.key[0])))
 
     async def test_started_complete_and_duplicate_messages_preserve_result_and_timestamps(self):
         key = AttemptKey(job_id=self.key[0], attempt_id=self.key[1])
@@ -150,7 +150,7 @@ class AttemptServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_late_unknown_result_is_saved_without_overwriting_newer_attempt(self):
         await self.service.sync(self.identity, self.snapshot())
         async with self.database.transaction() as db:
-            job = await db.scalar(select(ExperimentRun))
+            job = await db.scalar(select(Job))
             db.add(RunnerAttempt(experiment_run_id=job.id, runner_id=self.identity.runner_id,
                                  attempt_id="newer", status="unknown", unknown_reason="test", dispatch_json={}))
         reply = await self.service.sync(self.identity, self.snapshot(pending=True))

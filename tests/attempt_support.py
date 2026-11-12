@@ -2,7 +2,7 @@
 
 from uuid import uuid4
 
-from evalforge.db.models import Dataset, DatasetExample, DatasetVersion, Experiment, ExperimentRun, RunnerAttempt
+from evalforge.db.models import Dataset, DatasetExample, DatasetVersion, Experiment, Job, RunnerAttempt
 
 
 async def seed_attempt(database, owner_id, runner_id):
@@ -18,7 +18,7 @@ async def seed_attempt(database, owner_id, runner_id):
                                 repetitions=1, user_id=owner_id, status="running")
         db.add(experiment)
         await db.flush()
-        job = ExperimentRun(experiment_id=experiment.id, dataset_example_id=example.id,
+        job = Job(experiment_id=experiment.id, dataset_example_id=example.id,
                             repetition_number=1, status="assigned")
         db.add(job)
         await db.flush()

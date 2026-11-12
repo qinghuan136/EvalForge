@@ -1,4 +1,4 @@
-"""实验、样本快照关联、TaskRun 与 EvalRun；结果集合不另建表。"""
+"""实验、样本快照关联、Job 与 JobEvaluation。"""
 
 from datetime import datetime
 from typing import Any
@@ -32,9 +32,9 @@ class Experiment(HasId):
     user: Mapped["User | None"] = relationship(back_populates="experiments")
     dataset_version: Mapped["DatasetVersion"] = relationship(back_populates="experiments")
     experiment_dataset_examples: Mapped[list["ExperimentDatasetExample"]] = relationship(back_populates="experiment", cascade="all, delete-orphan", passive_deletes=True)
-    runs: Mapped[list["ExperimentRun"]] = relationship(back_populates="experiment", cascade="all, delete-orphan", passive_deletes=True)
+    jobs: Mapped[list["Job"]] = relationship(back_populates="experiment", cascade="all, delete-orphan", passive_deletes=True)
     # 旧配置关联仅为保留现有外键；新执行链路使用 status / execution_config。
-    job: Mapped["ExperimentJob | None"] = relationship(back_populates="experiment", cascade="all, delete-orphan", passive_deletes=True, uselist=False)
+    legacy_config: Mapped["ExperimentConfig | None"] = relationship(back_populates="experiment", cascade="all, delete-orphan", passive_deletes=True, uselist=False)
 
     __table_args__ = (
         CheckConstraint("repetitions > 0", name="positive_repetitions"),
@@ -56,8 +56,8 @@ class ExperimentDatasetExample(Base):
     dataset_example_revision: Mapped["DatasetExampleRevision"] = relationship(back_populates="experiment_dataset_examples")
 
 
-class ExperimentRun(HasId):
-    """一条样本的一次逻辑 Job；Attempt 历史另表保存。"""
+class Job(HasId):
+    """一条样本的一次执行；Attempt 历史另表保存。"""
     __tablename__ = "experiment_runs"
     __table_args__ = (
         UniqueConstraint("experiment_id", "dataset_example_id", "repetition_number"),
@@ -94,10 +94,10 @@ class ExperimentRun(HasId):
     created_at: Mapped[datetime] = mapped_column(UTC_TIMESTAMP, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(UTC_TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
-    experiment: Mapped["Experiment"] = relationship(back_populates="runs")
-    dataset_example: Mapped["DatasetExample"] = relationship(back_populates="runs")
-    annotations: Mapped[list["ExperimentRunAnnotation"]] = relationship(back_populates="experiment_run", cascade="all, delete-orphan", passive_deletes=True)
-    attempts: Mapped[list["RunnerAttempt"]] = relationship(back_populates="experiment_run", cascade="all, delete-orphan", passive_deletes=True)
+    experiment: Mapped["Experiment"] = relationship(back_populates="jobs")
+    dataset_example: Mapped["DatasetExample"] = relationship(back_populates="jobs")
+    evaluations: Mapped[list["JobEvaluation"]] = relationship(back_populates="job", cascade="all, delete-orphan", passive_deletes=True)
+    attempts: Mapped[list["RunnerAttempt"]] = relationship(back_populates="job", cascade="all, delete-orphan", passive_deletes=True)
 
     @hybrid_property
     def latency_ms(self) -> float | None:
@@ -113,7 +113,7 @@ class ExperimentRun(HasId):
         return func.coalesce(cls.duration_ms, func.extract("epoch", cls.end_time - cls.start_time) * 1000)
 
 
-class ExperimentRunAnnotation(HasId):
+class JobEvaluation(HasId):
     __tablename__ = "experiment_run_annotations"
     __table_args__ = (
         UniqueConstraint("experiment_run_id", "name"),
@@ -132,4 +132,4 @@ class ExperimentRunAnnotation(HasId):
     start_time: Mapped[datetime] = mapped_column(UTC_TIMESTAMP)
     end_time: Mapped[datetime] = mapped_column(UTC_TIMESTAMP)
 
-    experiment_run: Mapped["ExperimentRun"] = relationship(back_populates="annotations")
+    job: Mapped["Job"] = relationship(back_populates="evaluations")

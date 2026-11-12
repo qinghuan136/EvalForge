@@ -52,5 +52,5 @@ class RunnerAttempt(HasId):
     created_at: Mapped[datetime] = mapped_column(UTC_TIMESTAMP, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(UTC_TIMESTAMP, server_default=func.now(), onupdate=func.now())
 
-    experiment_run: Mapped["ExperimentRun"] = relationship(back_populates="attempts")
+    job: Mapped["Job"] = relationship(back_populates="attempts")
     runner: Mapped["Runner"] = relationship(back_populates="attempts")

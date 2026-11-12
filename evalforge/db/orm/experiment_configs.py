@@ -9,7 +9,9 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from ..base import Base, HasId, JSON_VALUE, UTC_TIMESTAMP, deferred_reference
 
 
-class ExperimentJob(HasId):
+class ExperimentConfig(HasId):
+    """已停用的实验执行配置，供现有数据库表与外键使用。"""
+
     __tablename__ = "experiment_jobs"
     __table_args__ = (
         CheckConstraint("type IN ('PROMPT', 'EVAL_ONLY')", name="valid_type"),
@@ -28,11 +30,11 @@ class ExperimentJob(HasId):
     max_concurrency: Mapped[int] = mapped_column(default=10, server_default=text("10"))
     created_at: Mapped[datetime] = mapped_column(UTC_TIMESTAMP, server_default=func.now())
 
-    experiment: Mapped["Experiment"] = relationship(back_populates="job")
+    experiment: Mapped["Experiment"] = relationship(back_populates="legacy_config")
     dataset_evaluator_links: Mapped[list["ExperimentDatasetEvaluator"]] = relationship(back_populates="execution_config", cascade="all, delete-orphan", passive_deletes=True)
 
 
-class ExperimentPromptTask(ExperimentJob):
+class ExperimentPromptTask(ExperimentConfig):
     __tablename__ = "experiment_prompt_tasks"
     __table_args__ = (
         CheckConstraint("type = 'PROMPT'", name="valid_type"),
@@ -58,8 +60,8 @@ class ExperimentPromptTask(ExperimentJob):
     stream_model_output: Mapped[bool] = mapped_column(default=True, server_default=true())
 
 
-class ExperimentEvalOnlyConfig(ExperimentJob):
-    # 单表继承：与 ExperimentJob 共用 experiment_jobs，不创建第 18 张表。
+class ExperimentEvalOnlyConfig(ExperimentConfig):
+    # 单表继承：与 ExperimentConfig 共用 experiment_jobs，不创建第 18 张表。
     __mapper_args__ = {"polymorphic_identity": "EVAL_ONLY"}
 
 
@@ -69,5 +71,5 @@ class ExperimentDatasetEvaluator(Base):
     experiment_id: Mapped[int] = mapped_column(ForeignKey("experiment_jobs.id", ondelete="CASCADE"), primary_key=True)
     dataset_evaluator_id: Mapped[int] = mapped_column(ForeignKey("dataset_evaluators.id", ondelete="CASCADE"), primary_key=True, index=True)
 
-    execution_config: Mapped["ExperimentJob"] = relationship(back_populates="dataset_evaluator_links")
+    execution_config: Mapped["ExperimentConfig"] = relationship(back_populates="dataset_evaluator_links")
     dataset_evaluator: Mapped["DatasetEvaluators"] = relationship(back_populates="experiment_links")

@@ -14,8 +14,8 @@ from sqlalchemy import select
 from api_support import SQLiteDatabase
 from attempt_support import result_params
 from evalforge.db.models import (
-    Base, Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment, ExperimentRun,
-    ExperimentRunAnnotation, Runner, RunnerAttempt, User,
+    Base, Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment, Job,
+    JobEvaluation, Runner, RunnerAttempt, User,
 )
 from evalforge.server.runner_auth import RunnerIdentity
 from evalforge.server.runner_connections import RegisteredConnection, RunnerConnections
@@ -115,7 +115,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             normal_experiment = await db.get(Experiment, normal.experiment_id)
             normal_experiment.execution_config = {k: v for k, v in normal_experiment.execution_config.items()
                                                   if k != "stream_output"}
-            jobs = {job.experiment_id: job.job_id for job in await db.scalars(select(ExperimentRun))}
+            jobs = {job.experiment_id: job.job_id for job in await db.scalars(select(Job))}
 
         old_call = AsyncMock(return_value={"accepted": True})
         old_session = Session(identity, old_call)
@@ -158,9 +158,9 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         recovered, scored, release, persisted = (asyncio.Event() for _ in range(4))
         calls = []
 
-        async def track_discovery(run_ids=None, **kwargs):
-            items = await find_missing(run_ids, **kwargs)
-            if run_ids is None:
+        async def track_discovery(job_pks=None, **kwargs):
+            items = await find_missing(job_pks, **kwargs)
+            if job_pks is None:
                 recovered.set()
             return items
 
@@ -191,7 +191,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         detail = await self.experiments.get(self.owner_id, experiment_id)
         self.assertEqual(detail.status, "completed")
         async with self.database.transaction() as db:
-            score = await db.scalar(select(ExperimentRunAnnotation))
+            score = await db.scalar(select(JobEvaluation))
             self.assertEqual((score.name, score.score, score.error), ("answer_match", 1.0, None))
 
     async def test_startup_recovers_only_missing_evals_even_across_pages_of_one_run(self):
@@ -202,9 +202,9 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         params = AttemptResult.model_validate(result_params((claim.key.job_id, claim.key.attempt_id)))
         await AttemptService(self.database).complete(identity, params)  # 模拟提交后未发通知。
         async with self.database.transaction() as db:
-            job = await db.scalar(select(ExperimentRun))
+            job = await db.scalar(select(Job))
             now = datetime.now(timezone.utc)
-            db.add(ExperimentRunAnnotation(experiment_run_id=job.id, name="already_saved", annotator_kind="CODE",
+            db.add(JobEvaluation(experiment_run_id=job.id, name="already_saved", annotator_kind="CODE",
                                            score=0, start_time=now, end_time=now))
 
         evaluation = EvaluationService(self.database)
@@ -225,7 +225,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(names, {"new_score", "missing_path"})
         async with self.database.transaction() as db:
             annotations = {row.name: (row.score, row.error) for row in
-                           await db.scalars(select(ExperimentRunAnnotation))}
+                           await db.scalars(select(JobEvaluation))}
         self.assertEqual(annotations["already_saved"], (0, None))
         self.assertEqual(annotations["new_score"], (1, None))
         self.assertIsNone(annotations["missing_path"][0])
@@ -246,7 +246,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(detail.status, "cancelled")
         await evaluation.run(item)
         async with self.database.transaction() as db:
-            self.assertIsNone(await db.scalar(select(ExperimentRunAnnotation)))
+            self.assertIsNone(await db.scalar(select(JobEvaluation)))
         self.assertEqual(await evaluation.find_missing(), [])
 
     async def test_busy_retries_after_delay_and_missing_target_fails_job(self):
@@ -273,7 +273,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             attempts = (await db.scalars(select(RunnerAttempt).order_by(RunnerAttempt.id))).all()
             self.assertEqual([(row.status, row.rejection_reason) for row in attempts],
                              [("rejected", "busy"), ("rejected", "target_not_found")])
-            job = await db.scalar(select(ExperimentRun))
+            job = await db.scalar(select(Job))
             self.assertEqual((job.status, job.error["code"]), ("failed", "target_not_found"))
         detail = await self.experiments.get(self.owner_id, experiment_id)
         self.assertEqual(detail.status, "completed")

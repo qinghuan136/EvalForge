@@ -10,7 +10,7 @@ from sqlalchemy.orm import load_only
 from evalforge.db import Database
 from evalforge.db.models import (
     DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment,
-    ExperimentDatasetExample, ExperimentRun, Runner, RunnerAttempt,
+    ExperimentDatasetExample, Job, Runner, RunnerAttempt,
 )
 
 from ..errors import APIError
@@ -119,7 +119,7 @@ class ExperimentService:
                  "dataset_example_revision_id": revision_id}
                 for example_id, revision_id in snapshot
             ])
-            await db.execute(insert(ExperimentRun), [
+            await db.execute(insert(Job), [
                 {"experiment_id": experiment.id, "dataset_example_id": example_id,
                  "repetition_number": number, "status": "queued"}
                 for example_id, _ in snapshot for number in range(1, data.repetitions + 1)
@@ -139,11 +139,10 @@ class ExperimentService:
             select(snapshots.experiment_id, func.count()).where(snapshots.experiment_id.in_(experiment_ids))
             .group_by(snapshots.experiment_id)
         )).all()}
-        runs = ExperimentRun
         statuses = {experiment_id: {} for experiment_id in experiment_ids}
         for experiment_id, status, count in (await db.execute(
-            select(runs.experiment_id, runs.status, func.count()).where(runs.experiment_id.in_(experiment_ids))
-            .group_by(runs.experiment_id, runs.status)
+            select(Job.experiment_id, Job.status, func.count()).where(Job.experiment_id.in_(experiment_ids))
+            .group_by(Job.experiment_id, Job.status)
         )).all():
             statuses[experiment_id][status] = count
         return {experiment_id: ExperimentProgress(
@@ -193,9 +192,9 @@ class ExperimentService:
             if cancelling:
                 now = datetime.now(timezone.utc)
                 experiment.status = "cancelling"
-                jobs = select(ExperimentRun.id).where(ExperimentRun.experiment_id == experiment_id)
-                await db.execute(update(ExperimentRun).where(
-                    ExperimentRun.experiment_id == experiment_id, ExperimentRun.status == "queued",
+                jobs = select(Job.id).where(Job.experiment_id == experiment_id)
+                await db.execute(update(Job).where(
+                    Job.experiment_id == experiment_id, Job.status == "queued",
                 ).values(status="cancelled", output={"task_output": None}, end_time=now))
                 await db.execute(update(RunnerAttempt).where(
                     RunnerAttempt.experiment_run_id.in_(jobs), RunnerAttempt.status.in_(ACTIVE),

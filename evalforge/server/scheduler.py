@@ -12,7 +12,7 @@ from .experiment_events import PreviewTarget
 from .rpc import RpcError, RpcProtocolError, RpcRequestTooLarge
 from .runner_sessions import RunnerSession, RunnerSessionManager
 from .services.dispatch import CancelRequest, DispatchService, RETRYABLE_REJECTIONS
-from .services.evaluations import EvaluationService, PendingEvaluation
+from .services.evaluations import EvaluationService, EvaluationWorkItem
 from .ws_transport import TransportClosed
 
 logger = logging.getLogger(__name__)
@@ -44,9 +44,9 @@ class Scheduler:
     def wake(self) -> None:
         self._wake.set()
 
-    def notify_eval(self, run_id: int) -> None:
+    def notify_eval(self, job_pk: int) -> None:
         if self.evaluations is not None and not self._stopping:
-            self._eval_candidates.add(run_id)
+            self._eval_candidates.add(job_pk)
             self.wake()
 
     async def close(self) -> None:
@@ -84,40 +84,40 @@ class Scheduler:
     async def _schedule_evals(self) -> None:
         if self.evaluations is None or self._stopping:
             return
-        run_ids = list(islice(self._eval_candidates, EVAL_SCAN_BATCH))
-        self._eval_candidates.difference_update(run_ids)
+        job_pks = list(islice(self._eval_candidates, EVAL_SCAN_BATCH))
+        self._eval_candidates.difference_update(job_pks)
         try:
-            if run_ids:
-                await self._start_evals(run_ids)
+            if job_pks:
+                await self._start_evals(job_pks)
             if self._recover_evals:
                 items = await self._start_evals(after=self._eval_cursor, limit=EVAL_SCAN_BATCH)
                 self._recover_evals = len(items) == EVAL_SCAN_BATCH
                 if self._recover_evals:
                     self._eval_cursor = items[-1].key
         except Exception as exc:
-            self._eval_candidates.update(run_ids)
+            self._eval_candidates.update(job_pks)
             logger.error("Eval discovery failed error_type=%s", type(exc).__name__)
         else:
             if self._eval_candidates or self._recover_evals:
                 self.wake()
 
-    async def _start_evals(self, run_ids: list[int] | None = None, *,
-                           after: tuple[int, str] | None = None, limit: int | None = None) -> list[PendingEvaluation]:
+    async def _start_evals(self, job_pks: list[int] | None = None, *,
+                           after: tuple[int, str] | None = None, limit: int | None = None) -> list[EvaluationWorkItem]:
         assert self.evaluations is not None
         in_flight = set(self._eval_tasks)  # 查询返回前，部分协程可能已经保存并退出。
-        items = await self.evaluations.find_missing(run_ids, after=after, limit=limit)
+        items = await self.evaluations.find_missing(job_pks, after=after, limit=limit)
         if not self._stopping:
             for item in items:
                 if item.key not in in_flight and item.key not in self._eval_tasks:
-                    self._eval_tasks[item.key] = asyncio.create_task(self._run_eval(item), name=f"eval-{item.run_id}")
+                    self._eval_tasks[item.key] = asyncio.create_task(self._run_eval(item), name=f"eval-{item.job_pk}")
         return items
 
-    async def _run_eval(self, item: PendingEvaluation) -> None:
+    async def _run_eval(self, item: EvaluationWorkItem) -> None:
         assert self.evaluations is not None
         try:
             await self.evaluations.run(item)
         except Exception as exc:
-            logger.error("Eval work failed run_id=%s error_type=%s", item.run_id, type(exc).__name__)
+            logger.error("Eval work failed job_pk=%s error_type=%s", item.job_pk, type(exc).__name__)
         finally:
             self._eval_tasks.pop(item.key, None)
 

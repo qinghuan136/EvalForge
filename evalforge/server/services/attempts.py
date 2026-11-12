@@ -8,7 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from evalforge.db import Database
-from evalforge.db.models import Experiment, ExperimentRun, Runner, RunnerAttempt
+from evalforge.db.models import Experiment, Job, Runner, RunnerAttempt
 
 from ..runner_auth import RunnerIdentity
 from ..schemas.attempts import AttemptKey, AttemptResult, RunnerSync
@@ -32,10 +32,10 @@ async def lock_runner(db: AsyncSession, identity: RunnerIdentity) -> None:
 
 
 async def lock_owned_attempt(db: AsyncSession, identity: RunnerIdentity,
-                             key: AttemptKey) -> tuple[RunnerAttempt, ExperimentRun]:
-    job = await db.scalar(select(ExperimentRun).join(Experiment).where(
-        ExperimentRun.job_id == key.job_id, Experiment.user_id == identity.owner_user_id,
-    ).with_for_update(of=ExperimentRun))
+                             key: AttemptKey) -> tuple[RunnerAttempt, Job]:
+    job = await db.scalar(select(Job).join(Experiment).where(
+        Job.job_id == key.job_id, Experiment.user_id == identity.owner_user_id,
+    ).with_for_update(of=Job))
     if job is None:
         raise AttemptError("Attempt not found or not assigned to this Runner")
     attempt = await db.scalar(select(RunnerAttempt).where(
@@ -61,7 +61,7 @@ class AttemptService:
             raise AttemptError("Conflicting final result")
 
     @staticmethod
-    def _can_update(attempt: RunnerAttempt, job: ExperimentRun) -> None:
+    def _can_update(attempt: RunnerAttempt, job: Job) -> None:
         if attempt.status not in ACTIVE or job.status in SETTLED_JOBS:
             raise AttemptError("Attempt cannot update this Job")
 
@@ -103,11 +103,11 @@ class AttemptService:
             job.output = {"task_output": result.output}
             job.error = result.error.model_dump() if result.error is not None else None
             job.duration_ms, job.http_status, job.end_time = result.duration_ms, result.http_status, now
-            run_id = job.id
+            job_pk = job.id
             await finish_experiment(db, job.experiment_id, identity.runner_id)
         # 离开事务（包括 commit）成功后，调用方才可返回 ACK。
         if result.status == "succeeded" and self.on_task_succeeded is not None:
-            self.on_task_succeeded(run_id)
+            self.on_task_succeeded(job_pk)
 
     async def sync(self, identity: RunnerIdentity, snapshot: RunnerSync) -> dict:
         if snapshot.runner_id != identity.runner_id:
@@ -163,8 +163,8 @@ class AttemptService:
                 instructions.append({"job_id": local.job_id, "attempt_id": local.attempt_id,
                                      "action": "cancel" if cancel else "continue"})
             # 缺失的活跃尝试标记 unknown，后续调度可领取其他 Job。
-            rows = (await db.execute(select(RunnerAttempt, ExperimentRun)
-                                     .join(ExperimentRun).join(Experiment)
+            rows = (await db.execute(select(RunnerAttempt, Job)
+                                     .join(Job).join(Experiment)
                                      .where(RunnerAttempt.runner_id == identity.runner_id,
                                             RunnerAttempt.status.in_(ACTIVE),
                                             Experiment.user_id == identity.owner_user_id))).all()

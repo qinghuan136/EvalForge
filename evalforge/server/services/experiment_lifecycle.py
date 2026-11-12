@@ -3,7 +3,7 @@
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from evalforge.db.models import Experiment, ExperimentRun
+from evalforge.db.models import Experiment, Job
 
 from .evaluation_queries import missing_evaluations
 
@@ -15,8 +15,8 @@ async def settle_experiment(db: AsyncSession, experiment: Experiment) -> None:
     """Check both stages while the caller holds the experiment row lock."""
     if experiment.status not in {"running", "cancelling"}:
         return
-    unfinished_tasks = select(ExperimentRun.id).where(
-        ExperimentRun.experiment_id == experiment.id, ExperimentRun.status.not_in(SETTLED_JOBS),
+    unfinished_tasks = select(Job.id).where(
+        Job.experiment_id == experiment.id, Job.status.not_in(SETTLED_JOBS),
     ).exists()
     if await db.scalar(select(unfinished_tasks)):
         return
@@ -24,7 +24,7 @@ async def settle_experiment(db: AsyncSession, experiment: Experiment) -> None:
         experiment.status = "cancelled"
         return
     if experiment.execution_config.get("evaluators"):
-        pending = missing_evaluations(db).where(ExperimentRun.experiment_id == experiment.id).exists()
+        pending = missing_evaluations(db).where(Job.experiment_id == experiment.id).exists()
         if await db.scalar(select(pending)):
             return
     experiment.status = "completed"
