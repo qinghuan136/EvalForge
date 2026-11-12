@@ -14,6 +14,7 @@ from .config import ServerSettings
 from .errors import install_handlers
 from .experiment_events import ExperimentEventStore
 from .routes.auth import router as auth_router
+from .routes.datasets import router as datasets_router
 from .routes.evaluators import router as evaluators_router
 from .routes.experiments import router as experiments_router
 from .routes.runners import router as runners_router
@@ -25,6 +26,7 @@ from .runner_sessions import RunnerSessionManager
 from .scheduler import Scheduler
 from .security import Passwords
 from .services.auth import AuthService
+from .services.datasets import DatasetService
 from .services.runners import RunnerService
 from .services.attempts import AttemptService
 from .services.dispatch import DispatchService
@@ -62,6 +64,7 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
             scheduler = Scheduler(app.state.runner_sessions, DispatchService(db), evaluations=EvaluationService(db))
             attempts.on_task_succeeded = scheduler.notify_eval
             app.state.runner_sessions.on_work_available = scheduler.wake
+            app.state.datasets = DatasetService(db)
             app.state.dataset_evaluators = DatasetEvaluatorService(db)
             app.state.experiments = ExperimentService(db, connections, scheduler.wake)
             scheduler.start()
@@ -85,6 +88,7 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
         return response
 
     app.include_router(auth_router)
+    app.include_router(datasets_router)
     app.include_router(evaluators_router)
     app.include_router(experiments_router)
     app.include_router(runners_router)

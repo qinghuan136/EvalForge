@@ -10,6 +10,7 @@ Python 3.11+。V0 离线实验执行仅使用标准库，无需启动 Phoenix、
 云端七个浏览器鉴权接口与五个 Runner 管理接口已实现，见 [鉴权服务](docs/server-auth.md)与 [Runner 管理](docs/server-runners.md)。[WSS / JSON-RPC 接入](docs/server-wss.md)已接通认证、会话、Attempt 同步与结果上报。
 对象关系、协程、消息流及存储边界见 [当前项目架构图解](docs/当前项目架构图解.md)（内含 Mermaid 图）。
 登录鉴权与 Runner 管理接口约定见 [接口文档](docs/api/登录鉴权与Runner管理.md)。
+云端支持 [CSV / JSONL 数据集导入](docs/api/数据集导入.md)，导入后可直接用返回的数据集和版本 ID 创建实验。
 实验创建、列表和详情已实现。创建时固定版本快照并生成待执行 Job，进程级 Scheduler 会自动派发给已就绪且有空闲容量的指定 Runner。见 [实验接口](docs/api/实验创建与查询.md)和 [当前架构](docs/当前项目架构图解.md#10-进程级调度)。
 
 独立的本地客户端位于 [client/](client/README.md)，已实现 WebSocket 传输、双向 JSON-RPC 和本地 SQLite 存储基础层，

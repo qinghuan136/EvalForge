@@ -31,6 +31,7 @@ pycparser==3.12
 pydantic==2.14.2
 pydantic_core==2.50.2
 python-dotenv==1.2.4
+python-multipart==0.0.33
 redis==8.1.0
 referencing==0.37.0
 rpds-py==2026.9.1

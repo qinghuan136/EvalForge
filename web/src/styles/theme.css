@@ -1,0 +1,23 @@
+:root {
+  color-scheme: light;
+  --color-background: #f5f7f7;
+  --color-surface: #ffffff;
+  --color-surface-muted: #eff2f2;
+  --color-text: #233139;
+  --color-text-muted: #63727a;
+  --color-accent: #466d75;
+  --color-border: #dce3e3;
+  --color-accent-muted: #e4eff0;
+
+  font-family: system-ui, "Microsoft YaHei UI", sans-serif;
+  color: var(--color-text);
+  background: var(--color-background);
+}
+
+body {
+  margin: 0;
+}
+
+#root > main {
+  padding: 1.5rem;
+}
