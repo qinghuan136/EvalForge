@@ -35,7 +35,8 @@ flowchart TD
 - phase 使用状态机的 SessionState，属性只读。hello、ready 和退出由管理协程通过 `_transition()` 提交；心跳只校验续租事件，不修改 phase。
 - hello 先以 connected 注册，预览通过后比较 session_id 和预期阶段，更新 Redis 成功才提交本地 syncing。比较失败、超时或写入后停止都不返回成功；关闭继续走状态机。
 - 有界队列承载业务事件。hello 成功后启动独立心跳；即使管理协程在等业务写库，心跳也可以执行。
-- 心跳先复查 PostgreSQL 凭证，再在 Redis 原子比较 session_id 并续租。失效时发出停止信号；关闭时结束回复等待、回收心跳，再清理 Redis 和本地注册。
+- 心跳先检查 Redis 授权快照；未命中才查 PostgreSQL 的凭证、Runner 和账号状态。授权快照固定有效期 60 秒（不超过凭证有效期），读命中不会续期。通过授权后在 Redis 原子比较 session_id 并续租。失效时发出停止信号；关闭时结束回复等待、回收心跳，再清理 Redis 会话和本地注册。
+- 删除 Runner 在数据库撤权提交后同时清除授权快照和会话。后续若新增凭证撤销、Runner 禁用或账号禁用入口，提交后须对受影响的 Runner 调用同一失效操作。直接改库或 Redis 失效失败时，由授权缓存到期后的回源校验兜底。
 - hello 只允许成功一次；身份不一致、非法能力或容量、未知字段返回 -32602，重复 hello 返回 -32001。
 - 当前仅支持 max_concurrent_jobs=1；capabilities 允许空列表，版本字段暂只做格式和长度校验，不做兼容性协商。
 

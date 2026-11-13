@@ -25,7 +25,7 @@ from .session_state_machine import (
 from .ws_transport import TransportClosed
 from .schemas.attempts import AttemptKey, AttemptResult, RunnerReady, RunnerSync
 from .schemas.output_preview import OutputPreviewBatch
-from .services.attempts import AttemptError, AttemptService
+from .services.attempts import AttemptCompletion, AttemptError, AttemptService
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -236,13 +236,15 @@ class RunnerSession:
         if event.method == "runner.ready":
             if params.session_id != self.session_id:
                 raise RpcError(-32001, "Session identity mismatch")
+            first_ready = self.phase != SessionState.READY
             try:
                 await self._transition(SessionEvent.READY_REQUESTED, SessionContext(
                     is_current=True, sync_processed=self.sync_processed,
                     pending_uploads_count=len(self.pending_uploads)))
             except TransitionRejected:
                 raise RpcError(-32002, "Session is not ready") from None
-            self.manager.notify_work()
+            if first_ready and self.manager.on_ready is not None:
+                await self.manager.on_ready(self)
             return {"session_id": self.session_id, "status": "ready"}
         try:
             if self.phase not in {SessionState.SYNCING, SessionState.READY}:
@@ -264,9 +266,10 @@ class RunnerSession:
                 if event.method == "jobs.started":
                     await service.started(self.identity, params)
                 else:
-                    await service.complete(self.identity, params)
+                    completion = await service.complete(self.identity, params)
                     self.clear_preview_target(params)
-                    self.manager.notify_work()
+                    if self.manager.on_complete is not None:
+                        await self.manager.on_complete(self, params, completion)
                 await self.check_current()
                 if event.method == "jobs.complete":
                     self.pending_uploads.discard((params.job_id, params.attempt_id))
@@ -423,6 +426,8 @@ class RunnerSession:
                 logger.warning("Runner session cleanup unavailable session_id=%r error_type=%s", self.session_id, type(exc).__name__)
             finally:
                 self.manager.sessions.pop(self.session_id, None)
+                if self.manager.on_closed is not None:
+                    self.manager.on_closed(self)
                 logger.info("Runner session closed runner_id=%r session_id=%r", self.identity.runner_id, self.session_id)
 
     async def close(self, code: int = 1000) -> None:
@@ -438,17 +443,12 @@ class RunnerSessionManager:
         self.attempts = attempts
         self.runner_auth = runner_auth
         self.event_store = event_store
-        self.on_work_available: Callable[[], None] | None = None
+        self.on_ready: Callable[[RunnerSession], Awaitable[None]] | None = None
+        self.on_closed: Callable[[RunnerSession], None] | None = None
+        self.on_complete: Callable[[RunnerSession, AttemptKey, AttemptCompletion | None], Awaitable[None]] | None = None
         self.instance_id = uuid4().hex
         self.sessions: dict[str, RunnerSession] = {}
         self._closing = False
-
-    def notify_work(self) -> None:
-        if self.on_work_available is not None:
-            self.on_work_available()
-
-    def ready_sessions(self) -> list[RunnerSession]:
-        return [session for session in self.sessions.values() if session.can_dispatch]
 
     def open(self, identity: RunnerIdentity, peer: JsonRpcPeer, settings: ServerSettings) -> RunnerSession:
         if self._closing:

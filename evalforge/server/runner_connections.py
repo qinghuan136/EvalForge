@@ -7,6 +7,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from .errors import APIError
+from .runner_auth import RUNNER_AUTH_CACHE_PREFIX
 from .schemas.runners import RunnerConnection
 
 RUNNER_SESSION_PREFIX = "evalforge:runner:session:"
@@ -67,12 +68,12 @@ class RunnerConnections:
                 result.append(RunnerConnection())
                 continue
             record = self._decode(encoded)
-            result.append(RunnerConnection(online=True, phase=record.phase))
+            result.append(RunnerConnection(online=True, phase=record.phase, capabilities=record.capabilities))
         return result
 
     async def invalidate(self, runner_id: str) -> None:
-        # DB 已删除 / 撤销后清理注册；后续 WSS 层必须同时检查持久化身份状态。
-        await self.redis.delete(RUNNER_SESSION_PREFIX + runner_id)
+        # DB 撤权提交后，同时清理会话注册和授权快照。
+        await self.redis.delete(RUNNER_SESSION_PREFIX + runner_id, RUNNER_AUTH_CACHE_PREFIX + runner_id)
 
     async def register(self, runner_id: str, record: RegisteredConnection, ttl_seconds: int) -> str | None:
         """原子替换并返回被接管的 session_id，便于立即通知本进程旧连接。"""

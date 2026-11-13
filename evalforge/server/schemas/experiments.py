@@ -12,6 +12,7 @@ from .common import PositiveDbId, StoredText, validate_database_json
 from .evaluators import EvaluatorSnapshot
 
 ExperimentStatus = Literal["pending", "running", "cancelling", "completed", "failed", "cancelled"]
+JobStatus = Literal["queued", "assigned", "running", "succeeded", "failed", "cancelled", "unknown"]
 
 
 class ExecutionConfig(Schema):
@@ -74,6 +75,16 @@ class ExperimentProgress(Schema):
     unknown: int = 0
 
 
+class EvaluationProgress(Schema):
+    expected: int = 0
+    completed: int = 0
+    errors: int = 0
+
+
+class ExperimentDetailProgress(ExperimentProgress):
+    evaluations: EvaluationProgress = Field(default_factory=EvaluationProgress)
+
+
 class ExperimentSummary(Schema):
     experiment_id: int = Field(validation_alias="id")
     dataset_id: int
@@ -100,6 +111,7 @@ class SavedExecutionConfig(TypedDict, total=False):
 
 
 class ExperimentDetail(ExperimentSummary):
+    progress: ExperimentDetailProgress
     description: str | None
     metadata: dict[str, JsonValue]
     execution_config: SavedExecutionConfig
@@ -108,6 +120,54 @@ class ExperimentDetail(ExperimentSummary):
 
 class ExperimentPage(Schema):
     items: list[ExperimentSummary]
+    page: int
+    pagesize: int
+    total: int
+
+
+class JobSummary(Schema):
+    job_id: str
+    example_id: int
+    repetition_number: int
+    status: JobStatus
+    duration_ms: float | None
+    http_status: int | None
+    evaluation_progress: EvaluationProgress
+
+
+class JobError(Schema):
+    code: str
+    message: str
+
+
+class JobEvaluationDetail(Schema):
+    name: str
+    score: float | None
+    label: str | None
+    explanation: str | None
+    error: str | None
+
+
+class JobDetail(JobSummary):
+    input: dict[str, JsonValue]
+    reference: dict[str, JsonValue]
+    metadata: dict[str, JsonValue]
+    output: JsonValue
+    error: JobError | None
+    started_at: datetime | None
+    ended_at: datetime | None
+    evaluations: list[JobEvaluationDetail]
+
+    @field_validator("started_at", "ended_at")
+    @classmethod
+    def utc_time(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+class JobPage(Schema):
+    items: list[JobSummary]
     page: int
     pagesize: int
     total: int

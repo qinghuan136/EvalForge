@@ -20,6 +20,7 @@ class RunnerName(Schema):
 class RunnerConnection(Schema):
     online: bool = False
     phase: Literal["disconnected", "connected", "syncing", "ready"] = "disconnected"
+    capabilities: list[str] = Field(default_factory=list)
 
 
 class RunnerCreated(Schema):

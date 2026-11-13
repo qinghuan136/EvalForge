@@ -1,8 +1,9 @@
-"""云端数据集导入的表单参数和响应。"""
+"""云端数据集导入和查询的接口结构。"""
 
+from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, JsonValue, field_validator
 
 from .auth import Schema
 from .common import PositiveDbId, StoredText
@@ -30,3 +31,45 @@ class DatasetImportResult(Schema):
     dataset_id: PositiveDbId
     dataset_version_id: PositiveDbId
     example_count: int
+
+
+class DatasetSummary(Schema):
+    dataset_id: int = Field(validation_alias="id")
+    name: str
+    description: str | None
+    latest_version_id: int | None
+    created_at: datetime
+    updated_at: datetime
+
+    @field_validator("created_at", "updated_at")
+    @classmethod
+    def utc_time(cls, value: datetime) -> datetime:
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+class DatasetDetail(DatasetSummary):
+    metadata: dict[str, JsonValue]
+    example_count: int
+
+
+class DatasetPage(Schema):
+    items: list[DatasetSummary]
+    page: int
+    pagesize: int
+    total: int
+
+
+class DatasetExampleResponse(Schema):
+    example_id: int
+    input: dict[str, JsonValue]
+    output: dict[str, JsonValue]
+    metadata: dict[str, JsonValue]
+
+
+class DatasetExamplePage(Schema):
+    dataset_id: int
+    dataset_version_id: int | None
+    items: list[DatasetExampleResponse]
+    page: int
+    pagesize: int
+    total: int

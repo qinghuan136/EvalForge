@@ -1,8 +1,8 @@
-"""浏览器数据集导入接口。"""
+"""浏览器数据集导入和查询接口。"""
 
 from collections.abc import AsyncGenerator
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Path, Query, Request
 from pydantic import ValidationError
 from python_multipart.exceptions import FormParserError
 from starlette.concurrency import run_in_threadpool
@@ -13,7 +13,11 @@ from starlette.requests import ClientDisconnect
 from ..dataset_import import parse_dataset_upload
 from ..dependencies import Authenticated, SessionContext, current_user, require_csrf
 from ..errors import APIError
-from ..schemas.datasets import MAX_CSV_COLUMNS, MAX_DATASET_UPLOAD_BYTES, DatasetImportOptions, DatasetImportResult
+from ..schemas.common import MAX_DB_ID
+from ..schemas.datasets import (
+    MAX_CSV_COLUMNS, MAX_DATASET_UPLOAD_BYTES, DatasetDetail, DatasetExamplePage,
+    DatasetImportOptions, DatasetImportResult, DatasetPage,
+)
 from ..services.datasets import DatasetService
 
 router = APIRouter(prefix="/api/v1/datasets", tags=["datasets"])
@@ -74,6 +78,31 @@ def _options(form: FormData) -> DatasetImportOptions:
 
 def dataset_service(request: Request) -> DatasetService:
     return request.app.state.datasets
+
+
+@router.get("", response_model=DatasetPage)
+async def list_datasets(page: int = Query(default=1, ge=1, le=MAX_DB_ID),
+                        pagesize: int = Query(default=20, ge=1, le=100),
+                        identity: Authenticated = Depends(current_user),
+                        service: DatasetService = Depends(dataset_service)):
+    return await service.list_datasets(identity.user.id, page, pagesize)
+
+
+@router.get("/{dataset_id}", response_model=DatasetDetail)
+async def get_dataset(dataset_id: int = Path(ge=1, le=MAX_DB_ID),
+                      identity: Authenticated = Depends(current_user),
+                      service: DatasetService = Depends(dataset_service)):
+    return await service.get(identity.user.id, dataset_id)
+
+
+@router.get("/{dataset_id}/examples", response_model=DatasetExamplePage)
+async def list_dataset_examples(dataset_id: int = Path(ge=1, le=MAX_DB_ID),
+                                version_id: int | None = Query(default=None, ge=1, le=MAX_DB_ID),
+                                page: int = Query(default=1, ge=1, le=MAX_DB_ID),
+                                pagesize: int = Query(default=20, ge=1, le=100),
+                                identity: Authenticated = Depends(current_user),
+                                service: DatasetService = Depends(dataset_service)):
+    return await service.list_examples(identity.user.id, dataset_id, version_id, page, pagesize)
 
 
 @router.post("/import", status_code=201, response_model=DatasetImportResult, openapi_extra={

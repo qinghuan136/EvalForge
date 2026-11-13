@@ -9,6 +9,7 @@ from .evaluation_queries import missing_evaluations
 
 TERMINAL = {"succeeded", "failed", "cancelled"}
 SETTLED_JOBS = TERMINAL | {"unknown"}
+ACTIVE_EXPERIMENTS = ("pending", "running", "cancelling")
 
 
 async def settle_experiment(db: AsyncSession, experiment: Experiment) -> None:
@@ -30,8 +31,10 @@ async def settle_experiment(db: AsyncSession, experiment: Experiment) -> None:
     experiment.status = "completed"
 
 
-async def finish_experiment(db: AsyncSession, experiment_id: int, runner_id: str) -> None:
+async def finish_experiment(db: AsyncSession, experiment_id: int, runner_id: str) -> Experiment | None:
     # Re-read after acquiring the lock so concurrent Task/Eval commits are visible.
     experiment = await db.get(Experiment, experiment_id, with_for_update=True, populate_existing=True)
     if experiment is not None and experiment.execution_config.get("runner_id") == runner_id:
         await settle_experiment(db, experiment)
+        return experiment
+    return None

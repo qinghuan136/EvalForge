@@ -9,7 +9,7 @@ from sqlalchemy.exc import OperationalError
 from api_support import APITestCase
 from evalforge.db.models import (
     BuiltinEvaluator, Dataset, DatasetEvaluators, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment,
-    ExperimentDatasetExample, Job, Runner, RunnerAttempt,
+    ExperimentDatasetExample, Job, JobEvaluation, Runner, RunnerAttempt,
 )
 from evalforge.server.runner_connections import RUNNER_SESSION_PREFIX, RegisteredConnection, RunnerConnections
 
@@ -203,7 +203,8 @@ class ExperimentAPITests(APITestCase):
         self.assertEqual(detail["status"], "pending")
         self.assertEqual(detail["progress"], {"example_count": 2, "job_count": 4, "queued": 4,
                                              "assigned": 0, "running": 0, "succeeded": 0,
-                                             "failed": 0, "cancelled": 0, "unknown": 0})
+                                             "failed": 0, "cancelled": 0, "unknown": 0,
+                                             "evaluations": {"expected": 0, "completed": 0, "errors": 0}})
         self.assertTrue(detail["created_at"].endswith("Z"))
         async with self.database.transaction() as db:
             links = ExperimentDatasetExample
@@ -291,7 +292,125 @@ class ExperimentAPITests(APITestCase):
         self.assertTrue({"description", "metadata", "execution_config", "runs", "attempts"}.isdisjoint(item))
         detail = (await self.client.get(f"/api/v1/experiments/{second['experiment_id']}")).json()
         self.assertEqual(detail["execution_config"], second["execution_config"])
-        self.assertEqual(detail["progress"], item["progress"])
+        self.assertEqual(detail["progress"], {
+            **item["progress"], "evaluations": {"expected": 0, "completed": 0, "errors": 0},
+        })
+
+    async def test_detail_and_cancel_report_saved_evaluations_against_frozen_config(self):
+        names = ("first", "second", "missing")
+        ids = [(await self.create_evaluator(name=name))["dataset_evaluator_id"] for name in names]
+        created = (await self.create_experiment(dataset_evaluator_ids=ids)).json()
+        self.assertEqual(created["progress"]["evaluations"], {"expected": 0, "completed": 0, "errors": 0})
+        experiment_id = created["experiment_id"]
+        now = datetime.now(timezone.utc)
+        async with self.database.transaction() as db:
+            job = await db.scalar(select(Job).where(Job.experiment_id == experiment_id).order_by(Job.id).limit(1))
+            job.status, job.output = "succeeded", {"task_output": {}}
+            for name, error in ((names[0], None), (names[1], "scoring failed"), ("not_configured", None)):
+                db.add(JobEvaluation(experiment_run_id=job.id, name=name, annotator_kind="CODE", error=error,
+                                     start_time=now, end_time=now))
+        path = f"/api/v1/experiments/{experiment_id}"
+        detail = (await self.client.get(path)).json()["progress"]
+        self.assertEqual((detail["job_count"], detail["succeeded"], detail["queued"]), (2, 1, 1))
+        self.assertEqual(detail["evaluations"], {"expected": 3, "completed": 2, "errors": 1})
+        self.assertNotIn("evaluations", (await self.client.get(self.path)).json()["items"][0]["progress"])
+        cancelled = (await self.client.post(path + "/cancel")).json()
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["progress"]["evaluations"], detail["evaluations"])
+
+    async def test_job_list_filters_paginates_and_counts_only_configured_scores(self):
+        names = ("first", "second", "missing")
+        ids = [(await self.create_evaluator(name=name))["dataset_evaluator_id"] for name in names]
+        experiment_id = (await self.create_experiment(repetitions=2, dataset_evaluator_ids=ids)).json()["experiment_id"]
+        now = datetime.now(timezone.utc)
+        async with self.database.transaction() as db:
+            jobs = (await db.scalars(select(Job).where(Job.experiment_id == experiment_id).order_by(Job.id))).all()
+            first, second = jobs[0], jobs[2]
+            first_id, second_id = first.job_id, second.job_id
+            for job in (first, second):
+                job.status, job.output = "succeeded", {"task_output": ["ok"]}
+            first.duration_ms, first.http_status = 123.5, 200
+            for job, name, error in ((first, "first", None), (first, "second", "failed"),
+                                     (first, "not_configured", "ignored"), (second, "second", None)):
+                db.add(JobEvaluation(experiment_run_id=job.id, name=name, annotator_kind="CODE",
+                                     error=error, start_time=now, end_time=now))
+        self.client.headers.pop("X-CSRF-Token")
+        path = f"/api/v1/experiments/{experiment_id}/jobs"
+        response = await self.client.get(path, params={"status": "succeeded", "pagesize": 1})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(response.json(), {"items": [{
+            "job_id": first_id, "example_id": self.example_ids[0], "repetition_number": 1, "status": "succeeded",
+            "duration_ms": 123.5, "http_status": 200,
+            "evaluation_progress": {"expected": 3, "completed": 2, "errors": 1},
+        }], "page": 1, "pagesize": 1, "total": 2})
+        second_page = (await self.client.get(path, params={"status": "succeeded", "pagesize": 1, "page": 2})).json()
+        self.assertEqual(second_page["items"][0]["job_id"], second_id)
+        self.assertEqual(second_page["items"][0]["evaluation_progress"], {"expected": 3, "completed": 1, "errors": 0})
+        empty = (await self.client.get(path, params={"status": "succeeded", "pagesize": 1, "page": 3})).json()
+        self.assertEqual(empty, {"items": [], "page": 3, "pagesize": 1, "total": 2})
+        unfiltered = (await self.client.get(path)).json()
+        self.assertEqual((unfiltered["total"], unfiltered["pagesize"]), (4, 20))
+        self.assertEqual(unfiltered["items"][1]["evaluation_progress"], {"expected": 0, "completed": 0, "errors": 0})
+
+    async def test_job_detail_returns_frozen_input_raw_output_and_saved_scores(self):
+        names = ("z_rule", "a_rule")
+        ids = [(await self.create_evaluator(name=name))["dataset_evaluator_id"] for name in names]
+        async with self.database.transaction() as db:
+            revision = await db.get(DatasetExampleRevision, self.original_revisions[0])
+            revision.output, revision.metadata_ = {"expected": "yes"}, {"tag": "frozen"}
+        experiment_id = (await self.create_experiment(dataset_version_id=self.v1, dataset_evaluator_ids=ids)
+                         ).json()["experiment_id"]
+        now = datetime(2026, 11, 12, 8, tzinfo=timezone.utc)
+        async with self.database.transaction() as db:
+            success, failure, queued = (await db.scalars(select(Job).where(Job.experiment_id == experiment_id)
+                                                         .order_by(Job.id))).all()
+            success.status, success.output = "succeeded", {"task_output": [1, {"text": "yes"}, None]}
+            success.start_time = success.end_time = now
+            failure.status, failure.output = "failed", {"task_output": None}
+            failure.error = {"code": "timeout", "message": "timed out"}
+            for name, score, error in (("a_rule", None, "评分失败"), ("z_rule", 0.0, None)):
+                db.add(JobEvaluation(experiment_run_id=success.id, name=name, annotator_kind="CODE", score=score,
+                                     error=error, start_time=now, end_time=now))
+        path = f"/api/v1/experiments/{experiment_id}/jobs"
+        response = await self.client.get(f"{path}/{success.job_id}")
+        self.assertEqual(response.status_code, 200, response.text)
+        detail = response.json()
+        self.assertEqual((detail["input"], detail["reference"], detail["metadata"]),
+                         ({"version": self.v1}, {"expected": "yes"}, {"tag": "frozen"}))
+        self.assertEqual(detail["output"], [1, {"text": "yes"}, None])
+        self.assertEqual(detail["started_at"], "2026-11-12T08:00:00Z")
+        self.assertEqual(detail["ended_at"], detail["started_at"])
+        self.assertIsNone(detail["error"])
+        self.assertEqual(detail["evaluations"], [
+            {"name": "z_rule", "score": 0.0, "label": None, "explanation": None, "error": None},
+            {"name": "a_rule", "score": None, "label": None, "explanation": None, "error": "评分失败"},
+        ])
+        self.assertEqual(detail["evaluation_progress"], {"expected": 2, "completed": 2, "errors": 1})
+        failed = (await self.client.get(f"{path}/{failure.job_id}")).json()
+        self.assertEqual((failed["status"], failed["output"], failed["error"], failed["evaluations"]),
+                         ("failed", None, failure.error, []))
+        pending = (await self.client.get(f"{path}/{queued.job_id}")).json()
+        self.assertEqual((pending["status"], pending["output"], pending["started_at"], pending["ended_at"]),
+                         ("queued", None, None, None))
+
+    async def test_job_queries_require_ownership_and_validate_params(self):
+        first = (await self.create_experiment()).json()["experiment_id"]
+        second = (await self.create_experiment()).json()["experiment_id"]
+        path = f"/api/v1/experiments/{first}/jobs"
+        job_id = (await self.client.get(path)).json()["items"][0]["job_id"]
+        for url in (path, f"{path}/{job_id}"):
+            self.assert_error(await self.new_client().get(url), 401, "not_authenticated")
+        other = self.new_client()
+        await self.register("bob", other)
+        await self.login(other, username="bob")
+        for url in (path, f"{path}/{job_id}"):
+            self.assert_error(await other.get(url), 404, "experiment_not_found")
+        self.assert_error(await self.client.get(f"/api/v1/experiments/{second}/jobs/{job_id}"), 404, "job_not_found")
+        self.assert_error(await self.client.get(f"{path}/missing"), 404, "job_not_found")
+        self.assert_error(await self.client.get(path, params={"status": "completed"}), 422, "invalid_request")
+        self.assert_error(await self.client.get(path, params={"pagesize": 101}), 422, "invalid_request")
+        self.assert_error(await self.client.get(f"{path}/" + "x" * 129), 422, "invalid_request")
 
     async def test_unauthenticated_requests_and_create_csrf_origin(self):
         anonymous = self.new_client()

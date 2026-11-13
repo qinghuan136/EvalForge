@@ -89,14 +89,24 @@ class RunnerAPITests(APITestCase):
     async def test_connection_snapshots_are_batched_and_missing_records_mean_offline(self):
         first, second = await self.create_runner("one"), await self.create_runner("two")
         first_id, second_id = first["runner"]["runner_id"], second["runner"]["runner_id"]
-        await self.redis.set(RUNNER_SESSION_PREFIX + first_id, json.dumps({"session_id": "session-1", "phase": "ready"}), ex=60)
+        key = RUNNER_SESSION_PREFIX + first_id
+        capabilities = ["http_json", "http_sse"]
+        await self.redis.set(key, json.dumps({
+            "session_id": "session-1", "phase": "ready", "capabilities": capabilities,
+        }), ex=60)
         with patch.object(self.redis, "mget", wraps=self.redis.mget) as batch:
             response = await self.client.get("/api/v1/runners")
         self.assertEqual(response.status_code, 200, response.text)
         batch.assert_called_once()
         states = {row["runner_id"]: row["connection"] for row in response.json()["items"]}
-        self.assertEqual(states[first_id], {"online": True, "phase": "ready"})
-        self.assertEqual(states[second_id], {"online": False, "phase": "disconnected"})
+        self.assertEqual(states[first_id], {"online": True, "phase": "ready", "capabilities": capabilities})
+        offline = {"online": False, "phase": "disconnected", "capabilities": []}
+        self.assertEqual(states[second_id], offline)
+        path = f"/api/v1/runners/{first_id}"
+        self.assertEqual((await self.client.get(path)).json()["connection"], states[first_id])
+        self.assertEqual((await self.client.patch(path, json={"name": "renamed"})).json()["connection"], states[first_id])
+        await self.redis.delete(key)
+        self.assertEqual((await self.client.get(path)).json()["connection"], offline)
 
     async def test_rename_only_changes_name_and_preserves_credential(self):
         created = await self.create_runner()

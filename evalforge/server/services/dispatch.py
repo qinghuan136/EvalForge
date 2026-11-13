@@ -1,23 +1,22 @@
 """为 Runner 领取 Job、读取取消意图并保存派发回执。"""
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Literal
 from uuid import uuid4
 
-from pydantic import ValidationError
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from evalforge.db import Database
-from evalforge.db.models import (
-    DatasetExampleRevision, Experiment, ExperimentDatasetExample, Job, RunnerAttempt,
-)
+from evalforge.db.models import Experiment, Job, RunnerAttempt
 
+from ..experiment_runtime import ExperimentRuntime, JobWorkItem
 from ..runner_auth import RunnerIdentity
 from ..schemas.attempts import AttemptKey
-from ..schemas.experiments import ExecutionConfig
 from .attempts import ACTIVE, AttemptError, lock_owned_attempt, lock_runner
-from .experiment_lifecycle import TERMINAL, finish_experiment
+from .experiment_lifecycle import TERMINAL, finish_experiment, settle_experiment
 
 RETRYABLE_REJECTIONS = {"busy", "not_ready", "session_unavailable"}
 FAILURE_MESSAGES = {
@@ -43,6 +42,33 @@ class CancelRequest:
     reason: str
 
 
+@dataclass(frozen=True)
+class ActiveAssignment:
+    key: AttemptKey
+    cancel_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class DispatchUpdate:
+    status: str | None = None
+    requeue: bool = False
+    changed: bool = False
+    released: bool = False
+
+
+async def active_assignment(db: AsyncSession, identity: RunnerIdentity) -> ActiveAssignment | None:
+    row = (await db.execute(select(RunnerAttempt.attempt_id, RunnerAttempt.cancel_requested_at,
+                                   RunnerAttempt.cancel_reason, Job.job_id)
+           .join(Job, Job.id == RunnerAttempt.experiment_run_id)
+           .join(Experiment, Experiment.id == Job.experiment_id)
+           .where(RunnerAttempt.runner_id == identity.runner_id, RunnerAttempt.status.in_(ACTIVE),
+                  Experiment.user_id == identity.owner_user_id))).one_or_none()
+    if row is None:
+        return None
+    return ActiveAssignment(AttemptKey(job_id=row.job_id, attempt_id=row.attempt_id),
+                            (row.cancel_reason or "user_requested") if row.cancel_requested_at else None)
+
+
 def fail_job(job: Job, reason: str) -> None:
     job.status = "failed"
     job.output = {"task_output": None}
@@ -60,57 +86,54 @@ class DispatchService:
     def __init__(self, database: Database):
         self.database = database
 
-    async def next_action(self, identity: RunnerIdentity, *, supports_streaming: bool = False) -> DispatchClaim | CancelRequest | None:
+    async def pending_cancel(self, identity: RunnerIdentity) -> CancelRequest | None:
         async with self.database.transaction() as db:
             try:
                 await lock_runner(db, identity)
             except AttemptError:
                 return None
-            occupied = (await db.execute(select(
-                RunnerAttempt.attempt_id, RunnerAttempt.cancel_requested_at, RunnerAttempt.cancel_reason,
-                Job.job_id, Experiment.user_id,
-            ).join(Job, Job.id == RunnerAttempt.experiment_run_id)
-             .join(Experiment, Experiment.id == Job.experiment_id).where(
-                RunnerAttempt.runner_id == identity.runner_id, RunnerAttempt.status.in_(ACTIVE),
-            ).limit(1))).one_or_none()
-            if occupied is not None:
-                if occupied.cancel_requested_at is not None and occupied.user_id == identity.owner_user_id:
-                    return CancelRequest(AttemptKey(job_id=occupied.job_id, attempt_id=occupied.attempt_id),
-                                         occupied.cancel_reason or "user_requested")
-                return None
+            assignment = await active_assignment(db, identity)
+            if assignment is not None and assignment.cancel_reason is not None:
+                return CancelRequest(assignment.key, assignment.cancel_reason)
+            return None
 
-            jobs, snapshot, revision = Job, ExperimentDatasetExample, DatasetExampleRevision
-            eligible = (
-                select(jobs, Experiment, revision.input)
-                .join(Experiment, Experiment.id == jobs.experiment_id)
-                .join(snapshot, (snapshot.experiment_id == jobs.experiment_id)
-                                & (snapshot.dataset_example_id == jobs.dataset_example_id))
-                .join(revision, revision.id == snapshot.dataset_example_revision_id)
-                .where(jobs.status == "queued", Experiment.status.in_(("pending", "running")),
+    async def claim(
+        self, identity: RunnerIdentity, runtime: ExperimentRuntime, item: JobWorkItem, *,
+        check_current: Callable[[], Awaitable[None]] | None = None,
+    ) -> DispatchClaim | ActiveAssignment | DispatchUpdate:
+        async with self.database.transaction() as db:
+            try:
+                await lock_runner(db, identity)
+            except AttemptError:
+                return DispatchUpdate()
+            # sync 锁同一 Runner。校验在锁内，避免旧会话在新会话对账之后创建预留。
+            if check_current is not None:
+                await check_current()
+            occupied = await active_assignment(db, identity)
+            if occupied is not None:
+                return occupied
+            row = (await db.execute(
+                select(Job, Experiment).join(Experiment, Experiment.id == Job.experiment_id)
+                .where(Job.id == item.job_pk, Job.job_id == item.job_id, Job.experiment_id == runtime.experiment_id,
                        Experiment.user_id == identity.owner_user_id,
                        Experiment.execution_config["runner_id"].as_string() == identity.runner_id)
-            )
-            if not supports_streaming:
-                # 在取队首前筛选。历史实验没有该字段，和显式 false 一样可派发。
-                eligible = eligible.where(Experiment.execution_config["stream_output"].as_boolean().is_not(True))
-            row = (await db.execute(eligible.order_by(jobs.created_at, jobs.id).limit(1)
-                                    .with_for_update(of=(jobs, Experiment), skip_locked=True))).one_or_none()
+                .with_for_update(of=(Job, Experiment))
+            )).one_or_none()
             if row is None:
-                return None
-
-            job, experiment, example_input = row
+                return DispatchUpdate("cancelled")  # 已删除的实验不再调度。
+            job, experiment = row
+            if job.status != "queued" or experiment.status not in {"pending", "running"}:
+                return DispatchUpdate(experiment.status)
             experiment.status = "running"
-            try:
-                runner_config = {key: value for key, value in experiment.execution_config.items() if key != "evaluators"}
-                config = ExecutionConfig.model_validate(runner_config)
-            except ValidationError:
+            config = runtime.execution_config
+            if config is None:
                 fail_job(job, "invalid_execution_config")
-                await finish_experiment(db, job.experiment_id, identity.runner_id)
-                return None
+                await settle_experiment(db, experiment)
+                return DispatchUpdate(experiment.status)
             key = AttemptKey(job_id=job.job_id, attempt_id=str(uuid4()))
             payload = {
                 **key.model_dump(), "agent_target_id": config.agent_target_id,
-                "example_id": str(job.dataset_example_id), "input": example_input,
+                "example_id": str(item.example_id), "input": item.input,
                 "timeout_seconds": config.timeout_seconds,
             }
             if config.stream_output:
@@ -120,46 +143,46 @@ class DispatchService:
                                  status="assigned", dispatch_json=payload))
             return DispatchClaim(key, payload, experiment.id)
 
-    async def prepare_send(self, identity: RunnerIdentity, claim: DispatchClaim) -> bool:
+    async def prepare_send(self, identity: RunnerIdentity, claim: DispatchClaim) -> DispatchUpdate | None:
         """在第一次发送 RPC 前确认预留仍可派发。"""
         async with self.database.transaction() as db:
             try:
                 await lock_runner(db, identity)
                 attempt, job = await lock_owned_attempt(db, identity, claim.key)
             except AttemptError:
-                return False
+                return DispatchUpdate()
             if attempt.status != "assigned" or job.status != "assigned":
-                return False
+                return DispatchUpdate()
             if attempt.cancel_requested_at is None:
-                return True
+                return None
             # 当前派发协程尚未调用 RPC，可以确认这次预留未送达客户端。
             attempt.status, attempt.rejection_reason = "rejected", "cancelled_before_dispatch"
             cancel_unstarted_job(job)
-            await finish_experiment(db, job.experiment_id, identity.runner_id)
-            return False
+            experiment = await finish_experiment(db, job.experiment_id, identity.runner_id)
+            return DispatchUpdate(experiment.status if experiment else None, changed=True, released=True)
 
     async def record(self, identity: RunnerIdentity, claim: DispatchClaim, *,
                      outcome: Literal["accepted", "rejected", "unknown"], reason: str | None = None,
-                     dispatched_at: datetime | None = None) -> bool:
+                     dispatched_at: datetime | None = None) -> DispatchUpdate:
         async with self.database.transaction() as db:
             try:
                 await lock_runner(db, identity)
                 attempt, job = await lock_owned_attempt(db, identity, claim.key)
             except AttemptError:
-                return False
+                return DispatchUpdate()
             if dispatched_at is not None:
                 attempt.dispatched_at = attempt.dispatched_at or dispatched_at
             if outcome == "accepted" and attempt.status in ({"assigned", "accepted", "running"} | TERMINAL):
                 attempt.accepted_at = attempt.accepted_at or datetime.now(timezone.utc)
             # started、complete 和新会话的 sync 都可能先于派发回执提交。
             if attempt.status != "assigned" or job.status != "assigned":
-                return False
+                return DispatchUpdate()
             if outcome == "accepted":
                 attempt.status = "accepted"
+                return DispatchUpdate(changed=True)
             elif outcome == "unknown":
                 attempt.status = job.status = "unknown"
                 attempt.unknown_reason = reason or "dispatch_outcome_unknown"
-                await finish_experiment(db, job.experiment_id, identity.runner_id)
             else:
                 if reason not in RETRYABLE_REJECTIONS and reason not in FAILURE_MESSAGES:
                     reason = "dispatch_rejected"
@@ -168,10 +191,10 @@ class DispatchService:
                 attempt.rejection_reason = reason
                 if attempt.cancel_requested_at is not None:
                     cancel_unstarted_job(job)
-                    await finish_experiment(db, job.experiment_id, identity.runner_id)
                 elif reason in RETRYABLE_REJECTIONS:
                     job.status = "queued"
+                    return DispatchUpdate(requeue=True, changed=True, released=True)
                 else:
                     fail_job(job, reason)
-                    await finish_experiment(db, job.experiment_id, identity.runner_id)
-            return True
+            experiment = await finish_experiment(db, job.experiment_id, identity.runner_id)
+            return DispatchUpdate(experiment.status if experiment else None, changed=True, released=True)

@@ -4,7 +4,9 @@ from sqlalchemy import case, column, func, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from evalforge.db.base import JSON_VALUE
-from evalforge.db.models import Experiment, Job, JobEvaluation
+from evalforge.db.models import DatasetExampleRevision, Experiment, ExperimentDatasetExample, Job, JobEvaluation
+
+from ..experiment_runtime import EvaluationWorkItem
 
 SCORABLE_EXPERIMENT_STATES = ("running", "completed")
 
@@ -28,3 +30,22 @@ def missing_evaluations(db: AsyncSession):
             .join(evaluator, true())
             .where(Job.status == "succeeded", Experiment.status.in_(SCORABLE_EXPERIMENT_STATES),
                    name.is_not(None), ~saved))
+
+
+async def missing_evaluation_items(db: AsyncSession, *scope) -> list[tuple[int, EvaluationWorkItem]]:
+    snapshot, revision = ExperimentDatasetExample, DatasetExampleRevision
+    query = missing_evaluations(db)
+    query = (query.join(snapshot, (snapshot.experiment_id == Job.experiment_id)
+                       & (snapshot.dataset_example_id == Job.dataset_example_id))
+            .join(revision, revision.id == snapshot.dataset_example_revision_id)
+            .add_columns(Job.experiment_id, Job.output, revision.input,
+                         revision.output.label("reference"), revision.metadata_)
+             .where(*scope).order_by(Job.id, query.selected_columns.name))
+    return [(row.experiment_id, evaluation_work_item(row)) for row in await db.execute(query)]
+
+
+def evaluation_work_item(row) -> EvaluationWorkItem:
+    return EvaluationWorkItem(row.job_pk, row.name, row.snapshot, {
+        "input": row.input, "reference": row.reference,
+        "output": (row.output or {}).get("task_output"), "metadata": row.metadata_,
+    })

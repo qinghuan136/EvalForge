@@ -33,6 +33,7 @@ from .services.dispatch import DispatchService
 from .services.evaluations import EvaluationService
 from .services.evaluators import DatasetEvaluatorService
 from .services.experiments import ExperimentService
+from .services.runtime_loader import RuntimeLoader
 from .sessions import SessionStore
 
 
@@ -55,18 +56,20 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
             app.state.auth = AuthService(db, app.state.sessions, passwords)
             connections = RunnerConnections(redis)
             app.state.runners = RunnerService(db, connections, config.runner_websocket_url)
-            app.state.runner_auth = RunnerAuth(db)
+            app.state.runner_auth = RunnerAuth(db, redis)
             attempts = AttemptService(db)
             app.state.experiment_events = ExperimentEventStore(redis)
             app.state.runner_sessions = RunnerSessionManager(
                 connections, attempts, runner_auth=app.state.runner_auth, event_store=app.state.experiment_events)
             resources.push_async_callback(app.state.runner_sessions.close)
-            scheduler = Scheduler(app.state.runner_sessions, DispatchService(db), evaluations=EvaluationService(db))
-            attempts.on_task_succeeded = scheduler.notify_eval
-            app.state.runner_sessions.on_work_available = scheduler.wake
+            scheduler = Scheduler(DispatchService(db), RuntimeLoader(db), EvaluationService(db))
+            app.state.runner_sessions.on_ready = scheduler.session_ready
+            app.state.runner_sessions.on_closed = scheduler.session_closed
+            app.state.runner_sessions.on_complete = scheduler.task_completed
             app.state.datasets = DatasetService(db)
             app.state.dataset_evaluators = DatasetEvaluatorService(db)
-            app.state.experiments = ExperimentService(db, connections, scheduler.wake)
+            app.state.experiments = ExperimentService(
+                db, connections, on_created=scheduler.experiment_created, on_cancelled=scheduler.experiment_cancelled)
             scheduler.start()
             resources.push_async_callback(scheduler.close)
             # 注入资源由调用方管理；应用创建的资源由 AsyncExitStack 按逆序关闭。
@@ -82,8 +85,9 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
     @app.middleware("http")
     async def no_auth_cache(request: Request, call_next):
         response = await call_next(request)
-        if request.url.path.startswith(("/api/v1/auth/", "/api/v1/runners", "/api/v1/datasets/",
-                                        "/api/v1/experiments/", "/api/v1/evaluators/")):
+        path = request.url.path
+        if path == "/api/v1/datasets" or path.startswith(("/api/v1/auth/", "/api/v1/runners", "/api/v1/datasets/",
+                                                         "/api/v1/experiments/", "/api/v1/evaluators/")):
             response.headers["Cache-Control"] = "no-store"
         return response
 

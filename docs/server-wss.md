@@ -26,7 +26,7 @@ routes/runner_ws.py
 - 客户端只通过 `Authorization: Bearer efr.<token_id>.<secret>` 提供凭证；不接受 Cookie、URL 参数或 hello 替代认证。
 - 根据 token_id 查询 Credential → Runner → User，比较 secret 的 SHA-256，检查凭证未过期 / 撤销、Runner 未删除且启用、所属用户启用。
 - 连接绑定 runner_id、owner_user_id、credential_id、到期时间和摘要；后续不能通过 RPC 参数更换认证身份。握手成功校验时更新 last_used_at / last_seen_at。
-- hello 成功后，由服务端会话心跳默认每 5 秒复查凭证并续租 Redis。已知凭证到期时间可提前终止连接；WSS 收发消息时不查 PostgreSQL 或 Redis。
+- WSS 握手每次都查 PostgreSQL。认证成功后写入 Redis 授权快照，最多有效 60 秒；不存原始 Token。hello 后，心跳默认每 5 秒优先读快照，未命中才回查 PostgreSQL，通过后再续租 Redis 会话。续租不会延长授权快照。WSS 收发消息时不做逐帧授权查询。
 - 凭证撤销、Runner 删除 / 禁用、账号禁用、到期或会话被替换时关闭 1008；存储不可用时关闭 1011。浏览器改密和退出全部登录不撤销 Runner 凭证。
 - 保留业务入口已有的会话归属与 Attempt 校验。
 

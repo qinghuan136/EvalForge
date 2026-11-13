@@ -30,7 +30,9 @@ from evalforge.db.models import (
     Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment, Job, Runner, RunnerAttempt,
     RunnerCredential, User,
 )
+from evalforge.server.errors import APIError
 from evalforge.server.experiment_events import PreviewTarget
+from evalforge.server.runner_auth import RUNNER_AUTH_CACHE_PREFIX
 
 
 class RunnerWebSocketTests(APITestCase):
@@ -122,7 +124,8 @@ class RunnerWebSocketTests(APITestCase):
             self.assertEqual(record["session_id"], hello["session_id"])
             self.assertEqual(record["phase"], "syncing")
             response = await self.client.get(f"/api/v1/runners/{self.runner_id}")
-            self.assertEqual(response.json()["connection"], {"online": True, "phase": "syncing"})
+            self.assertEqual(response.json()["connection"],
+                             {"online": True, "phase": "syncing", "capabilities": ["http_json"]})
             for method in ("runner.sync", "runner.ready", "jobs.complete"):
                 await ws.send(json.dumps({"jsonrpc": "2.0", "method": method, "id": method}))
                 reply = json.loads(await asyncio.wait_for(ws.recv(), 2))
@@ -473,17 +476,20 @@ asyncio.run(main())
     async def test_idle_connections_close_after_deletion_and_browser_logout_does_not_revoke(self):
         async with self.connection() as ws:
             await self.hello(ws)
+            cache_key = RUNNER_AUTH_CACHE_PREFIX + self.runner_id
+            self.assertIsNotNone(await self.redis.get(cache_key))
             logout = await self.client.post("/api/v1/auth/logout-all")
             self.assertEqual(logout.status_code, 204)
             await (await ws.ping())
             await self.login()
             deleted = await self.client.delete(f"/api/v1/runners/{self.runner_id}")
             self.assertEqual(deleted.status_code, 204)
+            self.assertIsNone(await self.redis.get(cache_key))
             with self.assertRaises(ConnectionClosed) as caught:
                 await asyncio.wait_for(ws.recv(), 2)
             self.assertEqual(caught.exception.rcvd.code, 1008)
 
-    async def test_database_outage_is_sanitized_and_existing_connection_fails_closed(self):
+    async def test_database_outage_rejects_new_handshake_and_only_closes_existing_connection_on_cache_miss(self):
         error = OperationalError("private database URI", {}, Exception("private secret"))
         with patch.object(self.database, "transaction", side_effect=error):
             with self.assertRaises(InvalidStatus) as caught:
@@ -493,20 +499,70 @@ asyncio.run(main())
         self.assertNotIn(b"private", caught.exception.response.body)
         async with self.connection() as ws:
             await self.hello(ws)
-            with patch.object(self.database, "transaction", side_effect=error):
+            cache_key = RUNNER_AUTH_CACHE_PREFIX + self.runner_id
+            self.assertGreater(await self.redis.pttl(cache_key), 0)
+            await self.redis.pexpire(cache_key, 5000)
+            connections = self.app.state.runner_sessions.connections
+            renewed = asyncio.Event()
+            original_renew = connections.renew
+
+            async def track_renew(*args):
+                result = await original_renew(*args)
+                renewed.set()
+                return result
+
+            with patch.object(self.database, "transaction", side_effect=error) as transaction, \
+                 patch.object(connections, "renew", side_effect=track_renew):
+                await asyncio.wait_for(renewed.wait(), 2)
+                transaction.assert_not_called()
+                self.assertTrue(0 < await self.redis.pttl(cache_key) <= 5000)
+                # 即使有缓存，新连接也必须查权威库。
+                with self.assertRaises(InvalidStatus) as handshake:
+                    async with self.connection():
+                        self.fail("Handshake used heartbeat cache")
+                self.assertEqual(handshake.exception.response.status_code, 503)
+                await self.redis.delete(cache_key)
                 with self.assertRaises(ConnectionClosed) as caught:
                     await asyncio.wait_for(ws.recv(), 2)
             self.assertEqual(caught.exception.rcvd.code, 1011)
 
     async def test_idle_connection_expires_without_waiting_for_an_application_message(self):
-        async with self.connection() as ws:
-            await self.hello(ws)
-            async with self.database.transaction() as db:
-                credential = await db.get(RunnerCredential, self.credential_id)
-                credential.expires_at = credential.created_at + timedelta(microseconds=1)
-            with self.assertRaises(ConnectionClosed) as caught:
-                await asyncio.wait_for(ws.recv(), 3)
-            self.assertEqual(caught.exception.rcvd.code, 1008)
+        self.app.state.settings = replace(self.config, runner_session_heartbeat_seconds=30)
+        auth = self.app.state.runner_auth
+        authenticate = auth.authenticate
+
+        async def authenticate_with_near_expiry(authorization):
+            identity = await authenticate(authorization)
+            return replace(identity, expires_at=datetime.now(timezone.utc) + timedelta(seconds=1))
+
+        with patch.object(auth, "authenticate", side_effect=authenticate_with_near_expiry):
+            async with self.connection() as ws:
+                await self.hello(ws)
+                with self.assertRaises(ConnectionClosed) as caught:
+                    await asyncio.wait_for(ws.recv(), 3)
+                self.assertEqual(caught.exception.rcvd.code, 1008)
+
+    async def test_heartbeat_refills_from_database_then_observes_account_disable_on_expiry(self):
+        auth = self.app.state.runner_auth
+        identity = await auth.authenticate(f"Bearer {self.token}")
+        cache_key = RUNNER_AUTH_CACHE_PREFIX + self.runner_id
+        await self.redis.delete(cache_key)
+        with patch.object(auth, "_check_database", wraps=auth._check_database) as check:
+            await auth.check(identity)
+            await auth.check(identity)
+            check.assert_awaited_once_with(identity)
+        self.assertTrue(0 < await self.redis.pttl(cache_key) <= 60_000)
+        async with self.database.transaction() as db:
+            user = await db.get(User, identity.owner_user_id)
+            user.enabled = False  # 模拟绕过应用、直接修改数据库。
+        await self.redis.pexpire(cache_key, 1)
+        async with asyncio.timeout(1):
+            while await self.redis.exists(cache_key):
+                await asyncio.sleep(0.005)
+        with self.assertRaises(APIError) as denied:
+            await auth.check(identity)
+        self.assertEqual(denied.exception.status, 403)
+        self.assertIsNone(await self.redis.get(cache_key))
 
     async def test_application_messages_do_not_check_credentials_or_session_in_transport(self):
         self.app.state.settings = replace(self.config, runner_session_heartbeat_seconds=30)

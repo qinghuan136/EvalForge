@@ -27,7 +27,7 @@ routes/runners.py → 当前用户 / CSRF
 - name 去除首尾空白后为 1–100 字符；PATCH 只接受 name。用户归属来自登录会话，其他用户访问同一 ID 统一返回 404。
 - 列表使用 page / pagesize，默认 1 / 20，pagesize 最大 100；按 created_at、runner_id 降序排列，排除已删除及其他用户的 Runner。分页不冻结跨请求快照。
 - 写事务内重新校验用户启用状态和 auth_version，用户行锁与改密码 / 退出全部会话协调；数据库和 Redis 基础设施保持共享，每次数据库操作独立 Session。
-- 删除事务同时写 deleted_at、enabled=false、revoked_at，不改变 Attempt 结果或删除历史。已删除记录详情 / 改名为 404，重复删除为 204。
+- 删除事务同时写 deleted_at、enabled=false、revoked_at，不改变 Attempt 结果或删除历史。提交后删除 Redis 会话和授权快照。已删除记录详情 / 改名为 404；重复删除会再次尝试清理 Redis。
 - 数据库提交后才清理 Redis 注册；清理失败返回 503，撤销不回滚，重复 DELETE 会再次清理。改名后连接读取失败也返回 503，但名称已保存，可重复 PATCH 重试。
 
 ## 连接快照与当前边界

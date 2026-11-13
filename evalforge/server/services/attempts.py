@@ -1,8 +1,9 @@
-"""执行尝试的归属、事务和幂等规则；不调度、不重试，也不记录入口日志。"""
+"""执行尝试的归属、事务和幂等规则；提交后返回可调度的工作。"""
 
-from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
+import logging
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -10,15 +11,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from evalforge.db import Database
 from evalforge.db.models import Experiment, Job, Runner, RunnerAttempt
 
+from ..experiment_runtime import EvaluationWorkItem
 from ..runner_auth import RunnerIdentity
 from ..schemas.attempts import AttemptKey, AttemptResult, RunnerSync
+from .evaluation_queries import SCORABLE_EXPERIMENT_STATES, missing_evaluation_items
 from .experiment_lifecycle import SETTLED_JOBS, TERMINAL, finish_experiment
 
 ACTIVE = {"assigned", "accepted", "running"}
+logger = logging.getLogger(__name__)
 
 
 class AttemptError(ValueError):
     """可预期的业务拒绝；message 只能使用服务端固定文本。"""
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptCompletion:
+    experiment_id: int
+    status: str
+    evaluations: tuple[EvaluationWorkItem, ...] = ()
 
 
 async def lock_runner(db: AsyncSession, identity: RunnerIdentity) -> None:
@@ -48,9 +59,8 @@ async def lock_owned_attempt(db: AsyncSession, identity: RunnerIdentity,
 
 
 class AttemptService:
-    def __init__(self, database: Database, on_task_succeeded: Callable[[int], None] | None = None):
+    def __init__(self, database: Database):
         self.database = database
-        self.on_task_succeeded = on_task_succeeded
 
     @staticmethod
     def _same_result(attempt: RunnerAttempt, result: AttemptResult) -> None:
@@ -77,15 +87,16 @@ class AttemptService:
             job.start_time = job.start_time or now
             attempt.status = job.status = "running"
 
-    async def complete(self, identity: RunnerIdentity, result: AttemptResult) -> None:
+    async def complete(self, identity: RunnerIdentity, result: AttemptResult) -> AttemptCompletion | None:
         async with self.database.transaction() as db:
             await lock_runner(db, identity)
             attempt, job = await lock_owned_attempt(db, identity, result)
             if attempt.status in TERMINAL:
                 self._same_result(attempt, result)
-                return
+                return None
             update_job = True
-            if attempt.status == "unknown":
+            late = attempt.status == "unknown"
+            if late:
                 # 迟到结果仍归原 Attempt。只有它仍是该 Job 最新的尝试，才可补齐 Job 结果。
                 newer = select(RunnerAttempt.id).where(
                     RunnerAttempt.experiment_run_id == job.id, RunnerAttempt.id > attempt.id,
@@ -103,11 +114,22 @@ class AttemptService:
             job.output = {"task_output": result.output}
             job.error = result.error.model_dump() if result.error is not None else None
             job.duration_ms, job.http_status, job.end_time = result.duration_ms, result.http_status, now
-            job_pk = job.id
-            await finish_experiment(db, job.experiment_id, identity.runner_id)
-        # 离开事务（包括 commit）成功后，调用方才可返回 ACK。
-        if result.status == "succeeded" and self.on_task_succeeded is not None:
-            self.on_task_succeeded(job_pk)
+            succeeded = result.status == "succeeded"
+            experiment = await finish_experiment(db, job.experiment_id, identity.runner_id)
+            if experiment is None:
+                return None
+            experiment_id, status, job_pk = experiment.id, experiment.status, job.id
+            should_score = (succeeded and status in SCORABLE_EXPERIMENT_STATES
+                            and bool(experiment.execution_config.get("evaluators")))
+        work = ()
+        if should_score:
+            # Scoring discovery must not roll back an already accepted Task result.
+            try:
+                async with self.database.transaction() as db:
+                    work = tuple(item for _, item in await missing_evaluation_items(db, Job.id == job_pk))
+            except Exception as exc:
+                logger.error("Eval work discovery failed job_pk=%s error_type=%s", job_pk, type(exc).__name__)
+        return AttemptCompletion(experiment_id, status, work)
 
     async def sync(self, identity: RunnerIdentity, snapshot: RunnerSync) -> dict:
         if snapshot.runner_id != identity.runner_id:

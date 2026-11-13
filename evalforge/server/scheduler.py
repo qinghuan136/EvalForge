@@ -1,221 +1,335 @@
-"""调度本地 Runner 的 Task，以及数据库中的待评分工作。"""
+"""从本进程的 Runtime 调度 Task 和 Eval；主循环不访问外部存储。"""
 
 import asyncio
+from collections import OrderedDict
+from dataclasses import dataclass, field
 import logging
-from datetime import datetime, timezone
-from itertools import islice
 
-from redis.exceptions import RedisError
-
-from .errors import APIError
-from .experiment_events import PreviewTarget
-from .rpc import RpcError, RpcProtocolError, RpcRequestTooLarge
-from .runner_sessions import RunnerSession, RunnerSessionManager
-from .services.dispatch import CancelRequest, DispatchService, RETRYABLE_REJECTIONS
-from .services.evaluations import EvaluationService, EvaluationWorkItem
-from .ws_transport import TransportClosed
+from .experiment_runtime import EvaluationWorkItem, ExperimentRuntime, JobWorkItem
+from .runner_dispatch import send_cancel, send_dispatch
+from .runner_sessions import RunnerSession
+from .schemas.attempts import AttemptKey
+from .services.attempts import AttemptCompletion
+from .services.dispatch import ActiveAssignment, DispatchClaim, DispatchService
+from .services.evaluations import EvaluationService
+from .services.experiment_lifecycle import ACTIVE_EXPERIMENTS
+from .services.runtime_loader import RuntimeLoader
 
 logger = logging.getLogger(__name__)
-EVAL_SCAN_BATCH = 100
+
+
+@dataclass(slots=True)
+class RunnerWork:
+    session: RunnerSession
+    runtimes: dict[int, ExperimentRuntime] = field(default_factory=dict)
+    task_candidates: OrderedDict[int, ExperimentRuntime] = field(default_factory=OrderedDict)
+    loading: asyncio.Lock = field(default_factory=asyncio.Lock)
+    ready: bool = False
+    active: AttemptKey | None = None
+    completed_during_dispatch: set[str] = field(default_factory=set)
+    check_cancel: bool = False
+    cancel_ack: str | None = None
+    task_retry: asyncio.TimerHandle | None = None
+    cancel_retry: asyncio.TimerHandle | None = None
+
+    def next_task(self) -> ExperimentRuntime | None:
+        if self.active is not None or self.task_retry is not None:
+            return None
+        return next(iter(self.task_candidates.values()), None)
+
+    def update_candidate(self, runtime: ExperimentRuntime, *, first: bool = False) -> None:
+        experiment_id = runtime.experiment_id
+        config = runtime.execution_config
+        if (self.runtimes.get(experiment_id) is runtime and runtime.tasks and not runtime.cancelling
+                and (config is None or not config.stream_output or self.session.supports_streaming)):
+            self.task_candidates[experiment_id] = runtime
+            if first:
+                self.task_candidates.move_to_end(experiment_id, last=False)
+        else:
+            self.task_candidates.pop(experiment_id, None)
 
 
 class Scheduler:
-    def __init__(self, sessions: RunnerSessionManager, dispatch: DispatchService, *,
-                 evaluations: EvaluationService | None = None, poll_interval: float = 1,
+    def __init__(self, dispatch: DispatchService, loader: RuntimeLoader, evaluations: EvaluationService, *,
                  dispatch_timeout: float = 5, retry_delay: float = 5):
-        self.sessions, self.dispatch = sessions, dispatch
-        self.evaluations = evaluations
-        self.poll_interval, self.dispatch_timeout, self.retry_delay = poll_interval, dispatch_timeout, retry_delay
+        self.dispatch, self.loader, self.evaluations = dispatch, loader, evaluations
+        self.dispatch_timeout, self.retry_delay = dispatch_timeout, retry_delay
         self._wake = asyncio.Event()
         self._stopping = False
         self._loop: asyncio.Task | None = None
-        self._tasks: dict[str, asyncio.Task] = {}
-        self._capacity = asyncio.Semaphore(32)
-        self._retry_after: dict[str, float] = {}
-        self._cancel_acks: dict[str, str] = {}  # session_id → 已确认接收取消指令的 attempt_id
-        self._eval_candidates: set[int] = set()
+        self._runners: dict[str, RunnerWork] = {}
+        self._task_ready: dict[str, None] = {}
+        self._eval_ready: dict[tuple[str, int], None] = {}
+        self._dispatches: dict[str, asyncio.Task[None]] = {}
+        self._dispatch_slots = asyncio.Semaphore(32)
         self._eval_tasks: dict[tuple[int, str], asyncio.Task[None]] = {}
-        self._recover_evals = evaluations is not None
-        self._eval_cursor: tuple[int, str] | None = None
 
     def start(self) -> None:
         self._loop = asyncio.create_task(self._run(), name="scheduler")
 
-    def wake(self) -> None:
-        self._wake.set()
-
-    def notify_eval(self, job_pk: int) -> None:
-        if self.evaluations is not None and not self._stopping:
-            self._eval_candidates.add(job_pk)
-            self.wake()
-
     async def close(self) -> None:
         self._stopping = True
-        self.wake()
+        self._wake.set()
         if self._loop is not None:
             await self._loop
+        for runner in list(self._runners.values()):
+            self.session_closed(runner.session)
         evaluations = tuple(self._eval_tasks.values())
         for task in evaluations:
             task.cancel()
-        # 让已经发出的派发在 RPC 超时内收尾，资源由 lifespan 在这之后关闭。
-        await asyncio.gather(*self._tasks.values(), *evaluations, return_exceptions=True)
-        self._eval_tasks.clear()
+        await asyncio.gather(*self._dispatches.values(), *evaluations, return_exceptions=True)
+
+    def _current(self, runner: RunnerWork) -> bool:
+        return (not self._stopping and runner.session.can_dispatch
+                and self._runners.get(runner.session.identity.runner_id) is runner)
+
+    async def session_ready(self, session: RunnerSession) -> None:
+        if self._stopping or not session.can_dispatch:
+            return
+        runner_id = session.identity.runner_id
+        if (old := self._runners.get(runner_id)) is not None:
+            if old.session is session:
+                return
+            self.session_closed(old.session)
+        runner = self._runners[runner_id] = RunnerWork(session)
+        async with runner.loading:
+            snapshot = await self.loader.load(session.identity)
+            await session.check_current()
+            if not self._current(runner):
+                return
+            if snapshot.active is not None:
+                runner.active = snapshot.active.key
+                runner.check_cancel = snapshot.active.cancel_reason is not None
+            runner.ready = True
+            for runtime in snapshot.experiments.values():
+                self._register(runner, runtime)
+            self._signal_task(runner)
+
+    def session_closed(self, session: RunnerSession) -> None:
+        runner_id = session.identity.runner_id
+        runner = self._runners.get(runner_id)
+        if runner is None or runner.session is not session:
+            return
+        self._runners.pop(runner_id)
+        self._task_ready.pop(runner_id, None)
+        for experiment_id in runner.runtimes:
+            self._eval_ready.pop((runner_id, experiment_id), None)
+        for timer in (runner.task_retry, runner.cancel_retry):
+            if timer is not None:
+                timer.cancel()
+        # 已启动的派发持有自己的 runtime 引用，可以独立收尾。
+        runner.runtimes.clear()
+        runner.task_candidates.clear()
+
+    async def experiment_created(self, runner_id: str, experiment_id: int) -> None:
+        runner = self._runners.get(runner_id)
+        if runner is None:
+            return
+        try:
+            async with runner.loading:
+                await self._load_one(runner, experiment_id)
+        except Exception as exc:
+            logger.error("Runtime load failed experiment_id=%s error_type=%s", experiment_id, type(exc).__name__)
+            runner.session.request_close(1011)  # 实验已提交；在新会话恢复。
+
+    async def _load_one(self, runner: RunnerWork, experiment_id: int) -> None:
+        if not self._current(runner) or not runner.ready or experiment_id in runner.runtimes:
+            return
+        snapshot = await self.loader.load(runner.session.identity, experiment_id=experiment_id)
+        if self._current(runner) and (runtime := snapshot.experiments.get(experiment_id)) is not None:
+            self._register(runner, runtime)
+
+    def _register(self, runner: RunnerWork, runtime: ExperimentRuntime) -> None:
+        # A local Eval may have survived the old connection and still be writing its result.
+        for key in runtime.evals.keys() & self._eval_tasks.keys():
+            runtime.evals.pop(key)
+        if runtime.completed and not runtime.evals:
+            return
+        runner.runtimes[runtime.experiment_id] = runtime
+        runner.update_candidate(runtime)
+        self._signal_eval(runner, runtime)
+        self._signal_task(runner)
+
+    async def experiment_cancelled(self, runner_id: str, experiment_id: int, status: str) -> None:
+        runner = self._runners.get(runner_id)
+        if runner is None:
+            return
+        async with runner.loading:
+            if self._current(runner):
+                self._apply_status(runner, experiment_id, status)
+                if status == "cancelling":
+                    runner.check_cancel = True
+                    self._signal_task(runner)
+
+    async def task_completed(self, session: RunnerSession, key: AttemptKey,
+                             completion: AttemptCompletion | None) -> None:
+        runner_id = session.identity.runner_id
+        runner = self._runners.get(runner_id)
+        if runner is None or runner.session is not session or not self._current(runner):
+            return  # syncing 时补传的结果在 ready 加载中统一发现。
+        if runner_id in self._dispatches:
+            runner.completed_during_dispatch.add(key.attempt_id)
+        if runner.active is not None and runner.active.attempt_id == key.attempt_id:
+            runner.active = None
+            if runner.cancel_retry is not None:
+                runner.cancel_retry.cancel()
+                runner.cancel_retry = None
+        if completion is not None:
+            experiment_id = completion.experiment_id
+            if completion.evaluations:
+                runtime = runner.runtimes.get(experiment_id)
+                if runtime is None:
+                    # unknown 后迟到的成功结果可能让已收尾的实验重新进入评分。
+                    await self.experiment_created(runner_id, experiment_id)
+                elif not runtime.cancelling:
+                    runtime.evals.update((item.key, item) for item in completion.evaluations)
+                    self._signal_eval(runner, runtime)
+            else:
+                self._apply_status(runner, experiment_id, completion.status)
+        self._signal_task(runner)
+
+    def _apply_status(self, runner: RunnerWork, experiment_id: int, status: str | None) -> None:
+        runtime = runner.runtimes.get(experiment_id)
+        if runtime is None or status is None:
+            return
+        if status == "cancelling":
+            runtime.cancel()
+        elif status not in ACTIVE_EXPERIMENTS:
+            runtime.cancel()
+            runner.runtimes.pop(experiment_id)
+            self._eval_ready.pop((runner.session.identity.runner_id, experiment_id), None)
+        runner.update_candidate(runtime)
+
+    def _signal_task(self, runner: RunnerWork) -> None:
+        if (self._current(runner) and runner.ready
+                and (runner.next_task() is not None or (runner.check_cancel and runner.cancel_retry is None))):
+            self._task_ready[runner.session.identity.runner_id] = None
+            self._wake.set()
+
+    def _signal_eval(self, runner: RunnerWork, runtime: ExperimentRuntime) -> None:
+        if self._current(runner) and runtime.evals and not runtime.cancelling:
+            self._eval_ready[(runner.session.identity.runner_id, runtime.experiment_id)] = None
+            self._wake.set()
 
     async def _run(self) -> None:
         while not self._stopping:
+            await self._wake.wait()
+            if self._stopping:
+                return
             self._wake.clear()
-            now = asyncio.get_running_loop().time()
-            self._retry_after = {key: deadline for key, deadline in self._retry_after.items() if deadline > now}
-            sessions = self.sessions.ready_sessions()
-            session_ids = {session.session_id for session in sessions}
-            self._cancel_acks = {key: value for key, value in self._cancel_acks.items() if key in session_ids}
-            for session in sessions:
-                runner_id = session.identity.runner_id
-                if runner_id not in self._tasks and runner_id not in self._retry_after:
-                    task = asyncio.create_task(self._dispatch_one(session), name=f"dispatch-{runner_id}")
-                    self._tasks[runner_id] = task
-            await self._schedule_evals()
-            try:
-                async with asyncio.timeout(self.poll_interval):
-                    await self._wake.wait()
-            except TimeoutError:
-                pass
+            task_ready, self._task_ready = self._task_ready, {}
+            for runner_id in task_ready:
+                self._schedule_runner(runner_id)
+            eval_ready, self._eval_ready = self._eval_ready, {}
+            for runner_id, experiment_id in eval_ready:
+                self._schedule_evals(runner_id, experiment_id)
 
-    async def _schedule_evals(self) -> None:
-        if self.evaluations is None or self._stopping:
+    def _schedule_runner(self, runner_id: str) -> None:
+        runner = self._runners.get(runner_id)
+        if runner is None or not self._current(runner) or runner_id in self._dispatches:
             return
-        job_pks = list(islice(self._eval_candidates, EVAL_SCAN_BATCH))
-        self._eval_candidates.difference_update(job_pks)
+        cancel = runner.check_cancel and runner.cancel_retry is None
+        runtime = None if cancel else runner.next_task()
+        if not cancel and runtime is None:
+            return
+        item = runtime.reserve_task() if runtime is not None else None
+        if runtime is not None:
+            runner.update_candidate(runtime)
+        self._dispatches[runner_id] = asyncio.create_task(
+            self._run_dispatch(runner, runtime, item), name=f"dispatch-{runner_id}")
+
+    async def _run_dispatch(self, runner: RunnerWork, runtime: ExperimentRuntime | None,
+                            item: JobWorkItem | None) -> None:
+        session = runner.session
+        runner_id = session.identity.runner_id
+        requeue = False
         try:
-            if job_pks:
-                await self._start_evals(job_pks)
-            if self._recover_evals:
-                items = await self._start_evals(after=self._eval_cursor, limit=EVAL_SCAN_BATCH)
-                self._recover_evals = len(items) == EVAL_SCAN_BATCH
-                if self._recover_evals:
-                    self._eval_cursor = items[-1].key
+            async with self._dispatch_slots:
+                if not self._current(runner):
+                    return
+                if runtime is None:
+                    await self._run_cancel(runner)
+                elif not runtime.cancelling:
+                    assert item is not None
+                    requeue = await self._dispatch_task(runner, runtime, item)
         except Exception as exc:
-            self._eval_candidates.update(job_pks)
-            logger.error("Eval discovery failed error_type=%s", type(exc).__name__)
-        else:
-            if self._eval_candidates or self._recover_evals:
-                self.wake()
+            logger.error("Dispatch failed runner_id=%r error_type=%s", runner_id, type(exc).__name__)
+            session.request_close(1011)
+        finally:
+            if runtime is not None and item is not None:
+                runtime.finish_dispatch(item, requeue=requeue)
+                runner.update_candidate(runtime, first=requeue)
+            runner.completed_during_dispatch.clear()
+            self._dispatches.pop(runner_id, None)
+            if (current := self._runners.get(runner_id)) is not None:
+                self._signal_task(current)
 
-    async def _start_evals(self, job_pks: list[int] | None = None, *,
-                           after: tuple[int, str] | None = None, limit: int | None = None) -> list[EvaluationWorkItem]:
-        assert self.evaluations is not None
-        in_flight = set(self._eval_tasks)  # 查询返回前，部分协程可能已经保存并退出。
-        items = await self.evaluations.find_missing(job_pks, after=after, limit=limit)
-        if not self._stopping:
-            for item in items:
-                if item.key not in in_flight and item.key not in self._eval_tasks:
-                    self._eval_tasks[item.key] = asyncio.create_task(self._run_eval(item), name=f"eval-{item.job_pk}")
-        return items
+    async def _dispatch_task(self, runner: RunnerWork, runtime: ExperimentRuntime, item: JobWorkItem) -> bool:
+        session = runner.session
+        claim = await self.dispatch.claim(session.identity, runtime, item, check_current=session.check_current)
+        if isinstance(claim, ActiveAssignment):
+            if claim.key.attempt_id not in runner.completed_during_dispatch:
+                runner.active = claim.key
+                if claim.cancel_reason is not None and claim.key.attempt_id != runner.cancel_ack:
+                    runner.check_cancel = True
+            return True  # 事务未领取，原 Job 仍可作为候选。
+        if not isinstance(claim, DispatchClaim):
+            self._apply_status(runner, runtime.experiment_id, claim.status)
+            return claim.requeue
+        if claim.key.attempt_id not in runner.completed_during_dispatch:
+            runner.active = claim.key
+        update = await send_dispatch(session, self.dispatch, claim, self.dispatch_timeout)
+        if update.released and runner.active == claim.key:
+            runner.active = None
+        self._apply_status(runner, runtime.experiment_id, update.status)
+        if update.requeue:
+            self._retry(runner, "task_retry")
+        return update.requeue
 
-    async def _run_eval(self, item: EvaluationWorkItem) -> None:
-        assert self.evaluations is not None
+    async def _run_cancel(self, runner: RunnerWork) -> None:
+        runner.check_cancel = False
+        session = runner.session
+        request = await self.dispatch.pending_cancel(session.identity)
+        if (request is None or request.key.attempt_id == runner.cancel_ack
+                or request.key.attempt_id in runner.completed_during_dispatch or not self._current(runner)):
+            return
+        if await send_cancel(session, request, self.dispatch_timeout, lambda: (
+            self._current(runner) and request.key.attempt_id not in runner.completed_during_dispatch
+        )):
+            runner.cancel_ack = request.key.attempt_id
+        elif self._current(runner):
+            runner.check_cancel = True
+            self._retry(runner, "cancel_retry")
+
+    def _retry(self, runner: RunnerWork, timer: str) -> None:
+        if self._current(runner):
+            def wake_runner() -> None:
+                setattr(runner, timer, None)
+                self._signal_task(runner)
+
+            setattr(runner, timer, asyncio.get_running_loop().call_later(self.retry_delay, wake_runner))
+
+    def _schedule_evals(self, runner_id: str, experiment_id: int) -> None:
+        runner = self._runners.get(runner_id)
+        if runner is None or not self._current(runner):
+            return
+        runtime = runner.runtimes.get(experiment_id)
+        if runtime is None or runtime.cancelling:
+            return
+        items, runtime.evals = runtime.evals, {}
+        for key, item in items.items():
+            if key not in self._eval_tasks:
+                self._eval_tasks[key] = asyncio.create_task(
+                    self._run_eval(runner_id, experiment_id, item), name=f"eval-{item.job_pk}")
+
+    async def _run_eval(self, runner_id: str, experiment_id: int, item: EvaluationWorkItem) -> None:
         try:
-            await self.evaluations.run(item)
+            status = await self.evaluations.run(item)
+            if (runner := self._runners.get(runner_id)) is not None:
+                async with runner.loading:
+                    if self._current(runner):
+                        self._apply_status(runner, experiment_id, status)
         except Exception as exc:
             logger.error("Eval work failed job_pk=%s error_type=%s", item.job_pk, type(exc).__name__)
         finally:
             self._eval_tasks.pop(item.key, None)
-
-    async def _can_dispatch(self, session: RunnerSession) -> bool:
-        if self._stopping or not session.can_dispatch:
-            return False
-        try:
-            await session.check_current()
-        except (APIError, RedisError, TimeoutError):
-            return False
-        return not self._stopping and session.can_dispatch
-
-    async def _dispatch_one(self, session: RunnerSession) -> None:
-        identity = session.identity
-        try:
-            async with self._capacity:
-                if await self._can_dispatch(session):
-                    await self._send_one(session)
-        except Exception as exc:
-            logger.error("Dispatch failed runner_id=%r error_type=%s", identity.runner_id, type(exc).__name__)
-        finally:
-            self._tasks.pop(identity.runner_id, None)
-
-    async def _send_one(self, session: RunnerSession) -> None:
-        identity = session.identity
-        action = await self.dispatch.next_action(identity, supports_streaming=session.supports_streaming)
-        if isinstance(action, CancelRequest):
-            await self._send_cancel(session, action)
-            return
-        self._cancel_acks.pop(session.session_id, None)
-        if action is None:
-            return
-        claim = action
-        if not await self._can_dispatch(session):
-            # 从未进入 RPC，因此可以安全释放这次预留。
-            await self.dispatch.record(identity, claim, outcome="rejected", reason="session_unavailable")
-            return
-        if not await self.dispatch.prepare_send(identity, claim):
-            return
-
-        preview_target = None
-        if claim.payload.get("stream_output"):
-            preview_target = PreviewTarget(claim.experiment_id, claim.key.job_id, claim.key.attempt_id)
-        session.set_preview_target(preview_target)
-        sent_at = datetime.now(timezone.utc)
-        try:
-            reply = await session.peer.call("jobs.dispatch", claim.payload, timeout=self.dispatch_timeout)
-        except RpcRequestTooLarge:
-            session.clear_preview_target(claim.key)
-            await self.dispatch.record(identity, claim, outcome="rejected", reason="dispatch_payload_too_large")
-            return
-        except TimeoutError:
-            outcome, reason = "unknown", "dispatch_timeout"
-        except (TransportClosed, RpcError, RpcProtocolError):
-            outcome, reason = "unknown", "dispatch_outcome_unknown"
-        except Exception as exc:
-            logger.warning("RPC dispatch failed runner_id=%r error_type=%s", identity.runner_id, type(exc).__name__)
-            outcome, reason = "unknown", "dispatch_outcome_unknown"
-        else:
-            accepted = reply.get("accepted") if isinstance(reply, dict) else None
-            reason = reply.get("reason", "dispatch_rejected") if isinstance(reply, dict) else None
-            if accepted is True and isinstance(reason, str):
-                outcome, reason = "accepted", None
-            elif accepted is False and isinstance(reason, str):
-                outcome = "rejected"
-            else:
-                outcome, reason = "unknown", "invalid_dispatch_reply"
-        if outcome != "accepted":
-            session.clear_preview_target(claim.key)
-        try:
-            changed = await self.dispatch.record(identity, claim, outcome=outcome, reason=reason, dispatched_at=sent_at)
-        except Exception:
-            if outcome == "unknown":
-                session.request_close(1011)
-            raise
-        if changed and outcome == "unknown":
-            # 触发重连对账，再给新会话派发后续 Job。
-            session.request_close(1011)
-        if changed and outcome == "rejected" and reason in RETRYABLE_REJECTIONS:
-            self._retry_after[identity.runner_id] = asyncio.get_running_loop().time() + self.retry_delay
-        if outcome == "accepted":
-            self.wake()  # 接单期间写入的取消意图可以立即处理。
-
-    async def _send_cancel(self, session: RunnerSession, request: CancelRequest) -> None:
-        if self._cancel_acks.get(session.session_id) == request.key.attempt_id:
-            return
-        if not await self._can_dispatch(session):
-            return
-        try:
-            reply = await session.peer.call("jobs.cancel", {**request.key.model_dump(), "reason": request.reason},
-                                            timeout=self.dispatch_timeout)
-        except (TimeoutError, TransportClosed, RpcError, RpcProtocolError):
-            reply = None
-        if isinstance(reply, dict):
-            if reply.get("accepted") is True:
-                self._cancel_acks[session.session_id] = request.key.attempt_id
-                return  # 最终状态由 jobs.complete 写入。
-            if reply.get("reason") == "attempt_not_found":
-                session.request_close(1011)  # 重连快照可以区分缺失尝试和已有结果。
-                return
-        self._retry_after[session.identity.runner_id] = asyncio.get_running_loop().time() + self.retry_delay

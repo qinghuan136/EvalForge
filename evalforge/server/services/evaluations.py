@@ -1,65 +1,29 @@
 """Discover and execute missing scores against the experiment's saved snapshots."""
 
-from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from pydantic import JsonValue, ValidationError
-from sqlalchemy import and_, select, tuple_
+from pydantic import ValidationError
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from evalforge.db import Database
-from evalforge.db.models import (
-    DatasetExampleRevision, Experiment, ExperimentDatasetExample, Job, JobEvaluation,
-)
+from evalforge.db.models import Experiment, Job, JobEvaluation
 from evalforge.models import EvaluationResult
 
 from ..evaluators.execution import evaluate_builtin
 from ..evaluators.input_mapping import resolve_inputs
+from ..experiment_runtime import EvaluationWorkItem
 from ..schemas.evaluators import EvaluatorSnapshot
 from .evaluation_queries import SCORABLE_EXPERIMENT_STATES, missing_evaluations
 from .experiment_lifecycle import settle_experiment
-
-@dataclass(frozen=True, slots=True)
-class EvaluationWorkItem:
-    job_pk: int
-    name: str
-    snapshot: dict[str, JsonValue]
-    context: dict[str, JsonValue]
-
-    @property
-    def key(self) -> tuple[int, str]:
-        return self.job_pk, self.name
 
 
 class EvaluationService:
     def __init__(self, database: Database):
         self.database = database
 
-    async def find_missing(self, job_pks: list[int] | None = None, *,
-                           after: tuple[int, str] | None = None, limit: int | None = None) -> list[EvaluationWorkItem]:
-        async with self.database.transaction() as db:
-            jobs, examples, revision = Job, ExperimentDatasetExample, DatasetExampleRevision
-            query = missing_evaluations(db)
-            name = query.selected_columns.name
-            query = (query.join(examples, and_(examples.experiment_id == jobs.experiment_id,
-                                               examples.dataset_example_id == jobs.dataset_example_id))
-                     .join(revision, revision.id == examples.dataset_example_revision_id)
-                     .add_columns(jobs.output, revision.input, revision.output.label("reference"), revision.metadata_)
-                     .order_by(jobs.id, name))
-            if job_pks is not None:
-                query = query.where(jobs.id.in_(job_pks))
-            if after is not None:
-                query = query.where(tuple_(jobs.id, name) > after)
-            if limit is not None:
-                query = query.limit(limit)
-            rows = (await db.execute(query)).all()
-        return [EvaluationWorkItem(row.job_pk, row.name, row.snapshot, {
-            "input": row.input, "reference": row.reference,
-            "output": (row.output or {}).get("task_output"), "metadata": row.metadata_,
-        }) for row in rows]
-
-    async def run(self, item: EvaluationWorkItem) -> None:
+    async def run(self, item: EvaluationWorkItem) -> str | None:
         started = datetime.now(timezone.utc)
         result, error = EvaluationResult(), None
         try:
@@ -72,10 +36,10 @@ class EvaluationService:
                 result, error = await evaluate_builtin(snapshot.evaluator_key, inputs)
             except TimeoutError:
                 error = "评分执行超时"
-        await self._save(item, result, error, started)
+        return await self._save(item, result, error, started)
 
     async def _save(self, item: EvaluationWorkItem, result: EvaluationResult, error: str | None,
-                    started: datetime) -> None:
+                    started: datetime) -> str | None:
         async with self.database.transaction() as db:
             # 与 Task 完成一致，先锁 Job，再锁 Experiment。取消以实验状态为准。
             job = await db.get(Job, item.job_pk, with_for_update=True)
@@ -91,4 +55,10 @@ class EvaluationService:
                 label=result.label, score=result.score, explanation=result.explanation, error=error,
                 start_time=started, end_time=datetime.now(timezone.utc),
             ).on_conflict_do_nothing(index_elements=[table.c.experiment_run_id, table.c.name]))
-            await settle_experiment(db, experiment)
+            if experiment.status == "completed":
+                # A late Task result can add more than one score without reopening the experiment.
+                if await db.scalar(select(missing_evaluations(db).where(Job.experiment_id == experiment.id).exists())):
+                    return None
+            else:
+                await settle_experiment(db, experiment)
+            return experiment.status

@@ -12,6 +12,7 @@ from evalforge.db.models import Dataset, DatasetExample, DatasetExampleRevision,
 from evalforge.server.runner_auth import RunnerIdentity
 from evalforge.server.runner_connections import RegisteredConnection, RunnerConnections
 from evalforge.server.services.dispatch import DispatchClaim, DispatchService
+from evalforge.server.services.runtime_loader import RuntimeLoader
 
 URL = "/api/v1/datasets/import"
 
@@ -66,6 +67,85 @@ class DatasetImportAPITests(APITestCase):
             self.assertEqual(rows[0].metadata_, {"category": "地理"})
             self.assertEqual(rows[1].output, {"answer": ""})
 
+    async def test_dataset_reads_are_owner_scoped_and_page_stably(self):
+        path = "/api/v1/datasets"
+        first = (await self.upload('{"input":{}}', name="first")).json()
+        other = self.new_client()
+        await self.register("bob", other)
+        await self.login(other, username="bob")
+        foreign = (await self.upload('{"input":{}}', name="foreign", client=other)).json()
+        async with self.database.transaction() as db:
+            original = await db.get(Dataset, first["dataset_id"])
+            empty = Dataset(name="empty", user_id=original.user_id, created_at=original.created_at,
+                            metadata_={"tags": ["demo"]})
+            db.add(empty)
+            await db.flush()
+            empty_id = empty.id
+
+        self.client.headers.pop("X-CSRF-Token")
+        for page, expected in [(1, empty_id), (2, first["dataset_id"])]:
+            response = await self.client.get(path, params={"page": page, "pagesize": 1})
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(response.headers["cache-control"], "no-store")
+            self.assertEqual(response.json()["total"], 2)
+            item, = response.json()["items"]
+            self.assertEqual(item["dataset_id"], expected)
+            self.assertEqual(item["latest_version_id"], None if page == 1 else first["dataset_version_id"])
+            self.assertNotIn("metadata", item)
+            self.assertTrue(item["created_at"].endswith("Z"))
+
+        for suffix in ("", "/examples"):
+            self.assert_error(await self.client.get(f"{path}/{foreign['dataset_id']}{suffix}"),
+                              404, "dataset_not_found")
+        for suffix in ("", f"/{empty_id}", f"/{empty_id}/examples"):
+            self.assert_error(await self.new_client().get(path + suffix), 401, "not_authenticated")
+        self.assert_error(await self.client.get(path, params={"pagesize": 101}), 422, "invalid_request")
+        self.assert_error(await self.client.get(f"{path}/{empty_id}/examples", params={"version_id": 0}),
+                          422, "invalid_request")
+        self.assert_error(await self.client.get(f"{path}/{empty_id}/examples",
+                                               params={"version_id": foreign["dataset_version_id"]}),
+                          404, "dataset_version_not_found")
+        empty_detail = (await self.client.get(f"{path}/{empty_id}")).json()
+        self.assertEqual((empty_detail["example_count"], empty_detail["metadata"]), (0, {"tags": ["demo"]}))
+        self.assertEqual((await self.client.get(f"{path}/{empty_id}/examples")).json(), {
+            "dataset_id": empty_id, "dataset_version_id": None, "items": [], "total": 0, "page": 1, "pagesize": 20,
+        })
+
+    async def test_dataset_examples_use_latest_revision_at_selected_version(self):
+        created = (await self.upload('\n'.join(json.dumps({
+            "input": {"n": n}, "output": {"answer": n}, "metadata": {"tag": "original"},
+        }) for n in (1, 2, 3)))).json()
+        dataset_id, v1 = created["dataset_id"], created["dataset_version_id"]
+        async with self.database.transaction() as db:
+            first, second, third = (await db.scalars(select(DatasetExample.id)
+                .where(DatasetExample.dataset_id == dataset_id).order_by(DatasetExample.id))).all()
+            v2 = DatasetVersion(dataset_id=dataset_id)
+            db.add(v2)
+            await db.flush()
+            v2_id = v2.id
+            db.add_all([
+                DatasetExampleRevision(dataset_version_id=v2_id, dataset_example_id=first,
+                                       revision_kind="PATCH", input={"n": 10}, output={"answer": 10},
+                                       metadata_={"tag": "patched"}),
+                DatasetExampleRevision(dataset_version_id=v2_id, dataset_example_id=second,
+                                       revision_kind="DELETE", input={}, output={}),
+            ])
+
+        path = f"/api/v1/datasets/{dataset_id}"
+        detail = (await self.client.get(path)).json()
+        self.assertEqual((detail["latest_version_id"], detail["example_count"]), (v2_id, 2))
+        old = (await self.client.get(path + "/examples", params={"version_id": v1})).json()
+        self.assertEqual((old["dataset_version_id"], old["total"]), (v1, 3))
+        self.assertEqual([item["example_id"] for item in old["items"]], [first, second, third])
+        self.assertEqual(old["items"][0]["input"], {"n": 1})
+        latest = (await self.client.get(path + "/examples", params={"pagesize": 1})).json()
+        self.assertEqual((latest["dataset_version_id"], latest["total"]), (v2_id, 2))
+        self.assertEqual(latest["items"], [{
+            "example_id": first, "input": {"n": 10}, "output": {"answer": 10}, "metadata": {"tag": "patched"},
+        }])
+        next_page = (await self.client.get(path + "/examples", params={"page": 2, "pagesize": 1})).json()
+        self.assertEqual([item["example_id"] for item in next_page["items"]], [third])
+
     async def test_jsonl_preserves_nested_objects_through_experiment_dispatch(self):
         sample = {"input": {"messages": [{"role": "user", "content": "你好"}], "max_tokens": 10, "verbose": False},
                   "output": {"answer": "你好", "citations": [{"source": 1}]},
@@ -94,7 +174,9 @@ class DatasetImportAPITests(APITestCase):
         self.assertEqual(experiment.status_code, 201, experiment.text)
         self.assertEqual(experiment.json()["progress"]["queued"], 2)
         identity = RunnerIdentity(runner.runner_id, owner.id, 1, datetime.max.replace(tzinfo=timezone.utc), b"")
-        claim = await DispatchService(self.database).next_action(identity)
+        snapshot = await RuntimeLoader(self.database).load(identity)
+        runtime = snapshot.experiments[experiment.json()["experiment_id"]]
+        claim = await DispatchService(self.database).claim(identity, runtime, runtime.reserve_task())
         self.assertIsInstance(claim, DispatchClaim)
         self.assertEqual(claim.payload["input"], sample["input"])
         self.assertNotIn("output", claim.payload)
