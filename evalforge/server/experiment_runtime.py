@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 from pydantic import JsonValue, ValidationError
 
+from .experiment_events import JobPreview
 from .schemas.experiments import ExecutionConfig
 
 
@@ -38,6 +39,25 @@ class ExperimentRuntime:
     inflight: set[int] = field(default_factory=set, init=False)
     tasks: OrderedDict[int, JobWorkItem] = field(default_factory=OrderedDict, init=False, repr=False)
     evals: dict[tuple[int, str], EvaluationWorkItem] = field(default_factory=dict, init=False, repr=False)
+    previews: dict[str, JobPreview] = field(default_factory=dict, init=False, repr=False)
+    _previews_closed: bool = field(default=False, init=False, repr=False)
+
+    def open_preview(self, job_id: str, attempt_id: str) -> JobPreview | None:
+        if self._previews_closed:
+            return None
+        self.close_preview(job_id)
+        preview = self.previews[job_id] = JobPreview(job_id, attempt_id)
+        return preview
+
+    def close_preview(self, job_id: str, *, completed: bool = False) -> None:
+        if (preview := self.previews.pop(job_id, None)) is not None:
+            preview.close(completed=completed)
+
+    def close_previews(self) -> None:
+        self._previews_closed = True
+        for preview in self.previews.values():
+            preview.close()
+        self.previews.clear()
 
     @classmethod
     def from_saved(cls, experiment_id: int, config: dict, status: str) -> "ExperimentRuntime":

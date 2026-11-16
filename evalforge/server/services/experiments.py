@@ -239,6 +239,18 @@ class ExperimentService:
             items = [JobSummary(**_job_summary(row, len(names), row.completed, row.errors)) for row in rows]
             return JobPage(items=items, page=page, pagesize=pagesize, total=total)
 
+    async def job_preview_state(self, owner_id: int, experiment_id: int, job_id: str) -> tuple[str, str | None]:
+        async with self.database.transaction() as db:
+            row = (await db.execute(select(Job.status, Experiment.execution_config)
+                .join(Experiment, Experiment.id == Job.experiment_id)
+                .where(Job.job_id == job_id, Experiment.id == experiment_id, Experiment.user_id == owner_id)
+            )).one_or_none()
+        if row is None:
+            raise APIError(404, "job_not_found", "Job 不存在")
+        status, config = row
+        runner_id = config.get("runner_id")
+        return status, runner_id if config.get("stream_output") is True and isinstance(runner_id, str) else None
+
     async def get_job(self, owner_id: int, experiment_id: int, job_id: str) -> JobDetail:
         async with self.database.transaction() as db:
             names = _evaluator_names(await _owned_execution_config(db, owner_id, experiment_id))

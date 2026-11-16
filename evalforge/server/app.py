@@ -12,11 +12,11 @@ from evalforge.redis import RedisSettings, RedisStore
 
 from .config import ServerSettings
 from .errors import install_handlers
-from .experiment_events import ExperimentEventStore
 from .routes.auth import router as auth_router
 from .routes.datasets import router as datasets_router
 from .routes.evaluators import router as evaluators_router
 from .routes.experiments import router as experiments_router
+from .routes.internal_routing import router as internal_routing_router
 from .routes.runners import router as runners_router
 from .routes.runner_ws import router as runner_ws_router
 from .rpc import JsonRpcPeer
@@ -50,6 +50,7 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
             if redis is None:
                 store = await resources.enter_async_context(RedisStore(RedisSettings.from_env()))
                 redis = store.client
+            app.state.database = db
             app.state.sessions = SessionStore(redis, config.session_ttl_seconds)
             passwords = Passwords()
             await passwords.initialize()
@@ -58,11 +59,11 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
             app.state.runners = RunnerService(db, connections, config.runner_websocket_url)
             app.state.runner_auth = RunnerAuth(db, redis)
             attempts = AttemptService(db)
-            app.state.experiment_events = ExperimentEventStore(redis)
             app.state.runner_sessions = RunnerSessionManager(
-                connections, attempts, runner_auth=app.state.runner_auth, event_store=app.state.experiment_events)
+                connections, attempts, runner_auth=app.state.runner_auth)
             resources.push_async_callback(app.state.runner_sessions.close)
             scheduler = Scheduler(DispatchService(db), RuntimeLoader(db), EvaluationService(db))
+            app.state.scheduler = scheduler
             app.state.runner_sessions.on_ready = scheduler.session_ready
             app.state.runner_sessions.on_closed = scheduler.session_closed
             app.state.runner_sessions.on_complete = scheduler.task_completed
@@ -95,6 +96,7 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
     app.include_router(datasets_router)
     app.include_router(evaluators_router)
     app.include_router(experiments_router)
+    app.include_router(internal_routing_router)
     app.include_router(runners_router)
     app.include_router(runner_ws_router)
     return app

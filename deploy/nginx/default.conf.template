@@ -1,0 +1,130 @@
+# Docker's embedded DNS tracks service addresses after a container is replaced.
+resolver 127.0.0.11 valid=5s ipv6=off;
+resolver_timeout 2s;
+
+upstream cloud_pool {
+    zone cloud_pool 64k;
+    server cloud-a:8000 resolve;
+    server cloud-b:8000 resolve;
+}
+
+upstream cloud_a {
+    zone cloud_a 64k;
+    server cloud-a:8000 resolve;
+}
+
+upstream cloud_b {
+    zone cloud_b 64k;
+    server cloud-b:8000 resolve;
+}
+
+map $evalforge_route_id $evalforge_target {
+    default "";
+    cloud-a cloud_a;
+    cloud-b cloud_b;
+}
+
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    "" close;
+}
+
+log_format evalforge '$remote_addr "$request" $status uri=$uri upstream=$upstream_addr '
+                     'upstream_status=$upstream_status route=$evalforge_route_id';
+
+server {
+    listen 443 ssl;
+    server_name _;
+    ssl_certificate /etc/nginx/tls/fullchain.pem;
+    ssl_certificate_key /etc/nginx/tls/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    root /usr/share/nginx/html;
+    access_log /dev/stdout evalforge;
+    log_subrequest on;
+    client_max_body_size 6m;
+
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_connect_timeout 3s;
+
+    location = /api/v1/runner/ws {
+        proxy_pass http://cloud_pool;
+        proxy_read_timeout 75s;
+    }
+
+    location ~ "^/api/v1/runners/[a-zA-Z0-9_-]{1,128}/datasets/[1-9][0-9]{0,9}/experiments$" {
+        if ($request_method != POST) {
+            return 405;
+        }
+        set $evalforge_original_path $uri;
+        auth_request /internal/runner-route;
+        auth_request_set $evalforge_route_id $upstream_http_x_evalforge_cloud_route_id;
+
+        error_page 403 = @runner_not_routable;
+        error_page 500 502 504 = @runner_route_unavailable;
+        proxy_next_upstream off;
+        proxy_pass http://$evalforge_target;
+    }
+
+    location ~ "^/api/v1/experiments/[1-9][0-9]{0,9}/jobs/[a-zA-Z0-9_-]{1,128}/events$" {
+        if ($request_method != GET) {
+            return 405;
+        }
+        set $evalforge_original_path $uri;
+        auth_request /internal/runner-route;
+        auth_request_set $evalforge_route_id $upstream_http_x_evalforge_cloud_route_id;
+
+        error_page 403 = @runner_not_routable;
+        error_page 500 502 504 = @runner_route_unavailable;
+        proxy_next_upstream off;
+        proxy_buffering off;
+        proxy_read_timeout 60s;
+        proxy_pass http://$evalforge_target;
+    }
+
+    location = /internal/runner-route {
+        internal;
+        proxy_method GET;
+        proxy_pass_request_body off;
+        proxy_pass_request_headers off;
+        proxy_read_timeout 6s;
+        proxy_set_header Host $http_host;
+        proxy_set_header Content-Length "";
+        proxy_set_header X-Original-Path $evalforge_original_path;
+        proxy_set_header X-EvalForge-Route-Token "${EVALFORGE_INTERNAL_ROUTE_TOKEN}";
+        proxy_pass http://cloud_pool;
+    }
+
+    location ^~ /internal/ {
+        return 404;
+    }
+
+    location @runner_not_routable {
+        default_type application/json;
+        add_header Cache-Control no-store always;
+        return 403 '{"error":{"code":"runner_not_routable","message":"Runner 尚未就绪，请确认连接后重试。"}}';
+    }
+
+    location @runner_route_unavailable {
+        default_type application/json;
+        add_header Cache-Control no-store always;
+        return 503 '{"error":{"code":"runner_route_unavailable","message":"Runner 归属暂时无法确认，请稍后重试。"}}';
+    }
+
+    location /api/ {
+        proxy_pass http://cloud_pool;
+    }
+
+    location /assets/ {
+        try_files $uri =404;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+}

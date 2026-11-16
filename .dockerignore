@@ -1,0 +1,11 @@
+.git
+.venv
+**/.venv
+**/__pycache__
+**/*.egg-info
+**/node_modules
+**/dist
+**/.env
+**/.env.*
+deploy/tls
+results

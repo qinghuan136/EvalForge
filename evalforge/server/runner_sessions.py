@@ -14,7 +14,8 @@ from redis.exceptions import RedisError
 
 from .config import ServerSettings
 from .errors import APIError
-from .experiment_events import ExperimentEventStore, PreviewTarget
+from .experiment_events import JobPreview
+from .experiment_runtime import ExperimentRuntime
 from .rpc import JsonRpcPeer, RpcError
 from .runner_auth import RunnerAuth, RunnerIdentity
 from .runner_connections import RegisteredConnection, RunnerConnections
@@ -90,8 +91,7 @@ class RunnerSession:
         self._stop: asyncio.Future[int] = asyncio.get_running_loop().create_future()
         self._registration_attempted = False
         self._registration: SessionRegistration | None = None
-        self._preview_target: PreviewTarget | None = None
-        self._publishing_preview = False
+        self._preview_target: tuple[ExperimentRuntime, JobPreview] | None = None
 
     @property
     def phase(self) -> SessionState:
@@ -139,7 +139,7 @@ class RunnerSession:
         # 只投递停止信号；phase 的修改仍由唯一管理协程负责。
         if not self._stop.done():
             self._stop.set_result(code)
-            self._preview_target = None
+            self._close_preview()
 
     @property
     def close_code(self) -> int:
@@ -203,12 +203,23 @@ class RunnerSession:
     async def complete(self, **params) -> dict:
         return await self._attempt_request("jobs.complete", AttemptResult, params)
 
-    def set_preview_target(self, target: PreviewTarget | None) -> None:
-        self._preview_target = target if self.can_dispatch and self.supports_streaming else None
+    def set_preview_target(self, runtime: ExperimentRuntime, key: AttemptKey) -> None:
+        self._close_preview()
+        if self.can_dispatch and self.supports_streaming:
+            if (preview := runtime.open_preview(key.job_id, key.attempt_id)) is not None:
+                self._preview_target = runtime, preview
 
-    def clear_preview_target(self, key: AttemptKey) -> None:
-        if self._preview_target is not None and self._preview_target.key == (key.job_id, key.attempt_id):
-            self._preview_target = None
+    def _close_preview(self, *, completed: bool = False) -> None:
+        target, self._preview_target = self._preview_target, None
+        if target is not None:
+            runtime, preview = target
+            job_id, _ = preview.key
+            if runtime.previews.get(job_id) is preview:
+                runtime.close_preview(job_id, completed=completed)
+
+    def clear_preview_target(self, key: AttemptKey, *, completed: bool = False) -> None:
+        if self._preview_target is not None and self._preview_target[1].key == (key.job_id, key.attempt_id):
+            self._close_preview(completed=completed)
 
     async def output_chunk(self, **params) -> None:
         """预览不进入业务队列，也不等待 started 或查询当前会话。"""
@@ -216,18 +227,10 @@ class RunnerSession:
             batch = OutputPreviewBatch.model_validate(params)
         except ValidationError:
             raise RpcError(-32602, "Invalid output preview params") from None
-        target, store = self._preview_target, self.manager.event_store
-        if (target is None or target.key != (batch.job_id, batch.attempt_id)
-                or store is None or not self.can_dispatch or self._publishing_preview):
-            return
-        # 一个会话最多有一批在写 Redis。慢写时丢预览，不占满 RPC handler 等待席位。
-        self._publishing_preview = True
-        try:
-            await self.storage(store.append_preview(target, batch.chunks))
-        except (RedisError, TimeoutError) as exc:
-            logger.debug("Preview unavailable session_id=%r error_type=%s", self.session_id, type(exc).__name__)
-        finally:
-            self._publishing_preview = False
+        if self._preview_target is not None and self.can_dispatch:
+            _, preview = self._preview_target
+            if preview.key == (batch.job_id, batch.attempt_id):
+                preview.append(batch.chunks)
 
     async def _handle_attempt(self, event: AttemptReceived) -> dict:
         """RPC 业务入口：单消费者串行修改同步事实，数据库异常在这里收口。"""
@@ -267,7 +270,7 @@ class RunnerSession:
                     await service.started(self.identity, params)
                 else:
                     completion = await service.complete(self.identity, params)
-                    self.clear_preview_target(params)
+                    self.clear_preview_target(params, completed=True)
                     if self.manager.on_complete is not None:
                         await self.manager.on_complete(self, params, completion)
                 await self.check_current()
@@ -294,6 +297,7 @@ class RunnerSession:
             raise RpcError(-32001, "Hello already completed") from None
         record = SessionRegistration(
             session_id=self.session_id, phase=self.phase.value, cloud_instance_id=self.manager.instance_id,
+            cloud_route_id=self.settings.cloud_route_id,
             owner_user_id=self.identity.owner_user_id, credential_id=self.identity.credential_id,
             client_version=event.params.version, capabilities=event.params.capabilities,
             max_concurrent_jobs=event.params.max_concurrent_jobs, connected_at=self.connected_at,
@@ -438,11 +442,10 @@ class RunnerSession:
 
 class RunnerSessionManager:
     def __init__(self, connections: RunnerConnections, attempts: AttemptService | None = None, *,
-                 runner_auth: RunnerAuth, event_store: ExperimentEventStore | None = None):
+                 runner_auth: RunnerAuth):
         self.connections = connections
         self.attempts = attempts
         self.runner_auth = runner_auth
-        self.event_store = event_store
         self.on_ready: Callable[[RunnerSession], Awaitable[None]] | None = None
         self.on_closed: Callable[[RunnerSession], None] | None = None
         self.on_complete: Callable[[RunnerSession, AttemptKey, AttemptCompletion | None], Awaitable[None]] | None = None

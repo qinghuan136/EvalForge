@@ -60,6 +60,7 @@ class RunnerSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["owner_user_id"], 1)
         self.assertEqual(record["credential_id"], 7)
         self.assertEqual(record["cloud_instance_id"], self.manager.instance_id)
+        self.assertIsNone((await self.connections.read_current(self.identity.runner_id)).cloud_route_id)
         self.assertEqual(record["capabilities"], ["http_json"])
         self.assertNotIn("token", record)
         self.assertGreater(await self.redis.pttl(self.key), 0)
@@ -222,16 +223,28 @@ class RunnerSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.connections.compare_delete(self.identity.runner_id, old.session_id))
 
     async def test_cross_instance_takeover_is_detected_by_idle_renewal(self):
-        old = self.session()
+        old = self.session(cloud_route_id="cloud-a")
         await self.hello(old)
+        current = await self.connections.read_current(self.identity.runner_id)
+        self.assertEqual((current.cloud_route_id, current.cloud_instance_id, current.session_id),
+                         ("cloud-a", self.manager.instance_id, old.session_id))
         other_manager = self.new_manager()
-        new = self.session(other_manager)
+        new = self.session(other_manager, cloud_route_id="cloud-b")
         await self.hello(new)
         await asyncio.wait_for(old.task, 0.5)
         self.assertEqual(old.close_code, 1008)
         self.assertTrue(await self.connections.is_current(self.identity.runner_id, new.session_id))
         await self.manager.close()
-        self.assertTrue(await self.connections.is_current(self.identity.runner_id, new.session_id))
+        current = await self.connections.read_current(self.identity.runner_id)
+        self.assertEqual((current.cloud_route_id, current.cloud_instance_id, current.session_id),
+                         ("cloud-b", other_manager.instance_id, new.session_id))
+
+    async def test_read_current_accepts_registration_without_instance_or_route_id(self):
+        await self.redis.set(self.key, '{"session_id":"legacy","phase":"ready"}', ex=60)
+        current = await self.connections.read_current(self.identity.runner_id)
+        self.assertEqual(current.session_id, "legacy")
+        self.assertIsNone(current.cloud_instance_id)
+        self.assertIsNone(current.cloud_route_id)
 
     async def test_delayed_registration_reply_cannot_stop_the_latest_of_three_connections(self):
         first, second, third = self.session(), self.session(), self.session()
@@ -416,10 +429,19 @@ class RunnerSessionConfigTests(unittest.TestCase):
                                      "EVALFORGE_RUNNER_SESSION_TTL_SECONDS": "30",
                                      "EVALFORGE_RUNNER_SESSION_HEARTBEAT_SECONDS": "4",
                                      "EVALFORGE_RUNNER_SESSION_OPERATION_TIMEOUT_SECONDS": "1",
-                                     "EVALFORGE_RUNNER_SESSION_QUEUE_SIZE": "4"}, clear=True):
+                                     "EVALFORGE_RUNNER_SESSION_QUEUE_SIZE": "4",
+                                     "EVALFORGE_CLOUD_ROUTE_ID": "cloud-a"}, clear=True):
             settings = ServerSettings.from_env("nonexistent-runner-session-test.env")
         self.assertEqual(settings.runner_hello_timeout_seconds, 2)
         self.assertEqual(settings.runner_session_ttl_seconds, 30)
         self.assertEqual(settings.runner_session_heartbeat_seconds, 4)
         self.assertEqual(settings.runner_session_operation_timeout_seconds, 1)
         self.assertEqual(settings.runner_session_queue_size, 4)
+        self.assertEqual(settings.cloud_route_id, "cloud-a")
+
+    def test_cloud_route_id_validation(self):
+        with patch.dict(os.environ, {"EVALFORGE_CLOUD_ROUTE_ID": ""}, clear=True):
+            self.assertIsNone(ServerSettings.from_env("nonexistent-runner-session-test.env").cloud_route_id)
+        for route_id in ("Cloud-A", "-cloud", "cloud a", "http://cloud-a", "a" * 64):
+            with self.subTest(route_id=route_id), self.assertRaisesRegex(ValueError, "EVALFORGE_CLOUD_ROUTE_ID"):
+                ServerSettings(cloud_route_id=route_id)

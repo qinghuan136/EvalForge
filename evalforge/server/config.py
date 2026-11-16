@@ -1,12 +1,15 @@
 """HTTP 会话配置；数据库与 Redis 配置继续使用各自基础设施。"""
 
-import os
 import math
-from dataclasses import dataclass
+import os
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from dotenv import dotenv_values
+
+CLOUD_ROUTE_ID_PATTERN = r"^[a-z0-9][a-z0-9-]{0,62}$"
 
 
 def origin_of(value: str) -> str:
@@ -40,8 +43,17 @@ class ServerSettings:
     runner_session_ttl_seconds: int = 60
     runner_session_operation_timeout_seconds: float = 5
     runner_session_queue_size: int = 32
+    cloud_route_id: str | None = None
+    internal_route_token: str | None = field(default=None, repr=False)
 
     def __post_init__(self):
+        if self.cloud_route_id is not None and (
+            not isinstance(self.cloud_route_id, str) or not re.fullmatch(CLOUD_ROUTE_ID_PATTERN, self.cloud_route_id)
+        ):
+            raise ValueError(
+                "EVALFORGE_CLOUD_ROUTE_ID must be 1–63 lowercase letters, digits or hyphens, "
+                "starting with a letter or digit"
+            )
         if not self.allowed_origins or type(self.cookie_secure) is not bool:
             raise ValueError("Configure explicit HTTP origins and a boolean cookie_secure")
         for value in self.allowed_origins:
@@ -101,4 +113,6 @@ class ServerSettings:
             runner_session_heartbeat_seconds=heartbeat_interval,
             runner_hello_timeout_seconds=hello_timeout, runner_session_ttl_seconds=runner_ttl,
             runner_session_operation_timeout_seconds=operation_timeout, runner_session_queue_size=queue_size,
+            cloud_route_id=values.get("EVALFORGE_CLOUD_ROUTE_ID") or None,
+            internal_route_token=values.get("EVALFORGE_INTERNAL_ROUTE_TOKEN") or None,
         )

@@ -12,6 +12,7 @@ Python 3.11+。V0 离线实验执行仅使用标准库，无需启动 Phoenix、
 登录鉴权与 Runner 管理接口约定见 [接口文档](docs/api/登录鉴权与Runner管理.md)。
 云端支持 [CSV / JSONL 数据集导入](docs/api/数据集导入.md)，导入后可直接用返回的数据集和版本 ID 创建实验。
 实验创建、列表和详情已实现。创建时固定版本快照并生成待执行 Job，进程级 Scheduler 会自动派发给已就绪且有空闲容量的指定 Runner。见 [实验接口](docs/api/实验创建与查询.md)和 [当前架构](docs/当前项目架构图解.md#10-进程级调度)。
+云端可以用 Docker Compose 部署 Nginx 和两个独立后端实例，见 [云端部署](deploy/README.md)。
 
 独立的本地客户端位于 [client/](client/README.md)，已实现 WebSocket 传输、双向 JSON-RPC 和本地 SQLite 存储基础层，
 单独安装依赖。已接通会话同步、单 Job HTTP 执行、结果持久化与确认上报，见 [Job 执行链路](docs/client/Job执行层核心链路.md)。

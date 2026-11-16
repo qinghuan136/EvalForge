@@ -1,8 +1,10 @@
 """实验 API 契约：版本快照、创建事务、归属、分页及 Job 进度。"""
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from unittest.mock import patch
 
+from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import delete, event, func, select, update
 from sqlalchemy.exc import OperationalError
 
@@ -464,6 +466,73 @@ class ExperimentAPITests(APITestCase):
         self.assertEqual((await self.client.post(path)).json(), result)
         async with self.database.transaction() as db:
             self.assertEqual(await db.scalar(select(func.count()).select_from(RunnerAttempt)), 0)
+
+    async def test_job_events_authorization_queued_and_terminal_responses(self):
+        created = await self.create_experiment()
+        base = created.headers["location"]
+        jobs = (await self.client.get(base + "/jobs")).json()["items"]
+        path = f"{base}/jobs/{jobs[0]['job_id']}/events"
+        self.assert_error(await self.new_client().get(path), 401, "not_authenticated")
+        other = self.new_client()
+        await self.register("bob", other)
+        await self.login(other, username="bob")
+        self.assert_error(await other.get(path), 404, "job_not_found")
+        self.assertEqual((await self.client.get(path)).status_code, 204)
+        self.assertEqual((await self.client.post(base + "/cancel")).status_code, 200)
+        finished = await self.client.get(path)
+        self.assertEqual(finished.status_code, 200)
+        self.assertEqual(finished.text, 'event: done\ndata: {"status":"cancelled"}\n\n')
+
+    async def test_routed_create_rejects_remote_session_without_another_ownership_lookup(self):
+        path = f"/api/v1/runners/{self.runner_id}/datasets/{self.dataset_id}/experiments"
+        await self.connections.register(self.runner_id, RegisteredConnection(
+            session_id="remote", phase="ready", capabilities=["http_json"], cloud_route_id="cloud-b",
+        ), 60)
+        with patch.object(RunnerConnections, "read_current") as read_current:
+            self.assert_error(await self.client.post(path, json=self.payload()), 503, "runner_not_ready_here")
+            self.app.state.settings = replace(self.config, internal_route_token="proxy-test-token")
+            self.assert_error(await self.client.post(self.path, json=self.payload()), 503, "runner_not_ready_here")
+            mismatched = self.payload(execution_config={"runner_id": "different", "agent_target_id": "order-agent"})
+            self.assert_error(await self.client.post(path, json=mismatched), 422, "runner_id_mismatch")
+            read_current.assert_not_called()
+        async with self.database.transaction() as db:
+            self.assertEqual(await db.scalar(select(func.count()).select_from(Experiment)), 0)
+
+    async def test_internal_runner_lookup_routes_create_and_events_only(self):
+        created = await self.create_experiment()
+        base = created.headers["location"]
+        creation_path = f"/api/v1/runners/{self.runner_id}/datasets/{self.dataset_id}/experiments"
+        internal = "/internal/runner-route"
+        client = self.new_client()
+
+        async def lookup(path, token="proxy-test-token"):
+            return await client.get(internal, headers={"X-Original-Path": path, "X-EvalForge-Route-Token": token})
+
+        self.assert_error(await lookup(creation_path), 403, "route_lookup_forbidden")
+        self.app.state.settings = replace(self.config, internal_route_token="proxy-test-token")
+        with patch.object(RunnerConnections, "read_current") as read_current:
+            self.assert_error(await lookup(creation_path, "wrong"), 403, "route_lookup_forbidden")
+            for path in [base, base + "/cancel", base + "/jobs", self.path]:
+                self.assert_error(await lookup(path), 403, "route_path_unsupported")
+            self.assert_error(await lookup("/api/v1/experiments/2147483647/jobs/job/events"), 403, "runner_route_missing")
+            read_current.assert_not_called()
+        self.assert_error(await lookup(creation_path), 403, "runner_not_ready")
+        record = RegisteredConnection(session_id="on-a", phase="ready", capabilities=["http_json"])
+        await self.connections.register(self.runner_id, record, 60)
+        self.assert_error(await lookup(creation_path), 503, "runner_route_unavailable")
+        await self.connections.register(self.runner_id, record.model_copy(update={"cloud_route_id": "cloud-a"}), 60)
+        for path in [creation_path, base + "/jobs/job/events"]:
+            result = await lookup(path)
+            self.assertEqual(result.status_code, 204, result.text)
+            self.assertEqual(result.headers["X-EvalForge-Cloud-Route-Id"], "cloud-a")
+        with patch.object(self.redis, "pipeline", side_effect=RedisConnectionError):
+            self.assert_error(await lookup(creation_path), 503, "runner_session_unavailable")
+        await self.redis.delete(RUNNER_SESSION_PREFIX + self.runner_id)
+        self.assert_error(await lookup(creation_path), 403, "runner_offline")
+        with patch.object(RunnerConnections, "read_current") as read_current:
+            cancelled = await self.client.post(base + "/cancel")
+            self.assertEqual((cancelled.status_code, cancelled.json()["status"]), (200, "cancelled"))
+            read_current.assert_not_called()
 
     async def test_request_validation_rejects_reserved_fields_invalid_ids_and_nonfinite_numbers(self):
         for changes in ({"status": "running"}, {"user_id": self.owner_id}, {"dataset_id": self.dataset_id},

@@ -131,7 +131,7 @@
 
 - 每个 Attempt 的 `seq` 从 1 递增。通知没有 `id` 和 ACK，首批可以早于 `jobs.started`；断线或缓冲满时可能缺片，预览不补传。
 - 每批 1–16 片，序号严格递增，单片文本最多 2,048 字符。
-- Cloud 只接收当前连接在派发时登记的流式 Attempt。通知只更新 Redis 预览并向实验频道发布，执行状态和最终输出仍由 `jobs.started` 和 `jobs.complete` 更新。
+- Cloud 只接收当前连接在派发时登记的流式 Attempt。通知更新本进程的 Job 预览缓冲，供浏览器 SSE 读取。执行状态和最终输出仍由 `jobs.started` 和 `jobs.complete` 更新。
 
 ## 3. 状态与可靠性
 

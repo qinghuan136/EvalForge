@@ -5,6 +5,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 import logging
 
+from .experiment_events import JobPreview
 from .experiment_runtime import EvaluationWorkItem, ExperimentRuntime, JobWorkItem
 from .runner_dispatch import send_cancel, send_dispatch
 from .runner_sessions import RunnerSession
@@ -83,6 +84,17 @@ class Scheduler:
         return (not self._stopping and runner.session.can_dispatch
                 and self._runners.get(runner.session.identity.runner_id) is runner)
 
+    def has_ready_runner(self, runner_id: str, owner_id: int) -> bool:
+        runner = self._runners.get(runner_id)
+        return (runner is not None and runner.ready and runner.session.identity.owner_user_id == owner_id
+                and self._current(runner))
+
+    def job_preview(self, runner_id: str, owner_id: int, experiment_id: int, job_id: str) -> JobPreview | None:
+        if not self.has_ready_runner(runner_id, owner_id):
+            return None
+        runtime = self._runners[runner_id].runtimes.get(experiment_id)
+        return runtime.previews.get(job_id) if runtime is not None else None
+
     async def session_ready(self, session: RunnerSession) -> None:
         if self._stopping or not session.can_dispatch:
             return
@@ -112,7 +124,8 @@ class Scheduler:
             return
         self._runners.pop(runner_id)
         self._task_ready.pop(runner_id, None)
-        for experiment_id in runner.runtimes:
+        for experiment_id, runtime in runner.runtimes.items():
+            runtime.close_previews()
             self._eval_ready.pop((runner_id, experiment_id), None)
         for timer in (runner.task_retry, runner.cancel_retry):
             if timer is not None:
@@ -196,6 +209,7 @@ class Scheduler:
             runtime.cancel()
         elif status not in ACTIVE_EXPERIMENTS:
             runtime.cancel()
+            runtime.close_previews()
             runner.runtimes.pop(experiment_id)
             self._eval_ready.pop((runner.session.identity.runner_id, experiment_id), None)
         runner.update_candidate(runtime)
@@ -278,7 +292,7 @@ class Scheduler:
             return claim.requeue
         if claim.key.attempt_id not in runner.completed_during_dispatch:
             runner.active = claim.key
-        update = await send_dispatch(session, self.dispatch, claim, self.dispatch_timeout)
+        update = await send_dispatch(session, self.dispatch, claim, self.dispatch_timeout, runtime)
         if update.released and runner.active == claim.key:
             runner.active = None
         self._apply_status(runner, runtime.experiment_id, update.status)

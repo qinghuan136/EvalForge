@@ -7,7 +7,7 @@ import logging
 from redis.exceptions import RedisError
 
 from .errors import APIError
-from .experiment_events import PreviewTarget
+from .experiment_runtime import ExperimentRuntime
 from .rpc import RpcError, RpcProtocolError, RpcRequestTooLarge
 from .runner_sessions import RunnerSession
 from .services.dispatch import CancelRequest, DispatchClaim, DispatchService, DispatchUpdate
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 async def send_dispatch(session: RunnerSession, service: DispatchService, claim: DispatchClaim,
-                        timeout: float) -> DispatchUpdate:
+                        timeout: float, runtime: ExperimentRuntime) -> DispatchUpdate:
     identity = session.identity
     if not session.can_dispatch:
         return await service.record(identity, claim, outcome="rejected", reason="session_unavailable")
@@ -30,10 +30,8 @@ async def send_dispatch(session: RunnerSession, service: DispatchService, claim:
         return skipped
     if not session.can_dispatch:
         return await service.record(identity, claim, outcome="rejected", reason="session_unavailable")
-    target = None
     if claim.payload.get("stream_output"):
-        target = PreviewTarget(claim.experiment_id, claim.key.job_id, claim.key.attempt_id)
-    session.set_preview_target(target)
+        session.set_preview_target(runtime, claim.key)
     sent_at = datetime.now(timezone.utc)
     try:
         reply = await session.peer.call("jobs.dispatch", claim.payload, timeout=timeout)

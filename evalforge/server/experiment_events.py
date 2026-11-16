@@ -1,106 +1,100 @@
-"""跨实例预览 Hub：短期 Redis 快照与即时通知。"""
+"""Job 预览的进程内缓冲与 SSE 生成器。"""
 
+import asyncio
 import json
+from collections import deque
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
-
-from redis.asyncio import Redis
 
 from .schemas.output_preview import OutputChunk
 
-PREVIEW_TTL_SECONDS = 600
 PREVIEW_MAX_BYTES = 256 * 1024
-PREVIEW_MAX_CHUNKS = 1024
-
-# 每个片段单独存为 hash 字段，追加时不搬运此前累积的文本。
-# 先更新快照，再发布去重后的整批；订阅者可用 last_seq 衔接两者。
-_APPEND_PREVIEW = """
-local key = KEYS[1]
-local old = redis.call('HMGET', key, 'last_seq', 'bytes', 'count', 'has_gap', 'truncated')
-local last_seq = tonumber(old[1]) or 0
-local stored_bytes = tonumber(old[2]) or 0
-local stored_count = tonumber(old[3]) or 0
-local has_gap = old[4] == '1'
-local truncated = old[5] == '1'
-local chunks = cjson.decode(ARGV[1])
-local new_chunks = {}
-local fields = {}
-local max_bytes, max_chunks = tonumber(ARGV[2]), tonumber(ARGV[3])
-for _, chunk in ipairs(chunks) do
-    if chunk.seq > last_seq then
-        has_gap = has_gap or chunk.seq ~= last_seq + 1
-        last_seq = chunk.seq
-        local size = string.len(chunk.text)
-        if not truncated and stored_bytes + size <= max_bytes and stored_count < max_chunks then
-            fields[#fields + 1] = 'chunk:' .. tostring(chunk.seq)
-            fields[#fields + 1] = chunk.text
-            stored_bytes = stored_bytes + size
-            stored_count = stored_count + 1
-        else
-            truncated = true
-        end
-        new_chunks[#new_chunks + 1] = chunk
-    end
-end
-if #new_chunks == 0 then return 0 end
-if #fields > 0 then redis.call('HSET', key, unpack(fields)) end
-redis.call('HSET', key, 'last_seq', last_seq, 'bytes', stored_bytes, 'count', stored_count,
-           'has_gap', has_gap and '1' or '0', 'truncated', truncated and '1' or '0')
-redis.call('EXPIRE', key, ARGV[4])
-redis.call('PUBLISH', ARGV[5], cjson.encode({
-    kind = 'job.output_chunk', experiment_id = ARGV[6],
-    job_id = ARGV[7], attempt_id = ARGV[8], chunks = new_chunks,
-    last_seq = last_seq, has_gap = has_gap, truncated = truncated
-}))
-return #new_chunks
-"""
+PREVIEW_MAX_SEGMENTS = 1024
+PREVIEW_SEGMENT_BYTES = 8 * 1024
+HEARTBEAT_SECONDS = 15
 
 
-@dataclass(frozen=True, slots=True)
-class PreviewTarget:
-    experiment_id: int
-    job_id: str
-    attempt_id: str
-
-    @property
-    def key(self) -> tuple[str, str]:
-        return self.job_id, self.attempt_id
-
-
-@dataclass(frozen=True, slots=True)
-class PreviewSnapshot:
-    chunks: tuple[OutputChunk, ...] = field(repr=False)
+@dataclass(slots=True)
+class PreviewSegment:
+    first_seq: int
     last_seq: int
-    has_gap: bool
-    truncated: bool
+    text: bytearray = field(repr=False)
 
 
-class ExperimentEventStore:
-    def __init__(self, redis: Redis):
-        self.redis = redis
-        self._append = redis.register_script(_APPEND_PREVIEW)
+def event_frame(event: str, data: dict) -> str:
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {payload}\n\n"
 
-    @staticmethod
-    def channel(experiment_id: int) -> str:
-        return f"evalforge:experiment:{experiment_id}:events"
 
-    @staticmethod
-    def _snapshot_key(target: PreviewTarget) -> str:
-        pair = json.dumps(target.key, separators=(",", ":"))
-        return f"evalforge:experiment:{target.experiment_id}:preview:{pair}"
+class JobPreview:
+    def __init__(self, job_id: str, attempt_id: str) -> None:
+        self.key = job_id, attempt_id
+        self._segments: deque[PreviewSegment] = deque()
+        self._head = self._tail = self._last_seq = 0
+        self._has_gap = False
+        self._changed = asyncio.Event()
+        self._end: str | None = None
 
-    async def append_preview(self, target: PreviewTarget, chunks: list[OutputChunk]) -> None:
-        encoded = json.dumps([chunk.model_dump() for chunk in chunks], ensure_ascii=False, separators=(",", ":"))
-        await self._append(keys=[self._snapshot_key(target)], args=[
-            encoded, PREVIEW_MAX_BYTES, PREVIEW_MAX_CHUNKS, PREVIEW_TTL_SECONDS,
-            self.channel(target.experiment_id), target.experiment_id, *target.key,
-        ])
+    def append(self, chunks: Sequence[OutputChunk]) -> None:
+        if self._end is not None:
+            return
+        previous_tail = self._tail
+        for chunk in chunks:
+            if chunk.seq <= self._last_seq:
+                continue
+            contiguous = chunk.seq == self._last_seq + 1
+            self._has_gap |= not contiguous
+            self._last_seq = chunk.seq
+            encoded = chunk.text.encode("utf-8")
+            last = self._segments[-1] if self._segments else None
+            if last is not None and contiguous and len(last.text) + len(encoded) <= PREVIEW_SEGMENT_BYTES:
+                last.text.extend(encoded)
+                last.last_seq = chunk.seq
+            else:
+                self._segments.append(PreviewSegment(chunk.seq, chunk.seq, bytearray(encoded)))
+            self._tail += len(encoded)
+        if self._tail == previous_tail:
+            return
+        while self._tail - self._head > PREVIEW_MAX_BYTES or len(self._segments) > PREVIEW_MAX_SEGMENTS:
+            self._head += len(self._segments.popleft().text)
+        # 每次写入唤醒所有旧读者。读者取到信号后，即使还没 await，也不会漏掉写入。
+        self._changed.set()
+        self._changed = asyncio.Event()
 
-    async def read_preview(self, target: PreviewTarget) -> PreviewSnapshot | None:
-        """读取一个 Attempt 已收到的预览；Redis 客户端使用 decode_responses。"""
-        fields = await self.redis.hgetall(self._snapshot_key(target))
-        if not fields:
-            return None
-        chunks = (OutputChunk(seq=int(name[6:]), text=text) for name, text in fields.items()
-                  if name.startswith("chunk:"))
-        return PreviewSnapshot(tuple(sorted(chunks, key=lambda chunk: chunk.seq)), int(fields["last_seq"]),
-                               fields["has_gap"] == "1", fields["truncated"] == "1")
+    def close(self, *, completed: bool = False) -> None:
+        if self._end is None:
+            self._end = "done" if completed else "interrupted"
+            self._segments.clear()
+            self._changed.set()
+
+    def _text_from(self, cursor: int) -> str:
+        offset = cursor - self._head
+        parts = []
+        for segment in self._segments:
+            size = len(segment.text)
+            if offset < size:
+                parts.append(memoryview(segment.text)[offset:])
+                offset = 0
+            else:
+                offset -= size
+        return b"".join(parts).decode("utf-8")
+
+    async def events(self) -> AsyncIterator[str]:
+        cursor = None
+        while self._end is None:
+            changed = self._changed
+            reset = cursor is None or cursor < self._head
+            if reset or cursor < self._tail:
+                text = self._text_from(self._head if reset else cursor)
+                cursor = self._tail
+                yield event_frame("snapshot" if reset else "delta", {
+                    "attempt_id": self.key[1], "text": text,
+                    "truncated": self._head > 0, "has_gap": self._has_gap,
+                })
+            else:
+                try:
+                    await asyncio.wait_for(changed.wait(), HEARTBEAT_SECONDS)
+                except TimeoutError:
+                    if self._end is None:
+                        yield ": keepalive\n\n"
+        yield event_frame(self._end, {})

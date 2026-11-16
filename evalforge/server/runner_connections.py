@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field, ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+from .config import CLOUD_ROUTE_ID_PATTERN
 from .errors import APIError
 from .runner_auth import RUNNER_AUTH_CACHE_PREFIX
 from .schemas.runners import RunnerConnection
@@ -35,6 +36,8 @@ class RegisteredConnection(BaseModel):
     session_id: str = Field(min_length=1)
     phase: Literal["connected", "syncing", "ready"]
     capabilities: list[str] = Field(default_factory=list, max_length=32)
+    cloud_instance_id: str | None = Field(default=None, min_length=1)
+    cloud_route_id: str | None = Field(default=None, pattern=CLOUD_ROUTE_ID_PATTERN)
 
 
 class RunnerConnections:

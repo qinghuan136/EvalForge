@@ -8,11 +8,13 @@ import socket
 import ssl
 import sys
 import tempfile
+from contextlib import AsyncExitStack
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import httpx
 import uvicorn
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -31,7 +33,6 @@ from evalforge.db.models import (
     RunnerCredential, User,
 )
 from evalforge.server.errors import APIError
-from evalforge.server.experiment_events import PreviewTarget
 from evalforge.server.runner_auth import RUNNER_AUTH_CACHE_PREFIX
 
 
@@ -206,23 +207,38 @@ class RunnerWebSocketTests(APITestCase):
         async with self.connection() as ws:
             capabilities = ["http_json", "http_sse"] if stream_output else ["http_json"]
             hello = await self.hello(ws, capabilities=capabilities)
-            response = await self.client.post(f"/api/v1/datasets/{dataset_id}/experiments", json={
+            create_path = f"/api/v1/datasets/{dataset_id}/experiments"
+            payload = {
                 "name": "dispatch", "repetitions": 2, "dataset_version_id": versions[0],
                 "execution_config": {"runner_id": self.runner_id, "agent_target_id": "agent",
                                      "timeout_seconds": 12, "stream_output": stream_output},
-            })
+            }
+            if stream_output:
+                create_path = f"/api/v1/runners/{self.runner_id}/datasets/{dataset_id}/experiments"
+                rejected = await self.client.post(create_path, json=payload)
+                self.assertEqual((rejected.status_code, rejected.json()["error"]["code"]),
+                                 (503, "runner_not_ready_here"))
+                await send(ws, "runner.sync", {"runner_id": self.runner_id, "active_jobs": [], "pending_results": []})
+                self.assertEqual((await recv(ws))["result"], {"jobs": []})
+                await send(ws, "runner.ready", {"session_id": hello["session_id"]})
+                self.assertEqual((await recv(ws))["result"]["status"], "ready")
+
+            response = await self.client.post(create_path, json=payload)
             self.assertEqual(response.status_code, 201, response.text)
             url = response.headers["location"]
             experiment_id = response.json()["experiment_id"]
             self.assertEqual(response.json()["progress"]["queued"], 2)
-            await send(ws, "runner.sync", {"runner_id": self.runner_id, "active_jobs": [], "pending_results": []})
-            self.assertEqual((await recv(ws))["result"], {"jobs": []})
-            self.assertEqual((await self.client.get(url)).json()["progress"]["queued"], 2)
-            await send(ws, "runner.ready", {"session_id": hello["session_id"]})
-            ready, dispatch = await recv(ws), await recv(ws)
-            if dispatch["id"] == "runner.ready":
-                ready, dispatch = dispatch, ready
-            self.assertEqual(ready["result"]["status"], "ready")
+            if stream_output:
+                dispatch = await recv(ws)
+            else:
+                await send(ws, "runner.sync", {"runner_id": self.runner_id, "active_jobs": [], "pending_results": []})
+                self.assertEqual((await recv(ws))["result"], {"jobs": []})
+                self.assertEqual((await self.client.get(url)).json()["progress"]["queued"], 2)
+                await send(ws, "runner.ready", {"session_id": hello["session_id"]})
+                ready, dispatch = await recv(ws), await recv(ws)
+                if dispatch["id"] == "runner.ready":
+                    ready, dispatch = dispatch, ready
+                self.assertEqual(ready["result"]["status"], "ready")
 
             for repetition in (1, 2):
                 self.assertEqual(dispatch["method"], "jobs.dispatch")
@@ -238,21 +254,39 @@ class RunnerWebSocketTests(APITestCase):
                     attempt = await db.scalar(select(RunnerAttempt).where(RunnerAttempt.attempt_id == key[1]))
                     self.assertEqual((job.repetition_number, job.status, attempt.status), (repetition, "assigned", "assigned"))
                     self.assertEqual(attempt.dispatch_json, payload)
-                if stream_output:
-                    # 首片在 accepted / started / complete 之前到达，仍应有正确的坐标和快照。
-                    chunks = [{"seq": 1, "text": "订单"}, {"seq": 2, "text": "已完成 🧪"}]
-                    await ws.send(json.dumps({"jsonrpc": "2.0", "method": "jobs.output_chunk", "params": {
-                        "job_id": key[0], "attempt_id": key[1], "chunks": chunks,
-                    }}))
-                    store = self.app.state.experiment_events
-                    target = PreviewTarget(experiment_id, *key)
-                    async with asyncio.timeout(2):
-                        while (snapshot := await store.read_preview(target)) is None:
-                            await asyncio.sleep(0.01)
-                    self.assertEqual([chunk.model_dump() for chunk in snapshot.chunks], chunks)
-                # 模拟 Agent 先于接单响应完成；迟到的 accepted 不得回退终态。
-                await send(ws, "jobs.complete", result_params(key))
-                self.assertEqual((await recv(ws))["result"], {"acknowledged": True})
+                async with AsyncExitStack() as stack:
+                    if stream_output:
+                        base = f"https://localhost:{self.listener.getsockname()[1]}"
+                        browser = await stack.enter_async_context(httpx.AsyncClient(
+                            base_url=base, verify=self.ssl, trust_env=False, timeout=4,
+                            cookies={self.config.cookie_name: self.client.cookies.get(self.config.cookie_name)},
+                        ))
+                        events_url = f"{url}/jobs/{key[0]}/events"
+                        stream = await stack.enter_async_context(browser.stream("GET", events_url))
+                        self.assertEqual(stream.status_code, 200)
+                        self.assertEqual(stream.headers["x-accel-buffering"], "no")
+                        lines = stream.aiter_lines()
+                        self.assertEqual(await anext(lines), "event: snapshot")
+                        self.assertEqual(json.loads((await anext(lines))[6:])["text"], "")
+                        self.assertEqual(await anext(lines), "")
+                        # 首片在 accepted / started 之前也能实时到达。
+                        chunks = [{"seq": 1, "text": "订单"}, {"seq": 2, "text": "已完成 🧪"}]
+                        await ws.send(json.dumps({"jsonrpc": "2.0", "method": "jobs.output_chunk", "params": {
+                            "job_id": key[0], "attempt_id": key[1], "chunks": chunks,
+                        }}))
+                        self.assertEqual(await anext(lines), "event: delta")
+                        self.assertEqual(json.loads((await anext(lines))[6:])["text"], "订单已完成 🧪")
+                        self.assertEqual(await anext(lines), "")
+                    # 模拟 Agent 先于接单响应完成；迟到的 accepted 不得回退终态。
+                    await send(ws, "jobs.complete", result_params(key))
+                    self.assertEqual((await recv(ws))["result"], {"acknowledged": True})
+                    if stream_output:
+                        self.assertEqual(await anext(lines), "event: done")
+                        finished = await self.client.get(events_url)
+                        self.assertIn('"status":"succeeded"', finished.text)
+                        self.assertIsNone(self.app.state.scheduler.job_preview(
+                            self.runner_id, owner.id, experiment_id, key[0],
+                        ))
                 await ws.send(json.dumps({"jsonrpc": "2.0", "id": dispatch["id"], "result": {"accepted": True}}))
                 if repetition == 1:
                     dispatch = await recv(ws)

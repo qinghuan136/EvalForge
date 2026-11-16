@@ -1,0 +1,103 @@
+x-cloud: &cloud
+  image: ${EVALFORGE_CLOUD_IMAGE:-evalforge-cloud:local}
+  environment: &cloud-env
+    EVALFORGE_DATABASE_URL: postgresql+asyncpg://evalforge:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the Compose env file}@postgres:5432/evalforge
+    EVALFORGE_REDIS_URL: redis://redis:6379/0
+    EVALFORGE_ALLOWED_ORIGINS: ${EVALFORGE_ALLOWED_ORIGINS:?Set the public HTTPS origin}
+    EVALFORGE_RUNNER_WS_URL: ${EVALFORGE_RUNNER_WS_URL:?Set the public WSS URL}
+    EVALFORGE_INTERNAL_ROUTE_TOKEN: ${EVALFORGE_INTERNAL_ROUTE_TOKEN:?Set the proxy lookup token}
+  networks: [edge, data]
+
+x-cloud-worker: &cloud-worker
+  <<: *cloud
+  pull_policy: never
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), 2).close()"]
+    interval: 5s
+    timeout: 3s
+    retries: 12
+
+services:
+  nginx:
+    build:
+      context: .
+      dockerfile: deploy/nginx/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${EVALFORGE_HTTPS_BIND:-0.0.0.0}:${EVALFORGE_HTTPS_PORT:-443}:443"
+    environment:
+      NGINX_ENVSUBST_FILTER: "^EVALFORGE_INTERNAL_ROUTE_TOKEN$$"
+      EVALFORGE_INTERNAL_ROUTE_TOKEN: ${EVALFORGE_INTERNAL_ROUTE_TOKEN:?Set the proxy lookup token}
+    volumes:
+      - type: bind
+        source: ${EVALFORGE_TLS_DIR:?Set the directory containing fullchain.pem and privkey.pem}
+        target: /etc/nginx/tls
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [edge]
+    healthcheck:
+      test: ["CMD", "curl", "-fkSs", "-o", "/dev/null", "https://127.0.0.1/"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    depends_on:
+      cloud-a:
+        condition: service_healthy
+      cloud-b:
+        condition: service_healthy
+
+  cloud-a:
+    <<: *cloud-worker
+    build:
+      context: .
+      dockerfile: deploy/cloud/Dockerfile
+    environment:
+      <<: *cloud-env
+      EVALFORGE_CLOUD_ROUTE_ID: cloud-a
+
+  cloud-b:
+    <<: *cloud-worker
+    environment:
+      <<: *cloud-env
+      EVALFORGE_CLOUD_ROUTE_ID: cloud-b
+
+  postgres:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: evalforge
+      POSTGRES_USER: evalforge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the Compose env file}
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    networks: [data]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "evalforge", "-d", "evalforge"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    networks: [data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+networks:
+  edge:
+  data:
+    internal: true
+
+volumes:
+  postgres-data:

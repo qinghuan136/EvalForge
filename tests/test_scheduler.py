@@ -44,8 +44,8 @@ class Session:
     async def check_current(self):
         pass
 
-    def set_preview_target(self, target):
-        self.preview_target = target
+    def set_preview_target(self, runtime, key):
+        self.preview_target = runtime.open_preview(key.job_id, key.attempt_id)
 
     def clear_preview_target(self, key):
         if self.preview_target is not None and self.preview_target.key == (key.job_id, key.attempt_id):

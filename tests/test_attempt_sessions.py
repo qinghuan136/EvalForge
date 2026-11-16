@@ -6,16 +6,16 @@ from unittest.mock import AsyncMock, patch
 from dataclasses import replace
 
 import fakeredis.aioredis
-from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy.exc import OperationalError
 
 from attempt_support import result_params
 from evalforge.server.config import ServerSettings
-from evalforge.server.experiment_events import PreviewTarget
+from evalforge.server.experiment_runtime import ExperimentRuntime
 from evalforge.server.rpc import RpcError
 from evalforge.server.runner_auth import RunnerIdentity
 from evalforge.server.runner_connections import RUNNER_SESSION_PREFIX, RunnerConnections
 from evalforge.server.runner_sessions import RunnerSessionManager
+from evalforge.server.schemas.attempts import AttemptKey
 from evalforge.server.session_state_machine import SessionState
 from evalforge.server.ws_transport import TransportClosed
 
@@ -42,39 +42,32 @@ class AttemptSessionTests(unittest.IsolatedAsyncioTestCase):
         return await session.hello(runner_id="runner", version="0.1", capabilities=capabilities or [],
                                    max_concurrent_jobs=1)
 
-    async def test_preview_only_accepts_its_attempt_and_slow_redis_does_not_block_completion(self):
-        store = self.manager.event_store = AsyncMock()
-        entered, release = asyncio.Event(), asyncio.Event()
-
-        async def slow_append(*args):
-            entered.set()
-            await release.wait()
-            raise RedisConnectionError("private address")
-
-        store.append_preview.side_effect = slow_append
-        target = PreviewTarget(42, "job", "attempt")
+    async def test_preview_only_accepts_its_attempt_and_closes_after_successful_commit(self):
+        runtime = ExperimentRuntime(42, None)
         chunks = [{"seq": 1, "text": "first"}]
         await self.hello(capabilities=["http_json", "http_sse"])
         await self.sync()
         await self.session.ready(session_id=self.session.session_id)
-        self.session.set_preview_target(target)
+        self.session.set_preview_target(runtime, AttemptKey(job_id="job", attempt_id="attempt"))
+        preview = runtime.previews["job"]
+        stream = preview.events()
         await self.session.output_chunk(job_id="job", attempt_id="another", chunks=chunks)
-        store.append_preview.assert_not_awaited()
+        self.assertIn('"text":""', await anext(stream))
 
         with patch.object(self.manager.connections, "is_current", wraps=self.manager.connections.is_current) as check:
-            task = asyncio.create_task(self.session.output_chunk(job_id="job", attempt_id="attempt", chunks=chunks))
-            try:
-                await asyncio.wait_for(entered.wait(), 1)
-                await self.session.output_chunk(job_id="job", attempt_id="attempt",
-                                                chunks=[{"seq": 2, "text": "during write"}])
-                check.assert_not_awaited()
-                self.assertEqual(await asyncio.wait_for(self.session.complete(**self.result), 1),
-                                 {"acknowledged": True})
-            finally:
-                release.set()
-                await task
-        await self.session.output_chunk(job_id="job", attempt_id="attempt", chunks=chunks)
-        store.append_preview.assert_awaited_once()
+            await self.session.output_chunk(job_id="job", attempt_id="attempt", chunks=chunks)
+            self.assertIn('"text":"first"', await asyncio.wait_for(anext(stream), 1))
+            check.assert_not_awaited()
+        self.service.complete.side_effect = RuntimeError("write failed")
+        with self.assertRaises(RpcError):
+            await self.session.complete(**self.result)
+        self.assertIs(runtime.previews["job"], preview)
+        self.service.complete.side_effect = None
+        self.assertEqual(await self.session.complete(**self.result), {"acknowledged": True})
+        self.assertEqual(runtime.previews, {})
+        self.assertEqual(await anext(stream), "event: done\ndata: {}\n\n")
+        with self.assertRaises(StopAsyncIteration):
+            await anext(stream)
 
     async def sync(self, pending=False, active=False):
         return await self.session.sync(runner_id="runner", active_jobs=[{
