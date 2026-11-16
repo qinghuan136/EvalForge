@@ -1,4 +1,25 @@
 {
+  "assistant_sessions": {
+    "id": false,
+    "user_id": false,
+    "title": false,
+    "version": false,
+    "active_run_id": true,
+    "lease_expires_at": true,
+    "created_at": false,
+    "updated_at": false
+  },
+  "assistant_messages": {
+    "id": false,
+    "session_id": false,
+    "role": false,
+    "content": false,
+    "status": false,
+    "model_provider": true,
+    "model_name": true,
+    "created_at": false,
+    "updated_at": false
+  },
   "users": {
     "id": false,
     "username": false,

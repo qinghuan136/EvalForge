@@ -45,8 +45,26 @@ class ServerSettings:
     runner_session_queue_size: int = 32
     cloud_route_id: str | None = None
     internal_route_token: str | None = field(default=None, repr=False)
+    assistant_models: tuple[str, ...] = ()
+    assistant_api_key: str | None = field(default=None, repr=False)
+    assistant_base_url: str | None = None
+    assistant_timeout_seconds: int = 90
+    assistant_lease_seconds: int = 45
+    assistant_heartbeat_seconds: int = 10
 
     def __post_init__(self):
+        if len(set(self.assistant_models)) != len(self.assistant_models) or any(
+            not name.strip() or len(name) > 200 for name in self.assistant_models
+        ):
+            raise ValueError("Configure unique nonblank assistant model names")
+        if not (0 < self.assistant_heartbeat_seconds < self.assistant_lease_seconds
+                and self.assistant_timeout_seconds > 0):
+            raise ValueError("Invalid assistant timing; heartbeat must be shorter than the lease")
+        if self.assistant_base_url is not None:
+            origin_of(self.assistant_base_url)
+            url = urlsplit(self.assistant_base_url)
+            if url.query or url.fragment:
+                raise ValueError("Assistant model URL cannot include a query or fragment")
         if self.cloud_route_id is not None and (
             not isinstance(self.cloud_route_id, str) or not re.fullmatch(CLOUD_ROUTE_ID_PATTERN, self.cloud_route_id)
         ):
@@ -115,4 +133,12 @@ class ServerSettings:
             runner_session_operation_timeout_seconds=operation_timeout, runner_session_queue_size=queue_size,
             cloud_route_id=values.get("EVALFORGE_CLOUD_ROUTE_ID") or None,
             internal_route_token=values.get("EVALFORGE_INTERNAL_ROUTE_TOKEN") or None,
+            assistant_models=tuple(
+                name.strip() for name in (values.get("EVALFORGE_ASSISTANT_MODELS") or "").split(",") if name.strip()
+            ),
+            assistant_api_key=values.get("EVALFORGE_ASSISTANT_API_KEY") or None,
+            assistant_base_url=values.get("EVALFORGE_ASSISTANT_BASE_URL") or None,
+            assistant_timeout_seconds=int(values.get("EVALFORGE_ASSISTANT_TIMEOUT_SECONDS", "90")),
+            assistant_lease_seconds=int(values.get("EVALFORGE_ASSISTANT_LEASE_SECONDS", "45")),
+            assistant_heartbeat_seconds=int(values.get("EVALFORGE_ASSISTANT_HEARTBEAT_SECONDS", "10")),
         )

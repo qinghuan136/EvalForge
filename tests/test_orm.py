@@ -43,7 +43,7 @@ class SchemaContractTests(unittest.TestCase):
                     ("experiments", "user_id"): "SET NULL",
                 }.get((table.name, foreign_key.parent.name), "CASCADE")
                 self.assertEqual(foreign_key.ondelete, expected)
-        self.assertEqual(len(Base.metadata.sorted_tables), 21)
+        self.assertEqual(len(Base.metadata.sorted_tables), 23)
         for name in ("spans", "prompts", "projects", "sandbox_configs", "languages"):
             self.assertNotIn(name, Base.metadata.tables)
         self.assertEqual(Dataset.__table__.c.user_id.info["deferred_foreign_key"]["target"], "users.id")

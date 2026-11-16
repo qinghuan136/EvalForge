@@ -4,6 +4,7 @@ import { Link, useLocation, useParams, useSearchParams } from 'react-router'
 import { privateKey } from '../../app/queryClient'
 import { Dialog } from '../../components/ui/Dialog'
 import { errorMessage } from '../../lib/api'
+import { AskAssistantButton } from '../assistant/AskAssistantButton'
 import { DatasetDetail } from '../datasets/DatasetsPage'
 import { cancelExperiment, getExperiment, getJob, getJobs, processed, statusLabels } from './api'
 import { JobOutputPreview } from './JobOutputPreview'
@@ -24,6 +25,7 @@ function JobDialog({ userId, experimentId, jobId, running, streamOutput, onClose
     {job.isError ? <><p className="error-message" role="alert">{errorMessage(job.error)}</p><button className="button" onClick={() => void job.refetch()}>重试</button></> : null}
     {job.data ? <>
       <p>样本 #{job.data.example_id}，第 {job.data.repetition_number} 次，{statusLabels[job.data.status] ?? job.data.status}</p>
+      <div><AskAssistantButton pageContext={{ type: 'job', experiment_id: experimentId, job_id: jobId }} /></div>
       {streamOutput && (job.data.status === 'assigned' || job.data.status === 'running') ?
         <JobOutputPreview key={jobId} userId={userId} experimentId={experimentId} jobId={jobId} /> : null}
       <dl className="detail-list">
@@ -43,7 +45,13 @@ function JobDialog({ userId, experimentId, jobId, running, streamOutput, onClose
 export function ExperimentDetail({ userId }: { userId: number }) {
   const { experimentId } = useParams()
   const id = Number(experimentId)
-  const validId = /^[1-9]\d*$/.test(experimentId ?? '') && id <= 2147483647
+  if (!/^[1-9]\d*$/.test(experimentId ?? '') || id > 2147483647) {
+    return <p className="error-message">实验 ID 无效。</p>
+  }
+  return <ExperimentDetailPage key={id} userId={userId} id={id} />
+}
+
+function ExperimentDetailPage({ userId, id }: { userId: number; id: number }) {
   const [params, setParams] = useSearchParams()
   const location = useLocation()
   const [jobId, setJobId] = useState<string | null>(null)
@@ -52,7 +60,7 @@ export function ExperimentDetail({ userId }: { userId: number }) {
   const client = useQueryClient()
   const detail = useQuery({
     queryKey: [...privateKey, userId, 'experiment', id],
-    queryFn: ({ signal }) => getExperiment(id, signal), enabled: validId,
+    queryFn: ({ signal }) => getExperiment(id, signal),
     refetchInterval: (query) => active(query.state.data?.status) ? 4000 : false,
   })
   const rawStatus = params.get('status') ?? ''
@@ -61,7 +69,7 @@ export function ExperimentDetail({ userId }: { userId: number }) {
   const page = rawPage && /^[1-9]\d*$/.test(rawPage) && Number(rawPage) <= 2147483647 ? Number(rawPage) : 1
   const jobs = useQuery({
     queryKey: [...privateKey, userId, 'jobs', id, page, status],
-    queryFn: ({ signal }) => getJobs(id, page, status, signal), enabled: validId && !!detail.data,
+    queryFn: ({ signal }) => getJobs(id, page, status, signal), enabled: !!detail.data,
     refetchInterval: active(detail.data?.status) ? 4000 : false,
   })
   useEffect(() => {
@@ -89,7 +97,6 @@ export function ExperimentDetail({ userId }: { userId: number }) {
   }
   const back = (location.state as { returnTo?: string } | null)?.returnTo
   const returnTo = back?.startsWith('/experiments?') ? back : item ? `/experiments?dataset=${item.dataset_id}` : '/experiments'
-  if (!validId) return <p className="error-message">实验 ID 无效。</p>
   return <>
     <header className="page-heading"><h1>{item?.name ?? '实验详情'}</h1>{item ? <p>EXP-{item.experiment_id}　数据集 #{item.dataset_id}　版本 #{item.dataset_version_id}　{statusLabels[item.status] ?? item.status}</p> : null}<Link className="button page-action" to={returnTo}>返回实验</Link></header>
     {detail.isPending ? <p role="status">正在加载实验…</p> : null}
@@ -98,6 +105,7 @@ export function ExperimentDetail({ userId }: { userId: number }) {
       <div className="experiment-overview">
         <section className="detail-panel"><h2>执行进度</h2><p className="progress-number">{processed(item.progress)} / {item.progress.job_count}</p><p className="muted">个 Job 已处理</p>
           <dl className="detail-list">{jobStatuses.map((status) => <div key={status}><dt>{statusLabels[status]}</dt><dd>{item.progress[status as keyof typeof item.progress] as number}</dd></div>)}</dl>
+          <AskAssistantButton />
           {item.status === 'pending' || item.status === 'running' ? confirm ? <div className="dialog-actions"><span>将停止剩余任务。</span><button className="button" onClick={() => setConfirm(false)} disabled={cancel.isPending}>保留实验</button><button className="button danger" onClick={() => cancel.mutate()} disabled={cancel.isPending}>确认取消</button></div> : <button className="button" onClick={() => setConfirm(true)}>取消实验</button> : null}
           {cancel.error ? <p className="error-message" role="alert">{errorMessage(cancel.error)}</p> : null}
         </section>

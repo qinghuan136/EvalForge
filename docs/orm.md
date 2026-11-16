@@ -1,7 +1,7 @@
 # 核心 ORM
 
-基于 Phoenix commit `14c193cfa`，按云端 + 轻客户端方案调整；当前 21 张表、183 个字段，含停用后保留的旧配置表，以及身份与凭证表。
-这里定义存储结构；尚未连接 PostgreSQL、执行建表或把 V0 Runner 接入数据库。
+基于 Phoenix commit `14c193cfa`，按云端 + 轻客户端方案调整；当前 23 张表，含停用后保留的旧配置表、身份与凭证表，以及评测助手的会话和消息表。
+本页介绍存储结构；应用启动不自动建表，部署方式见 [数据库说明](database.md)。
 
 ## 代码入口
 
@@ -12,6 +12,7 @@
 | `evalforge/db/orm/experiments.py` | Experiment、样本快照关联、Job、JobEvaluation |
 | `evalforge/db/orm/attempts.py` | 云端 Attempt、完整派发/结果快照、活动容量约束 |
 | `evalforge/db/orm/auth.py` | User、Runner、RunnerCredential；字段和 ER 图见 [鉴权数据结构](auth-schema.md) |
+| `evalforge/db/orm/assistant.py` | 助手会话、消息与执行租约；字段和 ER 图见 [Agent 会话与消息表设计](Agent会话与消息表设计.md) |
 | `evalforge/db/orm/evaluators.py` | 评分器公共定义、三个子类型、源码版本、数据集使用配置 |
 | `evalforge/db/orm/experiment_configs.py` | 旧 ExperimentConfig 已停用；保留 Prompt、EVAL_ONLY 和原评分关联的表与外键 |
 | `evalforge/db/models.py` | 统一导入和注册入口，Alembic 由此获得完整 metadata |
@@ -104,7 +105,7 @@ users 为真实账号模型，不是占位表；未创建 Trace、Prompt、沙�
 模型专项测试使用内存 SQLite 真正执行建表、写入、查询和约束失败；另行编译全部 PostgreSQL DDL，验证 JSONB、时区字段及复合外键。
 这些不替代真实 PostgreSQL 集成测试。
 
-21 张表、183 个字段与字典契约一致；SQLite 验证唯一约束、身份引用、默认有效期及历史保护，PostgreSQL DDL 验证 JSONB、BYTEA、时间类型及部分索引。Runner 接口验证见 [Runner 管理](server-runners.md)。
+23 张表与 ORM 契约一致；SQLite 验证唯一约束、身份引用、默认有效期及历史保护，PostgreSQL DDL 验证 JSONB、BYTEA、时间类型及部分索引。Runner 接口验证见 [Runner 管理](server-runners.md)。
 临时从活动索引移除 unknown 后，容量测试按预期失败；恢复源码后完整测试通过。数据字典的字段名和可空性已逐表核对，编译检查及 git diff --check 通过。
 
 实例就绪后生成迁移：

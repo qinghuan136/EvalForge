@@ -1,6 +1,6 @@
 # PostgreSQL 基础设施
 
-已具备连接能力和 21 张表的 ORM 定义（含停用保留的旧配置）；身份与凭证设计见 [鉴权数据结构](auth-schema.md)。当前不启动 PostgreSQL、不执行实际建表，不改变现有 V0 实验执行流程。
+已具备连接能力和 23 张表的 ORM 定义（含停用保留的旧配置）；身份与凭证设计见 [鉴权数据结构](auth-schema.md)。应用启动时不自动建表。
 
 ## 已提供的组件
 
@@ -45,7 +45,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m alembic heads
 ```
 
-当前没有业务迁移，`alembic heads` 无版本输出是正常情况。
+当前仓库迁移头为 `20261116_assistant`。
 
 ## 有实例后
 
@@ -83,14 +83,8 @@ Engine 和连接池应在同一个事件循环内使用并关闭，不要跨多�
 
 ## ORM 与后续建表
 
-18 张表的 ORM 已实现，统一从 `evalforge/db/models.py` 导入；现有 `evalforge/models.py` 继续保留 dataclass 契约。
-模型分组、继承和暂缓的外部外键见 [ORM 说明](orm.md)。Alembic 已能加载完整 metadata，在有连接的开发数据库上生成迁移：
-
-```powershell
-.\.venv\Scripts\python.exe -m alembic revision --autogenerate -m "create core tables"
-# 检查生成的脚本后执行
-.\.venv\Scripts\python.exe -m alembic upgrade head
-```
+ORM 统一从 `evalforge/db/models.py` 导入；`evalforge/models.py` 继续保留 dataclass 契约。模型分组和外部外键见 [ORM 说明](orm.md)。
+助手迁移基于已有核心表；已有库升级及新建开发库步骤见 [评测助手接入](assistant.md#启用)。
 
 目前没有自动启动迁移，也没有把 Phoenix 全套业务表或迁移搬入。
 实例未配置时，只能验证配置、驱动加载、会话管理及离线迁移；真实连接和数据库事务读写待实例就绪后验证。

@@ -6,6 +6,8 @@ WORKDIR /app
 COPY pyproject.toml requirements.lock ./
 COPY third_party ./third_party
 COPY evalforge ./evalforge
+COPY alembic.ini ./
+COPY migrations ./migrations
 RUN pip install --no-cache-dir --constraint requirements.lock .
 
 USER 10001:10001

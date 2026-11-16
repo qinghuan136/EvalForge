@@ -12,6 +12,7 @@ from evalforge.redis import RedisSettings, RedisStore
 
 from .config import ServerSettings
 from .errors import install_handlers
+from .routes.assistant import router as assistant_router
 from .routes.auth import router as auth_router
 from .routes.datasets import router as datasets_router
 from .routes.evaluators import router as evaluators_router
@@ -25,6 +26,7 @@ from .runner_connections import RunnerConnections
 from .runner_sessions import RunnerSessionManager
 from .scheduler import Scheduler
 from .security import Passwords
+from .services.assistant import AssistantService
 from .services.auth import AuthService
 from .services.datasets import DatasetService
 from .services.runners import RunnerService
@@ -71,6 +73,7 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
             app.state.dataset_evaluators = DatasetEvaluatorService(db)
             app.state.experiments = ExperimentService(
                 db, connections, on_created=scheduler.experiment_created, on_cancelled=scheduler.experiment_cancelled)
+            app.state.assistant = AssistantService(db, app.state.experiments, config)
             scheduler.start()
             resources.push_async_callback(scheduler.close)
             # 注入资源由调用方管理；应用创建的资源由 AsyncExitStack 按逆序关闭。
@@ -88,11 +91,12 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
         response = await call_next(request)
         path = request.url.path
         if path == "/api/v1/datasets" or path.startswith(("/api/v1/auth/", "/api/v1/runners", "/api/v1/datasets/",
-                                                         "/api/v1/experiments/", "/api/v1/evaluators/")):
+                                                         "/api/v1/experiments/", "/api/v1/evaluators/", "/api/v1/assistant/")):
             response.headers["Cache-Control"] = "no-store"
         return response
 
     app.include_router(auth_router)
+    app.include_router(assistant_router)
     app.include_router(datasets_router)
     app.include_router(evaluators_router)
     app.include_router(experiments_router)
