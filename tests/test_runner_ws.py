@@ -20,6 +20,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
+from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -30,7 +31,7 @@ from api_support import APITestCase, SQLiteDatabase
 from attempt_support import seed_attempt, result_params
 from evalforge.db.models import (
     Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment, Job, Runner, RunnerAttempt,
-    RunnerCredential, User,
+    RunnerCredential, Span, Trace, User,
 )
 from evalforge.server.errors import APIError
 from evalforge.server.runner_auth import RUNNER_AUTH_CACHE_PREFIX
@@ -153,6 +154,8 @@ class RunnerWebSocketTests(APITestCase):
     async def test_sync_ready_started_complete_and_reconnect_replay_over_tls(self):
         owner = await self.user()
         key = await seed_attempt(self.database, owner.id, self.runner_id)
+        trace_id = "a1" * 16
+        result = result_params(key, trace_id=trace_id)
         async def call(ws, method, params):
             await ws.send(json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": method}))
             reply = json.loads(await asyncio.wait_for(ws.recv(), 2))
@@ -164,13 +167,30 @@ class RunnerWebSocketTests(APITestCase):
                 "job_id": key[0], "attempt_id": key[1], "status": "accepted"}], "pending_results": []})
             await call(ws, "runner.ready", {"session_id": hello["session_id"]})
             await call(ws, "jobs.started", {"job_id": key[0], "attempt_id": key[1]})
-            self.assertEqual(await call(ws, "jobs.complete", result_params(key)), {"acknowledged": True})
+            self.assertEqual(await call(ws, "jobs.complete", result), {"acknowledged": True})
+        async with self.database.transaction() as db:
+            self.assertIsNone(await db.scalar(select(Trace)))
+            self.assertEqual(await db.scalar(select(Job.trace_id)), trace_id)
+            self.assertEqual(await db.scalar(select(RunnerAttempt.trace_id)), trace_id)
+
+        request = ExportTraceServiceRequest()
+        request.resource_spans.add().scope_spans.add().spans.add(
+            trace_id=bytes.fromhex(trace_id), span_id=b"12345678", name="agent", end_time_unix_nano=100,
+        )
+        upload = await self.client.post("/v1/traces", content=request.SerializeToString(), headers={
+            "Authorization": f"Bearer {self.token}", "Content-Type": "application/x-protobuf",
+        })
+        self.assertEqual(upload.status_code, 200)
+        async with self.database.transaction() as db:
+            self.assertEqual(await db.scalar(select(Span.name).join(Trace).join(
+                Job, Job.trace_id == Trace.trace_id,
+            ).where(Trace.owner_user_id == owner.id, Job.job_id == key[0])), "agent")
         async with self.connection() as ws:
             hello = await self.hello(ws)
             sync = await call(ws, "runner.sync", {"runner_id": self.runner_id, "active_jobs": [],
-                                                  "pending_results": [result_params(key)]})
+                                                  "pending_results": [result]})
             self.assertEqual(sync["jobs"][0]["action"], "retry_upload")
-            await call(ws, "jobs.complete", result_params(key))
+            await call(ws, "jobs.complete", result)
             await call(ws, "runner.ready", {"session_id": hello["session_id"]})
 
     async def test_created_experiment_dispatches_frozen_input_after_ready_and_completes(self):

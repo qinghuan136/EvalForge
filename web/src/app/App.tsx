@@ -6,6 +6,8 @@ import { RunnersPage } from '../features/runners/RunnersPage'
 import { DatasetsPage } from '../features/datasets/DatasetsPage'
 import { ExperimentsPage } from '../features/experiments/ExperimentsPage'
 import { ExperimentDetail } from '../features/experiments/ExperimentDetail'
+import { TracesPage } from '../features/traces/TracesPage'
+import { TraceDetailPage } from '../features/traces/TraceDetailPage'
 import { errorMessage } from '../lib/api'
 import { Workspace } from './Workspace'
 import { sessionKey } from './queryClient'
@@ -57,6 +59,8 @@ export function App() {
         <Route path="/runners" element={<RunnersPage userId={user.id} />} />
         <Route path="/experiments" element={<ExperimentsPage userId={user.id} />} />
         <Route path="/experiments/:experimentId" element={<ExperimentDetail userId={user.id} />} />
+        <Route path="/traces" element={<TracesPage userId={user.id} />} />
+        <Route path="/traces/:traceId" element={<TraceDetailPage userId={user.id} />} />
         <Route path="/datasets" element={<DatasetsPage userId={user.id} />} />
       </Route>
       <Route path="*" element={<Navigate replace to="/runners" />} />

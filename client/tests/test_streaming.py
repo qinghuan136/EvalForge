@@ -177,6 +177,7 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
                     saved = (await repo.get("j1", "a1")).result_json
                     self.assertEqual(saved["status"], "succeeded")
                     self.assertEqual(saved["output"], {"reply": "final"})
+                    self.assertEqual(saved["trace_id"], requests[0].headers["traceparent"].split("-")[1])
 
                     async with rpc_pair(methods) as (peer, _):
                         task = asyncio.create_task(RunnerSession(config, repo, jobs).run(peer))

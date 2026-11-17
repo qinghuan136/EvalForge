@@ -12,12 +12,15 @@ from time import monotonic
 from typing import Any
 
 import httpx
+from opentelemetry.context import Context
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 from .models import encode_json
 from .stream_output import MAX_CHUNK_CHARS, OutputChunk, sse_events
 from .targets import AgentTarget
 
 logger = logging.getLogger(__name__)
+_trace_propagator = TraceContextTextMapPropagator()
 
 
 @dataclass(frozen=True)
@@ -133,7 +136,8 @@ class HttpExecutor:
 
     async def execute(self, agent_target_id: str, input_json: Any, *, timeout_seconds: float,
                       stream_output: bool = False,
-                      on_chunk: Callable[[OutputChunk], None] | None = None) -> HttpExecutionResult:
+                      on_chunk: Callable[[OutputChunk], None] | None = None,
+                      trace_context: Context | None = None) -> HttpExecutionResult:
         if self._client is None:
             raise RuntimeError("Open the HTTP executor with async with before using it")
         if not isinstance(agent_target_id, str) or agent_target_id not in self._targets:
@@ -146,6 +150,10 @@ class HttpExecutor:
         payload = encode_json(input_json).encode("utf-8")
         target = self._targets[agent_target_id]
         headers = {**target.headers, "content-type": "application/json", "accept-encoding": "identity"}
+        if trace_context is not None:
+            for name in _trace_propagator.fields:
+                headers.pop(name, None)
+            _trace_propagator.inject(headers, context=trace_context)
         if stream_output:
             headers["accept"] = "text/event-stream"
         started, status = monotonic(), None

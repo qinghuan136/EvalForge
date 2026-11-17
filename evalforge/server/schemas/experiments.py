@@ -3,13 +3,13 @@
 from datetime import datetime, timezone
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, Field, JsonValue, StrictBool, field_validator
+from pydantic import AfterValidator, Field, JsonValue, StrictBool, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
 from typing_extensions import Required, TypedDict
 
 from .auth import Schema
 from .common import PositiveDbId, StoredText, validate_database_json
-from .evaluators import EvaluatorSnapshot
+from .evaluators import EvaluatorConfig, EvaluatorSnapshot
 
 ExperimentStatus = Literal["pending", "running", "cancelling", "completed", "failed", "cancelled"]
 JobStatus = Literal["queued", "assigned", "running", "succeeded", "failed", "cancelled", "unknown"]
@@ -42,6 +42,7 @@ class ExperimentCreate(Schema):
     metadata: Annotated[dict[str, JsonValue], AfterValidator(validate_database_json)] = Field(default_factory=dict)
     execution_config: ExecutionConfig
     dataset_evaluator_ids: list[PositiveDbId] = Field(default_factory=list, max_length=100)
+    evaluators: list[EvaluatorConfig] = Field(default_factory=list, max_length=100)
 
     @field_validator("name", mode="before")
     @classmethod
@@ -61,6 +62,14 @@ class ExperimentCreate(Schema):
         if len(set(ids)) != len(ids):
             raise ValueError("Dataset evaluator IDs must be unique")
         return ids
+
+    @model_validator(mode="after")
+    def validate_evaluator_selection(self):
+        if self.evaluators and self.dataset_evaluator_ids:
+            raise ValueError("Use either evaluators or dataset_evaluator_ids")
+        if len({evaluator.name for evaluator in self.evaluators}) != len(self.evaluators):
+            raise ValueError("Experiment evaluator names must be unique")
+        return self
 
 
 class ExperimentProgress(Schema):
@@ -149,6 +158,7 @@ class JobEvaluationDetail(Schema):
 
 
 class JobDetail(JobSummary):
+    trace_id: str | None
     input: dict[str, JsonValue]
     reference: dict[str, JsonValue]
     metadata: dict[str, JsonValue]

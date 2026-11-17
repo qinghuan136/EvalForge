@@ -24,7 +24,7 @@ from ..schemas.experiments import (
 from .auth import locked_user
 from .attempts import ACTIVE
 from .datasets import dataset_snapshot, require_owned_dataset
-from .evaluators import load_evaluator_snapshots
+from .evaluators import build_experiment_evaluator_snapshots, load_evaluator_snapshots
 from .experiment_lifecycle import settle_experiment
 
 MAX_EXPERIMENT_JOBS = 10_000
@@ -108,6 +108,8 @@ class ExperimentService:
             if data.execution_config.stream_output and not {"http_json", "http_sse"}.issubset(connection.capabilities):
                 raise APIError(409, "runner_streaming_unsupported", "当前 Runner 不支持流式执行，请升级后重连")
 
+            evaluators = (build_experiment_evaluator_snapshots(data.evaluators) if data.evaluators
+                          else await load_evaluator_snapshots(db, dataset_id, data.dataset_evaluator_ids))
             max_examples = MAX_EXPERIMENT_JOBS // data.repetitions
             snapshot = (await db.execute(dataset_snapshot(dataset_id, version_id)
                 .order_by("dataset_example_id").limit(max_examples + 1))).all()
@@ -116,7 +118,6 @@ class ExperimentService:
             if len(snapshot) > max_examples:
                 raise APIError(422, "experiment_job_limit_exceeded", "实验 Job 数量超过单次创建上限")
 
-            evaluators = await load_evaluator_snapshots(db, dataset_id, data.dataset_evaluator_ids)
             execution_config = data.execution_config.model_dump()
             if evaluators:
                 execution_config["evaluators"] = [evaluator.model_dump(mode="json") for evaluator in evaluators]
@@ -256,7 +257,7 @@ class ExperimentService:
             names = _evaluator_names(await _owned_execution_config(db, owner_id, experiment_id))
             snapshot, revision = ExperimentDatasetExample, DatasetExampleRevision
             row = (await db.execute(select(
-                *JOB_SUMMARY_COLUMNS, Job.output, Job.error, Job.start_time, Job.end_time,
+                *JOB_SUMMARY_COLUMNS, Job.trace_id, Job.output, Job.error, Job.start_time, Job.end_time,
                 revision.input, revision.output.label("reference"), revision.metadata_.label("metadata"),
             ).select_from(Job).join(snapshot, and_(snapshot.experiment_id == Job.experiment_id,
                                                   snapshot.dataset_example_id == Job.dataset_example_id))
@@ -274,7 +275,8 @@ class ExperimentService:
                 evaluations = [JobEvaluationDetail.model_validate(by_name[name]) for name in names if name in by_name]
             return JobDetail(
                 **_job_summary(row, len(names), len(evaluations), sum(score.error is not None for score in evaluations)),
-                input=row.input, reference=row.reference, metadata=row.metadata, output=(row.output or {}).get("task_output"),
+                trace_id=row.trace_id, input=row.input, reference=row.reference, metadata=row.metadata,
+                output=(row.output or {}).get("task_output"),
                 error=row.error, started_at=row.start_time, ended_at=row.end_time, evaluations=evaluations,
             )
 

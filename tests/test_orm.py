@@ -16,7 +16,7 @@ from evalforge.db.models import (
     DatasetEvaluators, DatasetExample, DatasetExampleRevision, DatasetVersion,
     Evaluator, Experiment, ExperimentDatasetEvaluator, ExperimentDatasetExample,
     ExperimentEvalOnlyConfig, ExperimentConfig, ExperimentPromptTask, Job,
-    JobEvaluation, LLMEvaluator,
+    JobEvaluation, LLMEvaluator, Span, Trace, User,
 )
 from evalforge.models import Dataset as InMemoryDataset, Example
 
@@ -43,8 +43,8 @@ class SchemaContractTests(unittest.TestCase):
                     ("experiments", "user_id"): "SET NULL",
                 }.get((table.name, foreign_key.parent.name), "CASCADE")
                 self.assertEqual(foreign_key.ondelete, expected)
-        self.assertEqual(len(Base.metadata.sorted_tables), 23)
-        for name in ("spans", "prompts", "projects", "sandbox_configs", "languages"):
+        self.assertEqual(len(Base.metadata.sorted_tables), 25)
+        for name in ("prompts", "projects", "sandbox_configs", "languages"):
             self.assertNotIn(name, Base.metadata.tables)
         self.assertEqual(Dataset.__table__.c.user_id.info["deferred_foreign_key"]["target"], "users.id")
         self.assertFalse(Dataset.__table__.c.user_id.foreign_keys)
@@ -68,6 +68,13 @@ class SchemaContractTests(unittest.TestCase):
         self.assertEqual(dataset.examples[0].id, "one")
         self.assertIsNot(InMemoryDataset, Dataset)
 
+    def test_postgresql_preserves_otlp_numeric_and_json_storage(self):
+        ddl = str(CreateTable(Span.__table__).compile(dialect=postgresql.dialect()))
+        self.assertIn("trace_row_id BIGINT", ddl)
+        self.assertIn("start_time_unix_nano NUMERIC(20, 0)", ddl)
+        self.assertIn("attributes JSON DEFAULT", ddl)
+        self.assertNotIn("JSONB", ddl)
+
 
 class PersistenceTests(unittest.TestCase):
     def setUp(self):
@@ -81,6 +88,56 @@ class PersistenceTests(unittest.TestCase):
 
     def tearDown(self):
         self.engine.dispose()
+
+    def test_trace_owner_isolation_and_span_deduplication(self):
+        trace_id = "a" * 32
+        span_id = "b" * 16
+        time_range = {"start_time_unix_nano": 100, "end_time_unix_nano": 200}
+        with Session(self.engine) as session, session.begin():
+            owners = [User(username=name, password_hash="test") for name in ("alice", "bob")]
+            session.add_all(owners)
+            session.flush()
+            traces = [Trace(owner_user_id=user.id, trace_id=trace_id, **time_range) for user in owners]
+            session.add_all(traces)
+            session.flush()
+            for trace in traces:
+                session.add(Span(trace=trace, span_id=span_id, name="request", kind=2, **time_range))
+            session.flush()
+
+            with self.assertRaises(IntegrityError), session.begin_nested():
+                session.add(Trace(owner_user_id=owners[0].id, trace_id=trace_id, **time_range))
+            with self.assertRaises(IntegrityError), session.begin_nested():
+                session.add(Span(trace_row_id=traces[0].id, span_id=span_id, name="retry", kind=2, **time_range))
+
+            session.delete(owners[0])
+            session.flush()
+            self.assertEqual(session.scalars(select(Trace.owner_user_id)).all(), [owners[1].id])
+            self.assertEqual(session.scalars(select(Span.trace_row_id)).all(), [traces[1].id])
+
+    def test_span_can_arrive_before_parent_and_keeps_typed_payload(self):
+        attributes = [
+            {"key": "gen_ai.request.model", "value": {"stringValue": "sample"}},
+            {"key": "custom.size", "value": {"intValue": "9007199254740993"}},
+        ]
+        events = [{"name": "end", "timeUnixNano": "199"}, {"name": "start", "timeUnixNano": "102"}]
+        with Session(self.engine) as session, session.begin():
+            owner = User(username="alice", password_hash="test")
+            session.add(owner)
+            session.flush()
+            trace = Trace(owner_user_id=owner.id, trace_id="a" * 32,
+                          start_time_unix_nano=100, end_time_unix_nano=200)
+            span = Span(trace=trace, span_id="b" * 16, parent_span_id="c" * 16, name="request", kind=2,
+                        start_time_unix_nano=100, end_time_unix_nano=200, attributes=attributes, events=events)
+            session.add(span)
+            session.flush()
+            span_id = span.id
+
+        with Session(self.engine) as session:
+            span = session.get(Span, span_id)
+            self.assertEqual(span.parent_span_id, "c" * 16)
+            self.assertEqual(span.attributes, attributes)
+            self.assertEqual(span.events, events)
+            self.assertEqual(span.links, [])
 
     def seed_experiment(self, session):
         dataset = Dataset(name="prices", metadata_={"purpose": "test"})

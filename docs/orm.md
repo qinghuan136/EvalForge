@@ -1,6 +1,6 @@
 # 核心 ORM
 
-基于 Phoenix commit `14c193cfa`，按云端 + 轻客户端方案调整；当前 23 张表，含停用后保留的旧配置表、身份与凭证表，以及评测助手的会话和消息表。
+基于 Phoenix commit `14c193cfa`，按云端 + 轻客户端方案调整；当前 25 张表，含停用后保留的旧配置表、身份与凭证、评测助手和 Trace 存储。
 本页介绍存储结构；应用启动不自动建表，部署方式见 [数据库说明](database.md)。
 
 ## 代码入口
@@ -13,6 +13,7 @@
 | `evalforge/db/orm/attempts.py` | 云端 Attempt、完整派发/结果快照、活动容量约束 |
 | `evalforge/db/orm/auth.py` | User、Runner、RunnerCredential；字段和 ER 图见 [鉴权数据结构](auth-schema.md) |
 | `evalforge/db/orm/assistant.py` | 助手会话、消息与执行租约；字段和 ER 图见 [Agent 会话与消息表设计](Agent会话与消息表设计.md) |
+| `evalforge/db/orm/traces.py` | Trace、Span；字段和 ER 图见 [Trace 与 Span 表设计](Trace与Span表设计.md) |
 | `evalforge/db/orm/evaluators.py` | 评分器公共定义、三个子类型、源码版本、数据集使用配置 |
 | `evalforge/db/orm/experiment_configs.py` | 旧 ExperimentConfig 已停用；保留 Prompt、EVAL_ONLY 和原评分关联的表与外键 |
 | `evalforge/db/models.py` | 统一导入和注册入口，Alembic 由此获得完整 metadata |
@@ -50,7 +51,7 @@ Experiment（整体状态、execution_config）
 
 ## 数据类型与继承
 
-- PostgreSQL JSON 字段使用 JSONB，时间字段使用 TIMESTAMP WITH TIME ZONE；写入时间应带时区。
+- PostgreSQL 业务 JSON 字段通常使用 JSONB。Span 原始明细使用 JSON，OTLP 纳秒时间使用 NUMERIC(20,0)；其他日期时间使用 TIMESTAMP WITH TIME ZONE。
 - `metadata_` 是 Python 属性名，对应数据库列 `metadata`。
 - Evaluator 使用 joined-table inheritance，通过 `(kind, id)` 复合外键关联子表。
 - ExperimentPromptTask 通过 `(type, id)` 关联 ExperimentConfig。
@@ -84,7 +85,7 @@ Experiment（整体状态、execution_config）
 | 字段位置 | 未来目标 |
 | --- | --- |
 | Dataset、DatasetVersion、Evaluator、CodeEvaluatorVersion、DatasetEvaluators 的 user_id | users.id（表已实现，这些旧模块的外键另行接入） |
-| DatasetExample.span_rowid | spans.id |
+| DatasetExample.span_rowid | spans.id（表已实现，数据集关联另行接入） |
 | LLMEvaluator.prompt_id / prompt_version_tag_id | prompts.id / prompt_version_tags.id |
 | CodeEvaluator.language / sandbox_config_id | languages.name / sandbox_configs.id |
 | CodeEvaluator 的 sandbox_config_id + language | sandbox_configs 的 id + language |
@@ -93,7 +94,7 @@ Experiment（整体状态、execution_config）
 
 字段的 Column.info、复合约束的 Table.info 保存目标信息，供后续补迁移时参考；它们本身不生成 SQL 约束。
 外部字段保留引用类型和索引。`dataset_evaluators.project_id` 在尚未接入项目模块时允许为空。已有开发库若按旧版 ORM 建表，需要在自己的 Alembic 迁移中移除该列的 `NOT NULL`。
-users 为真实账号模型，不是占位表；未创建 Trace、Prompt、沙箱等占位表。
+users、traces 和 spans 已有真实模型；Prompt、沙箱等仍未建表。
 
 ## 验证与迁移
 
@@ -105,7 +106,7 @@ users 为真实账号模型，不是占位表；未创建 Trace、Prompt、沙�
 模型专项测试使用内存 SQLite 真正执行建表、写入、查询和约束失败；另行编译全部 PostgreSQL DDL，验证 JSONB、时区字段及复合外键。
 这些不替代真实 PostgreSQL 集成测试。
 
-23 张表与 ORM 契约一致；SQLite 验证唯一约束、身份引用、默认有效期及历史保护，PostgreSQL DDL 验证 JSONB、BYTEA、时间类型及部分索引。Runner 接口验证见 [Runner 管理](server-runners.md)。
+25 张表与 ORM 契约一致；SQLite 验证唯一约束、身份引用、默认有效期及历史保护，PostgreSQL DDL 验证 JSON、JSONB、BYTEA、时间类型及索引。Runner 接口验证见 [Runner 管理](server-runners.md)。
 临时从活动索引移除 unknown 后，容量测试按预期失败；恢复源码后完整测试通过。数据字典的字段名和可空性已逐表核对，编译检查及 git diff --check 通过。
 
 实例就绪后生成迁移：
@@ -116,6 +117,6 @@ users 为真实账号模型，不是占位表；未创建 Trace、Prompt、沙�
 .\.venv\Scripts\python.exe -m alembic upgrade head
 ```
 
-本阶段仅交付 ORM；未生成正式初始迁移，未执行真实 PostgreSQL 建表和读写。
+仓库未提供创建核心表的初始迁移；助手和 Trace 的增量迁移见 [迁移版本](../migrations/versions/README.md)。
 
 如已有旧数据库，不能直接套用结构变更：需先为历史 Run 回填唯一 job_id 与执行状态，将旧 error 文本转换为结构化 JSON，并处理身份字段的孤立引用，再添加约束；旧配置表继续保留。迁移由实例就绪后的实际数据决定，不通过 create_all 自动升级。

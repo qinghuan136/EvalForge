@@ -65,6 +65,26 @@ class AttemptServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.service.complete(self.identity, self.result(output=None))
         self.assertEqual((await self.rows())[1].output, {"task_output": None})
 
+    async def test_trace_id_is_stored_without_waiting_for_spans_and_cannot_change_on_retry(self):
+        trace_id = "a1" * 16
+        result = self.result(trace_id=trace_id)
+        await self.service.complete(self.identity, result)
+        await self.service.complete(self.identity, result)
+        with self.assertRaises(AttemptError):
+            await self.service.complete(self.identity, self.result(trace_id="b2" * 16))
+        attempt, job = await self.rows()
+        self.assertEqual((attempt.trace_id, job.trace_id, attempt.result_json["trace_id"]), (trace_id,) * 3)
+
+    async def test_old_result_snapshot_without_trace_id_is_still_acknowledged(self):
+        await self.service.complete(self.identity, self.result())
+        async with self.database.transaction() as db:
+            attempt = await db.scalar(select(RunnerAttempt))
+            attempt.result_json = result_params(self.key, duration_ms=10.0)
+        await self.service.complete(self.identity, self.result(trace_id=None))
+        attempt, job = await self.rows()
+        self.assertNotIn("trace_id", attempt.result_json)
+        self.assertIsNone(job.trace_id)
+
     async def test_failed_result_stores_structured_error(self):
         await self.service.complete(self.identity, self.result(status="failed", output=None, http_status=None,
                                                                error={"code": "timeout", "message": "Timeout"}))
@@ -108,12 +128,14 @@ class AttemptServiceTests(unittest.IsolatedAsyncioTestCase):
                 raise OperationalError("private sql", {}, Exception("secret"))
         with patch.object(self.database, "transaction", failing_transaction):
             with self.assertRaises(OperationalError):
-                await self.service.complete(self.identity, self.result())
+                await self.service.complete(self.identity, self.result(trace_id="a1" * 16))
         self.assertEqual(len(calls), 1)
         attempt, job = await self.rows()
         self.assertEqual((attempt.status, job.status), ("assigned", "assigned"))
         self.assertIsNone(attempt.result_json)
         self.assertIsNone(job.output)
+        self.assertIsNone(attempt.trace_id)
+        self.assertIsNone(job.trace_id)
 
     async def test_sync_pending_only_requests_upload_and_duplicate_is_still_replayed(self):
         response = await self.service.sync(self.identity, self.snapshot(pending=True))
@@ -155,11 +177,13 @@ class AttemptServiceTests(unittest.IsolatedAsyncioTestCase):
                                  attempt_id="newer", status="unknown", unknown_reason="test", dispatch_json={}))
         reply = await self.service.sync(self.identity, self.snapshot(pending=True))
         self.assertEqual(reply["jobs"][0]["action"], "retry_upload")
-        await self.service.complete(self.identity, self.result())
+        await self.service.complete(self.identity, self.result(attempt_id="newer", trace_id="b2" * 16))
+        await self.service.complete(self.identity, self.result(trace_id="a1" * 16))
         attempt, job = await self.rows()
         self.assertEqual(attempt.status, "succeeded")
-        self.assertEqual(job.status, "unknown")
-        self.assertIsNone(job.output)
+        self.assertEqual(attempt.trace_id, "a1" * 16)
+        self.assertEqual(job.status, "succeeded")
+        self.assertEqual(job.trace_id, "b2" * 16)
 
     async def test_sync_cancel_intent_and_terminal_are_not_overwritten_by_running(self):
         async with self.database.transaction() as db:
@@ -214,7 +238,8 @@ class AttemptServiceTests(unittest.IsolatedAsyncioTestCase):
     def test_result_and_snapshot_validation(self):
         for changes in ({"duration_ms": True}, {"duration_ms": float("inf")}, {"http_status": True},
                         {"output": {"bad": float("nan")}}, {"status": "failed"},
-                        {"error": {"code": "x", "message": "x"}}, {"extra": "x"}):
+                        {"error": {"code": "x", "message": "x"}}, {"extra": "x"},
+                        {"trace_id": "0" * 32}, {"trace_id": "a" * 31}, {"trace_id": "A" * 32}):
             with self.subTest(changes=changes), self.assertRaises(ValidationError):
                 self.result(**changes)
         snapshot = {

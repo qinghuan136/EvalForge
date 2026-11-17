@@ -6,6 +6,7 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 Identity = Annotated[str, Field(min_length=1, max_length=128, pattern=r"\S")]
+TraceId = Annotated[str, Field(min_length=32, max_length=32, pattern=r"^[0-9a-f]{32}$")]
 
 
 class Message(BaseModel):
@@ -28,9 +29,12 @@ class AttemptResult(AttemptKey):
     duration_ms: Annotated[float, Field(ge=0)]
     http_status: Annotated[int, Field(ge=100, le=599)] | None
     error: ResultError | None
+    trace_id: TraceId | None = None
 
     @model_validator(mode="after")
     def valid_result(self):
+        if self.trace_id == "0" * 32:
+            raise ValueError("Trace ID cannot be all zeroes")
         if self.status == "succeeded" and self.error is not None:
             raise ValueError("Successful result cannot contain an error")
         if self.status == "failed" and self.error is None:

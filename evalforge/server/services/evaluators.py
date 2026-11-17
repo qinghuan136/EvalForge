@@ -14,8 +14,8 @@ from ..evaluators.builtin import BuiltinEvaluator as BuiltinRule
 from ..evaluators.builtin import get_builtin_evaluator, list_builtin_evaluators
 from ..evaluators.input_mapping import is_single_value_path
 from ..schemas.evaluators import (
-    BuiltinEvaluatorDefinition, DatasetEvaluatorCreate, DatasetEvaluatorDetail,
-    DatasetEvaluatorPage, EvaluatorSnapshot, InputMapping,
+    BuiltinEvaluatorDefinition, DatasetEvaluatorDetail, DatasetEvaluatorPage,
+    EvaluatorConfig, EvaluatorSnapshot, InputMapping,
 )
 from .auth import locked_user
 from .datasets import require_owned_dataset
@@ -95,20 +95,37 @@ async def load_evaluator_snapshots(db: AsyncSession, dataset_id: int, ids: list[
     return [snapshots[evaluator_id] for evaluator_id in ids]
 
 
+def _validated_rule(config: EvaluatorConfig) -> type[BuiltinRule]:
+    try:
+        rule = get_builtin_evaluator(config.evaluator_key)
+    except KeyError:
+        raise APIError(404, "builtin_evaluator_not_found", "内置评分器不存在") from None
+    _validate_mapping(config.input_mapping, rule)
+    return rule
+
+
+def _named_outputs(rule: type[BuiltinRule], name: str):
+    return [{**config, "name": name} for config in rule.output_configs()]
+
+
+def build_experiment_evaluator_snapshots(configs: list[EvaluatorConfig]) -> list[EvaluatorSnapshot]:
+    snapshots = []
+    for config in configs:
+        rule = _validated_rule(config)
+        snapshots.append(EvaluatorSnapshot(**config.model_dump(), output_configs=_named_outputs(rule, config.name)))
+    return snapshots
+
+
 class DatasetEvaluatorService:
     def __init__(self, database: Database):
         self.database = database
 
     async def create(self, owner_id: int, auth_version: int, dataset_id: int,
-                     data: DatasetEvaluatorCreate) -> DatasetEvaluatorDetail:
+                     data: EvaluatorConfig) -> DatasetEvaluatorDetail:
         async with self.database.transaction() as db:
             await locked_user(db, owner_id, auth_version)
             await require_owned_dataset(db, owner_id, dataset_id, lock=True)
-            try:
-                rule = get_builtin_evaluator(data.evaluator_key)
-            except KeyError:
-                raise APIError(404, "builtin_evaluator_not_found", "内置评分器不存在") from None
-            _validate_mapping(data.input_mapping, rule)
+            rule = _validated_rule(data)
 
             duplicate = await db.scalar(select(DatasetEvaluators.id).where(
                 DatasetEvaluators.dataset_id == dataset_id, DatasetEvaluators.name == data.name,
@@ -119,7 +136,7 @@ class DatasetEvaluatorService:
             binding = DatasetEvaluators(
                 dataset_id=dataset_id, evaluator_id=await _builtin_id(db, rule), user_id=owner_id,
                 name=data.name, description=data.description, input_mapping=data.input_mapping.model_dump(mode="json"),
-                output_configs=[{**config, "name": data.name} for config in rule.output_configs()],
+                output_configs=_named_outputs(rule, data.name),
             )
             db.add(binding)
             await db.flush()

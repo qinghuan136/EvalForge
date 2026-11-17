@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Path, Query, Request
 from ..dependencies import Authenticated, SessionContext, current_user, require_csrf
 from ..schemas.common import MAX_DB_ID
 from ..schemas.evaluators import (
-    BuiltinEvaluatorDefinition, DatasetEvaluatorCreate, DatasetEvaluatorDetail, DatasetEvaluatorPage,
+    BuiltinEvaluatorDefinition, DatasetEvaluatorDetail, DatasetEvaluatorPage, EvaluatorConfig,
 )
 from ..services.evaluators import DatasetEvaluatorService, builtin_catalog
 
@@ -31,7 +31,7 @@ async def list_dataset_evaluators(dataset_id: int = Path(ge=1, le=MAX_DB_ID),
 
 
 @router.post("/datasets/{dataset_id}/evaluators", status_code=201, response_model=DatasetEvaluatorDetail)
-async def create_dataset_evaluator(data: DatasetEvaluatorCreate, dataset_id: int = Path(ge=1, le=MAX_DB_ID),
+async def create_dataset_evaluator(data: EvaluatorConfig, dataset_id: int = Path(ge=1, le=MAX_DB_ID),
                                   identity: Authenticated = Depends(current_user),
                                   _csrf: SessionContext = Depends(require_csrf),
                                   service: DatasetEvaluatorService = Depends(evaluator_service)):

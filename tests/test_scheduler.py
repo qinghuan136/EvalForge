@@ -21,7 +21,7 @@ from evalforge.server.runner_auth import RunnerIdentity
 from evalforge.server.runner_connections import RegisteredConnection, RunnerConnections
 from evalforge.server.scheduler import Scheduler
 from evalforge.server.schemas.attempts import AttemptResult
-from evalforge.server.schemas.evaluators import DatasetEvaluatorCreate
+from evalforge.server.schemas.evaluators import EvaluatorConfig
 from evalforge.server.schemas.experiments import ExperimentCreate
 from evalforge.server.services.attempts import AttemptService
 from evalforge.server.services.dispatch import DispatchClaim, DispatchService
@@ -161,7 +161,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(attempt.dispatch_json, payload)
 
     async def create_metric(self, name, actual="$.output.reply"):
-        config = DatasetEvaluatorCreate(name=name, evaluator_key="exact_match", input_mapping={
+        config = EvaluatorConfig(name=name, evaluator_key="exact_match", input_mapping={
             "path_mapping": {"actual": actual, "expected": "$.reference.answer"},
         })
         return (await DatasetEvaluatorService(self.database).create(

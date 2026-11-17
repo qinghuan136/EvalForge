@@ -15,18 +15,32 @@ export type Experiment = {
   execution_config?: { runner_id?: string; agent_target_id?: string; timeout_seconds?: number; stream_output?: boolean }
   evaluators?: Evaluator[]
 }
-export type Evaluator = { dataset_evaluator_id: number; name: string; evaluator_key: string; description: string | null }
+export type Evaluator = { dataset_evaluator_id: number | null; name: string; evaluator_key: string; description: string | null }
+export type EvaluatorDefinition = {
+  key: string
+  description: string
+  input_schema: {
+    properties: Record<string, { type?: string; default?: unknown }>
+    required?: string[]
+  }
+}
+export type EvaluatorConfig = {
+  name: string
+  evaluator_key: string
+  input_mapping: { path_mapping: Record<string, string>; literal_mapping: Record<string, unknown> }
+}
 export type Job = {
   job_id: string; example_id: number; repetition_number: number; status: string
   duration_ms: number | null; http_status: number | null; evaluation_progress: EvaluationProgress
 }
 export type JobDetail = Job & {
+  trace_id: string | null
   input: unknown; reference: unknown; metadata: unknown; output: unknown
   error: { code: string; message: string } | null; started_at: string | null; ended_at: string | null
   evaluations: { name: string; score: number | null; label: string | null; explanation: string | null; error: string | null }[]
 }
 export type CreateExperiment = {
-  name: string; description?: string; dataset_version_id: number; repetitions: number; dataset_evaluator_ids: number[]
+  name: string; description?: string; dataset_version_id: number; repetitions: number; evaluators: EvaluatorConfig[]
   execution_config: { runner_id: string; agent_target_id: string; timeout_seconds: number; stream_output: boolean }
 }
 
@@ -35,6 +49,9 @@ export function getExperiments(dataset: number, page: number, signal: AbortSigna
 }
 export function getExperiment(id: number, signal: AbortSignal) {
   return apiRequest<Experiment>(`/experiments/${id}`, { signal })
+}
+export function getBuiltinEvaluators(signal: AbortSignal) {
+  return apiRequest<EvaluatorDefinition[]>('/evaluators/builtin', { signal })
 }
 export function createExperiment(dataset: number, data: CreateExperiment) {
   const runner = encodeURIComponent(data.execution_config.runner_id)

@@ -7,6 +7,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import httpx
+from opentelemetry.context import Context
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.trace import SpanKind, format_trace_id, get_current_span
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from websockets.asyncio.server import serve
 
 from evalforge_client.app import run_client
@@ -57,7 +61,9 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
             return self.reply
 
         self.executor = await self.stack.enter_async_context(HttpExecutor(
-            {"agent": {"url": "http://agent.example/invoke"}}, transport=httpx.MockTransport(agent),
+            {"agent": {"url": "http://agent.example/invoke", "headers": {
+                "Traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01", "Tracestate": "stale=value",
+            }}}, transport=httpx.MockTransport(agent),
         ))
         self.jobs = await self.stack.enter_async_context(JobManager(self.repo, self.executor))
 
@@ -91,6 +97,27 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
         await self.finished("j2")
         self.assertEqual(len(self.requests), 2)
         self.assertEqual((await self.repo.get("j1", "a1")).delivery_status, "pending")
+
+    async def test_trace_context_is_per_attempt_and_matches_the_saved_result(self):
+        carrier = TraceContextTextMapPropagator()
+        tracer = TracerProvider(shutdown_on_exit=False).get_tracer(__name__)
+        trace_ids = set()
+        for attempt_id in ("a1", "a2"):
+            await self.jobs.dispatch(dispatch_params(attempt=attempt_id))
+            saved = (await self.finished(attempt=attempt_id)).result_json
+            request = self.requests[-1]
+            self.assertEqual(len(request.headers.get_list("traceparent")), 1)
+            self.assertNotIn("tracestate", request.headers)
+            context = carrier.extract(dict(request.headers), context=Context())
+            parent = get_current_span(context).get_span_context()
+            self.assertTrue(parent.is_valid and parent.is_remote)
+            self.assertTrue(parent.trace_flags.sampled)
+            with tracer.start_as_current_span("agent", context=context, kind=SpanKind.SERVER) as server_span:
+                self.assertEqual(server_span.parent.span_id, parent.span_id)
+                self.assertEqual(format_trace_id(server_span.get_span_context().trace_id), saved["trace_id"])
+            trace_ids.add(saved["trace_id"])
+        self.assertEqual(len(trace_ids), 2)
+        self.assertNotIn("1" * 32, trace_ids)
 
     async def test_concurrent_dispatches_accept_only_one_without_local_queue(self):
         self.release.clear()
@@ -131,6 +158,7 @@ class JobManagerTests(unittest.IsolatedAsyncioTestCase):
             row = await self.finished(job)
             self.assertEqual(row.execution_status, "failed")
             self.assertEqual(row.result_json["error"]["code"], code)
+            self.assertEqual(row.result_json["trace_id"], self.requests[-1].headers["traceparent"].split("-")[1])
             self.assertNotIn("private endpoint", json.dumps(row.result_json))
         self.assertEqual(len(self.requests), 4)
 

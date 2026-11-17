@@ -18,8 +18,10 @@ from .routes.datasets import router as datasets_router
 from .routes.evaluators import router as evaluators_router
 from .routes.experiments import router as experiments_router
 from .routes.internal_routing import router as internal_routing_router
+from .routes.otlp import router as otlp_router
 from .routes.runners import router as runners_router
 from .routes.runner_ws import router as runner_ws_router
+from .routes.traces import router as traces_router
 from .rpc import JsonRpcPeer
 from .runner_auth import RunnerAuth, RunnerIdentity
 from .runner_connections import RunnerConnections
@@ -36,6 +38,8 @@ from .services.evaluations import EvaluationService
 from .services.evaluators import DatasetEvaluatorService
 from .services.experiments import ExperimentService
 from .services.runtime_loader import RuntimeLoader
+from .services.trace_ingest import TraceIngestService
+from .services.traces import TraceQueryService
 from .sessions import SessionStore
 
 
@@ -74,6 +78,8 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
             app.state.experiments = ExperimentService(
                 db, connections, on_created=scheduler.experiment_created, on_cancelled=scheduler.experiment_cancelled)
             app.state.assistant = AssistantService(db, app.state.experiments, config)
+            app.state.trace_ingest = TraceIngestService(db)
+            app.state.trace_queries = TraceQueryService(db)
             scheduler.start()
             resources.push_async_callback(scheduler.close)
             # 注入资源由调用方管理；应用创建的资源由 AsyncExitStack 按逆序关闭。
@@ -90,8 +96,10 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
     async def no_auth_cache(request: Request, call_next):
         response = await call_next(request)
         path = request.url.path
-        if path == "/api/v1/datasets" or path.startswith(("/api/v1/auth/", "/api/v1/runners", "/api/v1/datasets/",
-                                                         "/api/v1/experiments/", "/api/v1/evaluators/", "/api/v1/assistant/")):
+        if path in ("/api/v1/datasets", "/api/v1/traces") or path.startswith((
+            "/api/v1/auth/", "/api/v1/runners", "/api/v1/datasets/", "/api/v1/experiments/",
+            "/api/v1/evaluators/", "/api/v1/assistant/", "/api/v1/traces/",
+        )):
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -103,4 +111,6 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
     app.include_router(internal_routing_router)
     app.include_router(runners_router)
     app.include_router(runner_ws_router)
+    app.include_router(otlp_router)
+    app.include_router(traces_router)
     return app

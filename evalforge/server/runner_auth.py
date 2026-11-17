@@ -70,13 +70,20 @@ class RunnerAuth:
         return RunnerIdentity(runner.runner_id, owner.id, credential.id, utc(credential.expires_at), credential.token_hash)
 
     async def authenticate(self, authorization: str | None) -> RunnerIdentity:
+        return await self._authenticate(authorization, record_connection=True)
+
+    async def verify(self, authorization: str | None) -> RunnerIdentity:
+        """Validate a Runner credential without recording a WSS connection."""
+        return await self._authenticate(authorization, record_connection=False)
+
+    async def _authenticate(self, authorization: str | None, *, record_connection: bool) -> RunnerIdentity:
         scheme, _, token = (authorization or "").partition(" ")
         match = re.fullmatch(r"efr\.([A-Za-z0-9_-]{1,128})\.([A-Za-z0-9_-]{43})", token, re.ASCII)
         if scheme.lower() != "bearer" or match is None:
             raise APIError(401, "invalid_runner_credential", "Runner 凭证无效")
         lookup, secret = match.groups()
         digest = bytes.fromhex(token_digest(secret))
-        checked_since = monotonic()
+        checked_since = monotonic() if record_connection else None
         async with self.database.transaction() as db:
             row = (await db.execute(select(RunnerCredential, Runner, User)
                                     .join(Runner, Runner.runner_id == RunnerCredential.runner_id)
@@ -86,8 +93,10 @@ class RunnerAuth:
                 raise APIError(401, "invalid_runner_credential", "Runner 凭证无效")
             credential, runner, owner = row
             identity = self._identity(credential, runner, owner)
-            credential.last_used_at = runner.last_seen_at = datetime.now(timezone.utc)
-        await self._remember(identity, checked_since)
+            if record_connection:
+                credential.last_used_at = runner.last_seen_at = datetime.now(timezone.utc)
+        if checked_since is not None:
+            await self._remember(identity, checked_since)
         return identity
 
     async def check(self, identity: RunnerIdentity) -> None:

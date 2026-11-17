@@ -126,6 +126,10 @@ server {
         proxy_pass http://cloud_pool;
     }
 
+    location = /v1/traces {
+        proxy_pass http://cloud_pool;
+    }
+
     location /assets/ {
         try_files $uri =404;
     }

@@ -15,6 +15,7 @@ const active = (status?: string) => status === 'pending' || status === 'running'
 function JobDialog({ userId, experimentId, jobId, running, streamOutput, onClose }: {
   userId: number; experimentId: number; jobId: string; running: boolean; streamOutput: boolean; onClose: () => void
 }) {
+  const location = useLocation()
   const job = useQuery({
     queryKey: [...privateKey, userId, 'job', experimentId, jobId],
     queryFn: ({ signal }) => getJob(experimentId, jobId, signal),
@@ -25,7 +26,12 @@ function JobDialog({ userId, experimentId, jobId, running, streamOutput, onClose
     {job.isError ? <><p className="error-message" role="alert">{errorMessage(job.error)}</p><button className="button" onClick={() => void job.refetch()}>重试</button></> : null}
     {job.data ? <>
       <p>样本 #{job.data.example_id}，第 {job.data.repetition_number} 次，{statusLabels[job.data.status] ?? job.data.status}</p>
-      <div><AskAssistantButton pageContext={{ type: 'job', experiment_id: experimentId, job_id: jobId }} /></div>
+      <div className="trace-job-actions">
+        <AskAssistantButton pageContext={{ type: 'job', experiment_id: experimentId, job_id: jobId }} />
+        {job.data.trace_id ? <Link className="button" to={`/traces?trace_id=${encodeURIComponent(job.data.trace_id)}`}
+          state={{ jobReturnTo: location.pathname + location.search }}>查看调用链</Link>
+          : <span className="muted">尚未关联调用链</span>}
+      </div>
       {streamOutput && (job.data.status === 'assigned' || job.data.status === 'running') ?
         <JobOutputPreview key={jobId} userId={userId} experimentId={experimentId} jobId={jobId} /> : null}
       <dl className="detail-list">
@@ -54,7 +60,8 @@ export function ExperimentDetail({ userId }: { userId: number }) {
 function ExperimentDetailPage({ userId, id }: { userId: number; id: number }) {
   const [params, setParams] = useSearchParams()
   const location = useLocation()
-  const [jobId, setJobId] = useState<string | null>(null)
+  const requestedJob = params.get('job')
+  const jobId = requestedJob && requestedJob.length <= 128 && requestedJob.trim() ? requestedJob : null
   const [showSamples, setShowSamples] = useState(false)
   const [confirm, setConfirm] = useState(false)
   const client = useQueryClient()
@@ -93,7 +100,7 @@ function ExperimentDetailPage({ userId, id }: { userId: number; id: number }) {
     const next = new URLSearchParams(params)
     if (value) next.set(key, value); else next.delete(key)
     if (key === 'status') next.delete('page')
-    setParams(next)
+    setParams(next, { replace: key === 'job', state: location.state })
   }
   const back = (location.state as { returnTo?: string } | null)?.returnTo
   const returnTo = back?.startsWith('/experiments?') ? back : item ? `/experiments?dataset=${item.dataset_id}` : '/experiments'
@@ -117,11 +124,11 @@ function ExperimentDetailPage({ userId, id }: { userId: number; id: number }) {
       <section className="jobs-section"><div className="jobs-heading"><h2>Job 明细</h2><label className="field">状态<select value={status} onChange={(event) => update('status', event.target.value)}><option value="">全部状态</option>{jobStatuses.map((value) => <option key={value} value={value}>{statusLabels[value]}</option>)}</select></label></div>
         {jobs.isPending ? <p className="panel-message" role="status">正在加载 Job…</p> : null}
         {jobs.isError ? <div className="panel-message"><p className="error-message" role="alert">{errorMessage(jobs.error)}</p><button className="button" onClick={() => void jobs.refetch()}>重试</button></div> : null}
-        {jobs.data?.items.length ? <div className="table-scroll"><table className="experiment-table"><thead><tr><th>样本 / 重复</th><th>状态</th><th>耗时</th><th>HTTP</th><th>评分</th></tr></thead><tbody>{jobs.data.items.map((job) => <tr key={job.job_id}><th scope="row"><button className="text-link" onClick={() => setJobId(job.job_id)}>样本 #{job.example_id}</button><small>第 {job.repetition_number} 次</small></th><td>{statusLabels[job.status] ?? job.status}</td><td>{job.duration_ms === null ? '—' : `${job.duration_ms} ms`}</td><td>{job.http_status ?? '—'}</td><td>{job.evaluation_progress.completed} / {job.evaluation_progress.expected}{job.evaluation_progress.errors ? <small>{job.evaluation_progress.errors} 项错误</small> : null}</td></tr>)}</tbody></table></div> : jobs.data ? <p className="panel-message">没有符合此状态的 Job。</p> : null}
+        {jobs.data?.items.length ? <div className="table-scroll"><table className="experiment-table"><thead><tr><th>样本 / 重复</th><th>状态</th><th>耗时</th><th>HTTP</th><th>评分</th></tr></thead><tbody>{jobs.data.items.map((job) => <tr key={job.job_id}><th scope="row"><button className="text-link" onClick={() => update('job', job.job_id)}>样本 #{job.example_id}</button><small>第 {job.repetition_number} 次</small></th><td>{statusLabels[job.status] ?? job.status}</td><td>{job.duration_ms === null ? '—' : `${job.duration_ms} ms`}</td><td>{job.http_status ?? '—'}</td><td>{job.evaluation_progress.completed} / {job.evaluation_progress.expected}{job.evaluation_progress.errors ? <small>{job.evaluation_progress.errors} 项错误</small> : null}</td></tr>)}</tbody></table></div> : jobs.data ? <p className="panel-message">没有符合此状态的 Job。</p> : null}
         {jobs.data ? <div className="list-footer"><nav className="pagination" aria-label="Job 分页"><button className="button button-quiet" disabled={page <= 1} onClick={() => update('page', String(page - 1))}>上一页</button><span>第 {page} / {lastPage} 页</span><button className="button button-quiet" disabled={page >= lastPage} onClick={() => update('page', String(page + 1))}>下一页</button></nav><span>共 {jobs.data.total} 个 Job</span></div> : null}
       </section>
       {jobId ? <JobDialog userId={userId} experimentId={id} jobId={jobId} running={active(item.status)}
-        streamOutput={item.execution_config?.stream_output === true} onClose={() => setJobId(null)} /> : null}
+        streamOutput={item.execution_config?.stream_output === true} onClose={() => update('job', '')} /> : null}
       {showSamples ? <DatasetDetail userId={userId} id={item.dataset_id} versionId={item.dataset_version_id} onClose={() => setShowSamples(false)} /> : null}
     </> : null}
   </>

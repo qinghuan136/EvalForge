@@ -67,7 +67,9 @@ class AttemptService:
         # Python 的 True == 1，但它们是不同 JSON 结果；键顺序不影响幂等。
         def encoded(value):
             return json.dumps(value, sort_keys=True, allow_nan=False, separators=(",", ":"))
-        if encoded(attempt.result_json) != encoded(result.model_dump()):
+        stored = dict(attempt.result_json or {})
+        stored.setdefault("trace_id", None)  # 旧 Runner 已确认的结果可能没有这个字段。
+        if encoded(stored) != encoded(result.model_dump()):
             raise AttemptError("Conflicting final result")
 
     @staticmethod
@@ -107,10 +109,12 @@ class AttemptService:
             now = datetime.now(timezone.utc)
             attempt.status = result.status
             attempt.result_json, attempt.result_received_at = result.model_dump(), now
+            attempt.trace_id = result.trace_id
             attempt.unknown_reason = None
             if not update_job:
                 return
             job.status = result.status
+            job.trace_id = result.trace_id
             job.output = {"task_output": result.output}
             job.error = result.error.model_dump() if result.error is not None else None
             job.duration_ms, job.http_status, job.end_time = result.duration_ms, result.http_status, now

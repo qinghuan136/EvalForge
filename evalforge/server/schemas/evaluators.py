@@ -20,7 +20,7 @@ class InputMapping(Schema):
     literal_mapping: Annotated[dict[str, JsonValue], AfterValidator(validate_database_json)] = Field(default_factory=dict)
 
 
-class DatasetEvaluatorCreate(Schema):
+class EvaluatorConfig(Schema):
     name: StoredText = Field(min_length=1, max_length=100)
     evaluator_key: str = Field(min_length=1, max_length=100)
     description: StoredText | None = Field(default=None, max_length=2000)
@@ -32,12 +32,13 @@ class DatasetEvaluatorCreate(Schema):
         return value.strip() if isinstance(value, str) else value
 
 
-class EvaluatorSnapshot(DatasetEvaluatorCreate):
-    dataset_evaluator_id: PositiveDbId
+class EvaluatorSnapshot(EvaluatorConfig):
+    dataset_evaluator_id: PositiveDbId | None = None
     output_configs: list[dict[str, JsonValue]]
 
 
 class DatasetEvaluatorDetail(EvaluatorSnapshot):
+    dataset_evaluator_id: PositiveDbId
     dataset_id: PositiveDbId
 
 

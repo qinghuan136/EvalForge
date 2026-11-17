@@ -12,6 +12,7 @@ import { updateSession } from './queryClient'
 
 const navigation = [
   { to: '/experiments', label: '实验' },
+  { to: '/traces', label: '调用链' },
   { to: '/datasets', label: '数据集' },
   { to: '/runners', label: 'Runners' },
 ]

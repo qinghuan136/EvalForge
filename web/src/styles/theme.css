@@ -180,7 +180,10 @@ a { color: var(--color-accent); }
 .jobs-section { margin-top: 24px; }
 .jobs-heading { display: flex; align-items: end; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
 .jobs-heading select { min-width: 130px; }
-.evaluation-options { border: 1px solid var(--color-border); display: grid; gap: 8px; padding: 12px; }
+.evaluation-options, .evaluation-item { border: 1px solid var(--color-border); display: grid; gap: 12px; margin: 0; min-width: 0; padding: 12px; }
+.evaluation-item-header { display: grid; align-items: end; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+.evaluation-parameter { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 8px; }
+.evaluation-options p { margin: 0; }
 
 .auth-notice { color: var(--color-success); margin-top: 10px; }
 .auth-switch { color: var(--color-text-muted); margin-top: 21px; text-align: center; }
@@ -278,6 +281,83 @@ a { color: var(--color-accent); }
 .pagination [aria-current] { font-variant-numeric: tabular-nums; }
 .runner-total { margin-inline-start: auto; padding-inline-end: 12px; }
 
+.trace-page-actions, .trace-job-actions, .trace-id-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.trace-detail-heading { padding-right: 220px; }
+.trace-id-line { margin-top: 8px; color: var(--color-text-muted); overflow-wrap: anywhere; }
+.trace-filter { display: flex; align-items: end; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+.trace-filter .field { width: min(100%, 340px); }
+.trace-filter p { width: 100%; margin: 0; }
+.trace-table td:nth-child(2) { overflow-wrap: anywhere; }
+.trace-table .trace-match > * { background: var(--color-active); }
+.trace-time { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.trace-meta {
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin: 0 0 16px;
+  padding: 14px 18px;
+}
+.trace-meta dt { color: var(--color-text-muted); font-size: 12px; }
+.trace-meta dd { margin: 4px 0 0; overflow-wrap: anywhere; }
+.trace-layout { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.trace-inspector { min-width: 0; border: 1px solid var(--color-border); background: var(--color-surface); }
+.trace-panel-head {
+  display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap;
+  gap: 5px 10px; padding: 14px 16px; border-bottom: 1px solid var(--color-border);
+}
+.trace-panel-head h2 { font-size: 16px; margin: 0; overflow-wrap: anywhere; }
+.trace-panel-head p { margin: 0; }
+.trace-panel-body { padding: 14px 16px; margin: 0; min-width: 0; }
+.trace-tree-scroll { max-height: 65dvh; overflow: auto; }
+.trace-tree-head, .trace-tree li { display: grid; grid-template-columns: minmax(0, 1fr) minmax(120px, 43%); }
+.trace-tree-head {
+  position: sticky; top: 0; z-index: 1; background: var(--color-surface-muted);
+  align-items: center; padding-block: 6px; font-size: 12px; color: var(--color-text-muted);
+}
+.trace-tree-head > :first-child { padding-inline: 10px; }
+.trace-ticks { display: flex; justify-content: space-between; gap: 4px; white-space: nowrap; }
+.trace-tree { list-style: none; margin: 0; padding: 0; }
+.trace-tree li { border-top: 1px solid var(--color-divider); min-height: 42px; }
+.trace-node-selected { background: var(--color-active); }
+.trace-node { display: flex; align-items: stretch; min-width: 0; }
+.trace-toggle, .trace-node-label, .trace-tabs button { border: 0; background: transparent; color: inherit; cursor: pointer; }
+.trace-toggle { width: 21px; padding: 0; flex: none; color: var(--color-text-muted); }
+.trace-node-label { padding: 6px 7px 6px 2px; flex: 1; min-width: 0; text-align: left; }
+.trace-node-label > * { display: block; overflow-wrap: anywhere; }
+.trace-node-label small { color: var(--color-text-muted); margin-top: 1px; }
+.trace-span-time, .trace-scale {
+  display: grid; grid-template-columns: minmax(0, 1fr) 66px; align-items: center; gap: 7px;
+  min-width: 0; padding-inline: 8px; color: var(--color-text-muted); font-size: 11px; font-variant-numeric: tabular-nums;
+}
+.trace-span-time > :last-child { text-align: right; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.trace-span-ruler { position: relative; display: block; height: 7px; background: var(--color-surface-muted); border-radius: 2px; }
+.trace-span-ruler span {
+  position: absolute; top: 0; height: 100%; min-width: 2px;
+  border-radius: inherit; background: var(--color-accent);
+}
+.trace-span-ruler [data-error="true"] { background: var(--color-error); }
+.trace-tabs { display: flex; flex-wrap: wrap; gap: 2px; padding-inline: 12px; border-bottom: 1px solid var(--color-border); }
+.trace-tabs button { min-height: 39px; padding: 0 9px; border-bottom: 2px solid transparent; color: var(--color-text-muted); }
+.trace-tabs button[aria-pressed="true"] { border-color: var(--color-accent); color: var(--color-text); }
+.trace-extra { border-top: 1px solid var(--color-divider); padding-block: 9px; }
+.trace-extra summary { cursor: pointer; }
+.trace-attributes { margin: 0; }
+.trace-attributes div + div { border-top: 1px solid var(--color-divider); margin-top: 12px; padding-top: 10px; }
+.trace-attributes dt { overflow-wrap: anywhere; }
+.trace-attributes dd { margin: 4px 0 0; }
+.trace-raw {
+  margin: 0; padding: 10px; background: var(--color-surface-muted);
+  font: 12px/1.5 var(--font-mono); max-height: 52dvh; overflow: auto;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
 @media (max-width: 700px) {
   :root { --content-gutter: 20px; }
   .workspace { align-content: start; grid-template-columns: minmax(0, 1fr); }
@@ -299,4 +379,8 @@ a { color: var(--color-accent); }
   .page-action { position: static; margin-top: 16px; }
   .dialog-body { padding: 18px; }
   .experiment-overview { grid-template-columns: 1fr; }
+  .trace-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .trace-layout { grid-template-columns: minmax(0, 1fr); }
+  .trace-tree-scroll { max-height: 50dvh; }
+  .trace-span-time, .trace-scale { grid-template-columns: minmax(0, 1fr) 50px; }
 }

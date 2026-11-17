@@ -4,11 +4,11 @@
 
 ## 启用
 
-1. 已有核心表（含 `users`）且没有本地 Alembic 版本的数据库：执行 `python -m alembic upgrade head`，新增会话表和消息表。Compose 环境可用 `docker compose --env-file .env.compose exec cloud-a python -m alembic upgrade head`。若实例已有自行管理的迁移历史，把新增迁移接到现有链上，避免覆盖版本记录。
+1. 已有核心表（含 `users` 和 `runner_attempts`）且由仓库 Alembic 管理的数据库：执行 `python -m alembic upgrade head`，应用尚未执行的增量迁移。Compose 环境可用 `docker compose --env-file .env.compose exec cloud-a python -m alembic upgrade head`。若实例已有自行管理的迁移历史，把新增迁移接到现有链上，避免覆盖版本记录。
 2. 在 `.env`（Compose 为 `.env.compose`）设置 `EVALFORGE_ASSISTANT_MODELS` 与 `EVALFORGE_ASSISTANT_API_KEY`。模型名以英文逗号分隔，第一项是默认模型。同一会话可从清单里逐轮选模型。可选的 `EVALFORGE_ASSISTANT_BASE_URL` 指向支持 Chat Completions 和工具调用的 OpenAI 兼容入口。省略时使用默认 OpenAI 入口。
 3. 启动现有后端和前端。默认一轮最多等待 90 秒，租约 45 秒、每 10 秒续租；环境变量见 `.env.example`。Compose 网关等待聊天响应 120 秒；若调高模型等待时间，需同步检查网关超时。
 
-全新数据库需先创建 EvalForge 核心表。开发环境可从项目根目录运行以下命令创建**完整当前结构**，再标记助手迁移已包含：
+全新数据库需先创建 EvalForge 核心表。开发环境可从项目根目录运行以下命令创建**完整当前结构**，再将迁移版本标记到当前 `head`：
 
 ```powershell
 @'
@@ -22,7 +22,7 @@ async def setup():
 
 asyncio.run(setup())
 '@ | python -
-python -m alembic stamp 20261116_assistant
+python -m alembic stamp head
 ```
 
 ## HTTP 接口

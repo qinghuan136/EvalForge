@@ -41,6 +41,8 @@ class RunnerAttempt(HasId):
     status: Mapped[str] = mapped_column(default="assigned", server_default="assigned")
     dispatch_json: Mapped[dict[str, Any]] = mapped_column(JSON_VALUE)
     result_json: Mapped[dict[str, Any] | None] = mapped_column(JSON_VALUE)
+    # Trace 上报可以晚于执行结果，按用户与 OTLP Trace ID 关联，不设外键。
+    trace_id: Mapped[str | None]
     dispatched_at: Mapped[datetime | None] = mapped_column(UTC_TIMESTAMP)
     accepted_at: Mapped[datetime | None] = mapped_column(UTC_TIMESTAMP)
     started_reported_at: Mapped[datetime | None] = mapped_column(UTC_TIMESTAMP)

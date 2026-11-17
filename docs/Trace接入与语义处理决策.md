@@ -15,3 +15,5 @@ EvalForge仅提供**基础OpenTelemetry（OTel）Trace能力**，通过OTLP接�
 ## 边界
 
 **支持任意属性的存储与展示，不等于支持其专有语义。** 用户自行决定埋点方式及属性内容，EvalForge不要求使用OpenInference Instrumentation。
+
+接收端配置和写入行为见 [OTLP Trace 上报](OTLP接收.md)。

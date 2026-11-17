@@ -9,6 +9,11 @@ from contextlib import contextmanager
 from functools import partial
 from time import monotonic
 
+from opentelemetry.context import Context
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.sampling import ALWAYS_ON
+from opentelemetry.trace import SpanKind, format_trace_id, set_span_in_context
+
 from .attempts import AttemptConflict, AttemptRepository
 from .http_executor import HttpExecutor, HttpExecutionResult
 from .models import RunnerAttempt, encode_json
@@ -16,6 +21,8 @@ from .rpc import RpcError
 from .stream_output import OutputAccumulator, OutputChunk
 
 logger = logging.getLogger(__name__)
+# Local provider: Runner propagates context without registering a global tracer or exporter.
+_tracer = TracerProvider(sampler=ALWAYS_ON, shutdown_on_exit=False).get_tracer(__name__)
 
 
 class JobManager:
@@ -160,14 +167,21 @@ class JobManager:
                         row.job_id, row.attempt_id, row.agent_target_id)
             # 与取消共享锁，保证 running 提交后、HTTP Task 建立前不会遗漏取消信号。
             started = monotonic()
+            span = _tracer.start_span(
+                "evalforge.agent.request", context=Context(), kind=SpanKind.CLIENT,
+                record_exception=False, set_status_on_exception=False,
+            )
+            trace_id = format_trace_id(span.get_span_context().trace_id)
             options = {}
             if row.stream_output:
                 options = {"stream_output": True, "on_chunk": partial(self._offer_output, (row.job_id, row.attempt_id))}
             http_task = self._http_task = asyncio.create_task(self.executor.execute(
-                row.agent_target_id, row.input_json, timeout_seconds=row.timeout_seconds, **options,
+                row.agent_target_id, row.input_json, timeout_seconds=row.timeout_seconds,
+                trace_context=set_span_in_context(span, Context()), **options,
             ), name="evalforge-agent-http")
         try:
-            outcome = await http_task
+            with span:
+                outcome = await http_task
         except asyncio.CancelledError:
             if self._closed:
                 logger.warning("HTTP wait stopped during shutdown; execution unresolved job_id=%r attempt_id=%r",
@@ -176,7 +190,7 @@ class JobManager:
             current = await self.attempts.get(row.job_id, row.attempt_id)
             if not current.cancel_requested:
                 raise
-            await self._finish_cancelled(current, duration_ms=(monotonic() - started) * 1000)
+            await self._finish_cancelled(current, duration_ms=(monotonic() - started) * 1000, trace_id=trace_id)
             return
         except Exception as exc:
             logger.error("Unexpected executor failure job_id=%r attempt_id=%r error_type=%s",
@@ -191,17 +205,18 @@ class JobManager:
             "job_id": row.job_id, "attempt_id": row.attempt_id,
             "status": "succeeded" if outcome.error is None else "failed",
             "output": outcome.output, "duration_ms": outcome.duration_ms,
-            "http_status": outcome.http_status, "error": outcome.error,
+            "http_status": outcome.http_status, "error": outcome.error, "trace_id": trace_id,
         })
         logger.log(logging.INFO if outcome.error is None else logging.WARNING,
                    "Job result saved job_id=%r attempt_id=%r status=%s delivery=pending http_status=%s duration_ms=%.1f error_code=%r",
                    row.job_id, row.attempt_id, "succeeded" if outcome.error is None else "failed",
                    outcome.http_status, outcome.duration_ms, None if outcome.error is None else outcome.error["code"])
 
-    async def _finish_cancelled(self, row: RunnerAttempt, *, duration_ms: float = 0) -> None:
+    async def _finish_cancelled(self, row: RunnerAttempt, *, duration_ms: float = 0,
+                                trace_id: str | None = None) -> None:
         await self.attempts.finish(row.job_id, row.attempt_id, {
             "job_id": row.job_id, "attempt_id": row.attempt_id, "status": "cancelled",
-            "output": None, "duration_ms": duration_ms, "http_status": None,
+            "output": None, "duration_ms": duration_ms, "http_status": None, "trace_id": trace_id,
             "error": {"code": "cancelled", "message": (
                 "Client stopped waiting for Agent; the remote Agent may still be running"
                 if row.started_at is not None or duration_ms > 0 else "Cancelled before Agent invocation"

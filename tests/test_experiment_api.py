@@ -14,6 +14,8 @@ from evalforge.db.models import (
     ExperimentDatasetExample, Job, JobEvaluation, Runner, RunnerAttempt,
 )
 from evalforge.server.runner_connections import RUNNER_SESSION_PREFIX, RegisteredConnection, RunnerConnections
+from evalforge.server.services.evaluation_queries import missing_evaluation_items
+from evalforge.server.services.evaluations import EvaluationService
 
 
 class ExperimentAPITests(APITestCase):
@@ -165,6 +167,61 @@ class ExperimentAPITests(APITestCase):
         detail = await self.client.get(created.headers["location"])
         self.assertEqual(detail.status_code, 200, detail.text)
         self.assertEqual(detail.json()["evaluators"], expected)
+
+    async def test_inline_evaluators_are_frozen_and_score_independent_fields(self):
+        mappings = [
+            self.evaluator_payload(name="answer", input_mapping={
+                "path_mapping": {"actual": "$.output.answer", "expected": "$.reference.answer"},
+            }),
+            self.evaluator_payload(name="category", input_mapping={
+                "path_mapping": {"actual": "$.output.category", "expected": "$.reference.category"},
+                "literal_mapping": {"case_sensitive": False},
+            }),
+        ]
+        async with self.database.transaction() as db:
+            revision = await db.get(DatasetExampleRevision, self.updated_revision)
+            revision.output = {"answer": "Paris", "category": "Geography"}
+        created = (await self.create_experiment(evaluators=mappings)).json()
+        experiment_id = created["experiment_id"]
+        self.assertEqual([row["name"] for row in created["evaluators"]], ["answer", "category"])
+        self.assertTrue(all(row["dataset_evaluator_id"] is None for row in created["evaluators"]))
+        self.assertEqual(created["evaluators"][1]["output_configs"][0]["name"], "category")
+
+        async with self.database.transaction() as db:
+            self.assertEqual(await db.scalar(select(func.count()).select_from(DatasetEvaluators)), 0)
+            experiment = await db.get(Experiment, experiment_id)
+            experiment.status = "running"
+            job = await db.scalar(select(Job).where(Job.experiment_id == experiment_id,
+                                                    Job.dataset_example_id == self.example_ids[0]))
+            job.status = "succeeded"
+            job.output = {"task_output": {"answer": "London", "category": "geography"}}
+            job_pk = job.id
+            await db.flush()
+            items = await missing_evaluation_items(db, Job.id == job_pk)
+
+        service = EvaluationService(self.database)
+        for _, item in items:
+            await service.run(item)
+        async with self.database.transaction() as db:
+            scores = (await db.execute(select(JobEvaluation.name, JobEvaluation.score, JobEvaluation.error)
+                                       .where(JobEvaluation.experiment_run_id == job_pk)
+                                       .order_by(JobEvaluation.name))).all()
+        self.assertEqual(scores, [("answer", 0.0, None), ("category", 1.0, None)])
+
+    async def test_invalid_inline_evaluators_do_not_create_experiments(self):
+        first = self.evaluator_payload()
+        for changes, status, code in (
+            ({"evaluators": [first, self.evaluator_payload(name=" category_match ")]}, 422, "invalid_request"),
+            ({"evaluators": [first], "dataset_evaluator_ids": [1]}, 422, "invalid_request"),
+            ({"evaluators": [self.evaluator_payload(evaluator_key="missing")]}, 404, "builtin_evaluator_not_found"),
+            ({"evaluators": [self.evaluator_payload(input_mapping={"path_mapping": {"actual": "$.output"}})]},
+             422, "invalid_input_mapping"),
+        ):
+            with self.subTest(changes=changes):
+                response = await self.client.post(self.path, json=self.payload(**changes))
+                self.assert_error(response, status, code)
+        async with self.database.transaction() as db:
+            self.assertEqual(await db.scalar(select(func.count()).select_from(Experiment)), 0)
 
     async def test_binding_insert_failure_rolls_back_new_builtin_catalog_row(self):
         engine = self.database.engine.sync_engine
@@ -368,6 +425,7 @@ class ExperimentAPITests(APITestCase):
             success, failure, queued = (await db.scalars(select(Job).where(Job.experiment_id == experiment_id)
                                                          .order_by(Job.id))).all()
             success.status, success.output = "succeeded", {"task_output": [1, {"text": "yes"}, None]}
+            success.trace_id = "a1" * 16
             success.start_time = success.end_time = now
             failure.status, failure.output = "failed", {"task_output": None}
             failure.error = {"code": "timeout", "message": "timed out"}
@@ -381,6 +439,7 @@ class ExperimentAPITests(APITestCase):
         self.assertEqual((detail["input"], detail["reference"], detail["metadata"]),
                          ({"version": self.v1}, {"expected": "yes"}, {"tag": "frozen"}))
         self.assertEqual(detail["output"], [1, {"text": "yes"}, None])
+        self.assertEqual(detail["trace_id"], "a1" * 16)
         self.assertEqual(detail["started_at"], "2026-11-12T08:00:00Z")
         self.assertEqual(detail["ended_at"], detail["started_at"])
         self.assertIsNone(detail["error"])
@@ -393,6 +452,7 @@ class ExperimentAPITests(APITestCase):
         self.assertEqual((failed["status"], failed["output"], failed["error"], failed["evaluations"]),
                          ("failed", None, failure.error, []))
         pending = (await self.client.get(f"{path}/{queued.job_id}")).json()
+        self.assertIsNone(pending["trace_id"])
         self.assertEqual((pending["status"], pending["output"], pending["started_at"], pending["ended_at"]),
                          ("queued", None, None, None))
 

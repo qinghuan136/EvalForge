@@ -76,6 +76,7 @@ class CancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.execution_status, "cancelled")
         self.assertIsNone(first.started_at)
         self.assertEqual(first.cancel_reason, "user_requested")
+        self.assertIsNone(first.result_json["trace_id"])
         self.assertEqual((await self.repo.get("j1", "a1")).result_json, first.result_json)
         self.assertEqual(self.requests, [])
 
@@ -88,6 +89,7 @@ class CancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.result_json["error"]["code"], "cancelled")
         self.assertIn("remote Agent may still be running", result.result_json["error"]["message"])
         self.assertGreater(result.result_json["duration_ms"], 0)
+        self.assertEqual(result.result_json["trace_id"], self.requests[0].headers["traceparent"].split("-")[1])
         self.assertTrue(self.body.closed.is_set())
         self.assertEqual([(r.method, r.url.path) for r in self.requests], [("POST", "/invoke")])
         # pending 的取消结果不占新执行容量；没有任何 Agent 取消接口请求。

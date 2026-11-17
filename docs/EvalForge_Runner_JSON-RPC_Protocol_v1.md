@@ -80,7 +80,7 @@
 ### 2.5 `jobs.complete`
 
 ```json
-{"jsonrpc":"2.0","method":"jobs.complete","params":{"job_id":"job-01","attempt_id":"a-01","status":"succeeded","output":{"reply":"订单尚未发货"},"duration_ms":850,"http_status":200,"error":null},"id":5}
+{"jsonrpc":"2.0","method":"jobs.complete","params":{"job_id":"job-01","attempt_id":"a-01","status":"succeeded","output":{"reply":"订单尚未发货"},"duration_ms":850,"http_status":200,"error":null,"trace_id":"a821000000000000000000000000f310"},"id":5}
 ```
 
 ```json
@@ -90,6 +90,7 @@
 - `status`：`succeeded` / `failed` / `cancelled`；失败时 `error` 为 `{ "code": "timeout", "message": "..." }` 等结构化信息。
 - `output` 是 Agent **本次实际输出**（流式模式取终止 SSE `result` 事件中的 JSON），不是 Dataset 的预期输出。
 - Cloud 按 `job_id + attempt_id` **幂等保存**结果；Runner 在收到确认前应保留结果并可重试上报。
+- `trace_id` 可省略或为 `null`；存在时为 32 位非全零小写十六进制。它来自本次 Agent HTTP 请求的 `traceparent`，随本地结果一起保存和重传。Cloud 将它保存到对应 Attempt，且仅当采用这次结果时写入 Job。缺失与 `null` 对幂等比较等价；已保存结果的非空 Trace ID 不能改写。OTLP 上报可早于或晚于结果；确认结果无需等待 Span 入库。
 - **业务执行失败**放在 `status=failed`；**RPC 请求无效**才使用 JSON-RPC 的 `error`。
 
 ### 2.6 `runner.sync`

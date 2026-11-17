@@ -14,6 +14,7 @@ from .orm.evaluators import (
     LLMEvaluator,
 )
 from .orm.experiments import Experiment, ExperimentDatasetExample, Job, JobEvaluation
+from .orm.traces import Span, Trace
 
 # Register the experiments table before mapping the inherited legacy config.
 from .orm.experiment_configs import (
@@ -26,4 +27,5 @@ __all__ = [
     "Evaluator", "CodeEvaluator", "CodeEvaluatorVersion", "LLMEvaluator", "BuiltinEvaluator",
     "DatasetEvaluators", "ExperimentConfig", "ExperimentPromptTask", "ExperimentEvalOnlyConfig",
     "ExperimentDatasetEvaluator", "RunnerAttempt", "User", "Runner", "RunnerCredential",
+    "Trace", "Span",
 ]
