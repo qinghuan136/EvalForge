@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints, model_validator
 
 from .common import PositiveDbId, StoredText
 from .page_context import ExperimentPageContext, PageContext
@@ -64,6 +64,14 @@ class AssistantSessionDetail(AssistantSessionSummary):
     messages: list[AssistantMessageView]
 
 
+class AssistantAction(BaseModel):
+    id: str
+    tool: Literal["RUNNER_create_runner", "RUNNER_delete_runner", "DATASET_import_dataset",
+                  "EXPERIMENT_create_experiment", "EXPERIMENT_cancel_experiment"]
+    arguments: dict[str, JsonValue]
+
+
 class AssistantChatResponse(BaseModel):
     version: int
     messages: list[AssistantMessageView]
+    actions: list[AssistantAction] = Field(default_factory=list)

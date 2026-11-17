@@ -77,9 +77,12 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
             app.state.dataset_evaluators = DatasetEvaluatorService(db)
             app.state.experiments = ExperimentService(
                 db, connections, on_created=scheduler.experiment_created, on_cancelled=scheduler.experiment_cancelled)
-            app.state.assistant = AssistantService(db, app.state.experiments, config)
             app.state.trace_ingest = TraceIngestService(db)
             app.state.trace_queries = TraceQueryService(db)
+            app.state.assistant = AssistantService(
+                db, app.state.experiments, config, runners=app.state.runners,
+                datasets=app.state.datasets, traces=app.state.trace_queries,
+            )
             scheduler.start()
             resources.push_async_callback(scheduler.close)
             # 注入资源由调用方管理；应用创建的资源由 AsyncExitStack 按逆序关闭。

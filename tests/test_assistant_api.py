@@ -13,6 +13,7 @@ from sqlalchemy import func, select, update
 
 from api_support import APITestCase
 from evalforge.db.models import AssistantMessage, AssistantSession, Dataset, DatasetExample, DatasetVersion, Experiment, Job, Runner
+from evalforge.server.assistant.tools import ASSISTANT_TOOLS
 from evalforge.server.schemas.page_context import PageContextCatalog
 
 SESSIONS = "/api/v1/assistant/sessions"
@@ -81,8 +82,9 @@ class AssistantAPITests(APITestCase):
                 if not isinstance(tail, ToolReturnPart):
                     seen_history.append([part.tool_call_id for message in messages for part in message.parts
                                          if isinstance(part, ToolReturnPart)])
-                    self.assertEqual([tool.name for tool in info.function_tools], ["get_experiment_progress"])
-                    return ModelResponse(parts=[ToolCallPart("get_experiment_progress", {}, tool_call_id=name)])
+                    self.assertIn("EXPERIMENT_get_experiment_detail", {tool.name for tool in info.function_tools})
+                    return ModelResponse(parts=[ToolCallPart("EXPERIMENT_get_experiment_detail",
+                                                          {"experiment_id": self.experiment_id}, tool_call_id=name)])
                 self.assertEqual(tail.content["experiment_id"], self.experiment_id)
                 self.assertEqual(tail.content["status"], "running")
                 return ModelResponse(parts=[TextPart("实验正在执行")], provider_name="test-provider")
@@ -108,6 +110,69 @@ class AssistantAPITests(APITestCase):
             rows = (await db.scalars(select(AssistantMessage).order_by(AssistantMessage.id))).all()
             self.assertEqual([m.role for m in rows], ["user", "assistant", "tool", "assistant"] * 2)
             self.assertEqual([m.content["v"] for m in rows], [1] * 8)
+
+    async def test_runner_tool_checks_ownership_without_page_context(self):
+        own = (await self.client.post("/api/v1/runners", json={"name": "本人的 Runner"})).json()
+        other = self.new_client()
+        await self.register("bob", other)
+        await self.login(other, username="bob")
+        foreign = (await other.post("/api/v1/runners", json={"name": "别人的 Runner"})).json()
+
+        def respond(messages, _):
+            returns = [part for part in messages[-1].parts if isinstance(part, ToolReturnPart)]
+            if not returns:
+                return ModelResponse(parts=[
+                    ToolCallPart("RUNNER_get_runner_detail", {"runner_id": record["runner"]["runner_id"]}, tool_call_id=key)
+                    for key, record in (("own", own), ("foreign", foreign))
+                ])
+            by_id = {part.tool_call_id: part.content for part in returns}
+            self.assertEqual(by_id["own"]["name"], "本人的 Runner")
+            self.assertEqual(by_id["own"]["connection"]["phase"], "disconnected")
+            self.assertNotIn("credential", by_id["own"])
+            self.assertEqual(by_id["foreign"]["error"]["code"], "runner_not_found")
+            return ModelResponse(parts=[TextPart("查询完成")])
+
+        with patch("evalforge.server.services.assistant.build_model", return_value=FunctionModel(respond)):
+            response = await self.chat(experiment_id=None)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["actions"], [])
+
+    async def test_write_tools_return_confirmable_arguments_without_writing(self):
+        runner = (await self.client.post("/api/v1/runners", json={"name": "测试 Runner"})).json()["runner"]
+        content = '{"input":{"question":"hello"}}\n'
+        imported = await self.client.post("/api/v1/datasets/import", data={"name": "源数据集", "format": "jsonl"},
+                                          files={"file": ("sample.jsonl", content)})
+        self.assertEqual(imported.status_code, 201, imported.text)
+        dataset = imported.json()
+        requests = {
+            "RUNNER_create_runner": {"name": "待创建"},
+            "RUNNER_delete_runner": {"runner_id": runner["runner_id"]},
+            "DATASET_import_dataset": {"name": "待导入", "format": "jsonl", "content": content},
+            "EXPERIMENT_create_experiment": {"dataset_id": dataset["dataset_id"], "name": "待启动",
+                                             "execution_config": {"runner_id": runner["runner_id"], "agent_target_id": "agent"}},
+            "EXPERIMENT_cancel_experiment": {"experiment_id": self.experiment_id},
+        }
+
+        def respond(messages, _):
+            returns = [part for part in messages[-1].parts if isinstance(part, ToolReturnPart)]
+            if not returns:
+                return ModelResponse(parts=[ToolCallPart(tool, args, tool_call_id=tool) for tool, args in requests.items()])
+            self.assertEqual({part.content["status"] for part in returns}, {"requires_confirmation"})
+            return ModelResponse(parts=[TextPart("请确认待执行操作")])
+
+        with patch("evalforge.server.services.assistant.build_model", return_value=FunctionModel(respond)):
+            response = await self.chat(experiment_id=None)
+        self.assertEqual(response.status_code, 200, response.text)
+        actions = {action["tool"]: action["arguments"] for action in response.json()["actions"]}
+        self.assertEqual(actions.keys(), requests.keys())
+        self.assertEqual(actions["EXPERIMENT_create_experiment"]["dataset_version_id"], dataset["dataset_version_id"])
+        self.assertEqual(actions["DATASET_import_dataset"]["content"], content)
+        async with self.database.transaction() as db:
+            self.assertEqual(await db.scalar(select(func.count()).select_from(Runner)), 1)
+            self.assertTrue(await db.scalar(select(Runner.enabled).where(Runner.runner_id == runner["runner_id"])))
+            self.assertEqual(await db.scalar(select(func.count()).select_from(Dataset)), 2)
+            self.assertEqual(await db.scalar(select(func.count()).select_from(Experiment)), 1)
+            self.assertEqual(await db.scalar(select(Experiment.status).where(Experiment.id == self.experiment_id)), "running")
 
     async def test_auth_csrf_owned_experiment_and_model_allowlist(self):
         self.assertEqual((await self.new_client().get(self.path)).status_code, 401)
@@ -178,8 +243,9 @@ class AssistantAPITests(APITestCase):
                 self.assertEqual(user_message["page_context"], context)
                 self.assertIsNone(assistant_message["page_context"])
 
-        self.assertEqual(seen[0][1], ["get_experiment_progress"])
-        self.assertTrue(all(not tools for _, tools in seen[1:]))
+        registered = [tool.__name__ for tool in ASSISTANT_TOOLS]
+        self.assertEqual(len(set(registered)), 17)
+        self.assertTrue(all(tools == registered for _, tools in seen))
         all_prompts = seen[-1][0]
         for index, context in enumerate(contexts):
             block, text = all_prompts[index].split("\n\n", 1)
@@ -278,7 +344,9 @@ class AssistantAPITests(APITestCase):
 
         async def model(messages, _):
             if not isinstance(messages[-1].parts[-1], ToolReturnPart):
-                yield {0: DeltaToolCall(name="get_experiment_progress", json_args="{}", tool_call_id="progress")}
+                yield {0: DeltaToolCall(name="EXPERIMENT_get_experiment_detail",
+                                        json_args=json.dumps({"experiment_id": self.experiment_id}),
+                                        tool_call_id="progress")}
                 return
             self.assertEqual(messages[-1].parts[-1].content["experiment_id"], self.experiment_id)
             yield "实验"
@@ -308,7 +376,7 @@ class AssistantAPITests(APITestCase):
                 self.assertTrue(completed.startswith("event: done\n"))
                 result = json.loads(completed.splitlines()[1].removeprefix("data: "))
                 detail = (await self.client.get(self.path)).json()
-                self.assertEqual(result, {"version": 1, "messages": detail["messages"]})
+                self.assertEqual(result, {"version": 1, "messages": detail["messages"], "actions": []})
                 self.assertEqual(result["messages"][-1]["source_experiment_id"], self.experiment_id)
                 self.assertEqual(result["messages"][-1]["text"], "实验正在执行")
                 await asyncio.wait_for(task, 5)

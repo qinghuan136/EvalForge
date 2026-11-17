@@ -1,7 +1,7 @@
 """Resolve page references and render the model-facing message context."""
 
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import assert_never
 
 from pydantic_ai import ModelMessagesTypeAdapter
@@ -12,17 +12,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from evalforge.db.models import DatasetVersion, Experiment, Job, Runner
 
 from ..errors import APIError
+from ..schemas.assistant import AssistantAction
 from ..schemas.page_context import DatasetPageContext, ExperimentPageContext, JobPageContext, PageContext, RunnerPageContext
-from ..services.datasets import require_owned_dataset
+from ..services.datasets import DatasetService, require_owned_dataset
 from ..services.experiments import ExperimentService
+from ..services.runners import RunnerService
+from ..services.traces import TraceQueryService
 
 
 @dataclass
 class AssistantDeps:
     owner_id: int
-    page_context: PageContext | None
     experiments: ExperimentService
-    progress_read: bool = False
+    runners: RunnerService
+    datasets: DatasetService
+    traces: TraceQueryService
+    actions: list[AssistantAction] = field(default_factory=list)
+    source_experiment_id: int | None = None
 
 
 async def require_accessible_page_context(db: AsyncSession, user_id: int, context: PageContext | None) -> None:

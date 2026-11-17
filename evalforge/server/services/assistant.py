@@ -4,7 +4,7 @@ import asyncio
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from uuid import UUID, uuid4
 
@@ -28,12 +28,14 @@ from ..assistant.context import (
 from ..config import ServerSettings
 from ..errors import APIError
 from ..schemas.assistant import (
-    AssistantChatRequest, AssistantChatResponse, AssistantMessageView, AssistantSessionDetail,
+    AssistantAction, AssistantChatRequest, AssistantChatResponse, AssistantMessageView, AssistantSessionDetail,
     AssistantSessionList, AssistantSessionSummary,
 )
 from ..schemas.common import validate_database_json
-from ..schemas.page_context import ExperimentPageContext
+from .datasets import DatasetService
 from .experiments import ExperimentService
+from .runners import RunnerService
+from .traces import TraceQueryService
 
 logger = logging.getLogger(__name__)
 HISTORY_TURNS = 12
@@ -52,6 +54,7 @@ class AssistantTurn:
     model: str
     history: list[dict]
     finalized: bool = False
+    actions: list[AssistantAction] = field(default_factory=list)
 
 
 def _lease_clock(db: AsyncSession, seconds: int = 0):
@@ -76,10 +79,12 @@ def _lease_lost() -> APIError:
 
 
 class AssistantService:
-    def __init__(self, database: Database, experiments: ExperimentService, config: ServerSettings) -> None:
+    def __init__(self, database: Database, experiments: ExperimentService, config: ServerSettings, *,
+                 runners: RunnerService, datasets: DatasetService, traces: TraceQueryService) -> None:
         self.database = database
         self.experiments = experiments
         self.config = config
+        self.runners, self.datasets, self.traces = runners, datasets, traces
 
     @property
     def models(self) -> tuple[str, ...]:
@@ -151,6 +156,7 @@ class AssistantService:
                 rows = await self._run_with_heartbeat(turn, emit)
             result = await self._save(turn.user_id, turn.session_id, turn.run_id, rows)
             turn.finalized = True
+            result.actions = turn.actions
             return result
         except TimeoutError:
             raise APIError(504, "assistant_timeout", "助手回答超时，请重试") from None
@@ -218,8 +224,7 @@ class AssistantService:
     async def _run(self, turn: AssistantTurn, emit: EmitText | None) -> list[Message]:
         data, model_name = turn.data, turn.model
         context = data.page_context
-        experiment = context if isinstance(context, ExperimentPageContext) else None
-        deps = AssistantDeps(turn.user_id, context, self.experiments)
+        deps = AssistantDeps(turn.user_id, self.experiments, self.runners, self.datasets, self.traces, actions=turn.actions)
         page_context = context.model_dump(mode="json", exclude_none=True) if context is not None else None
 
         async def publish_text(_, events):
@@ -233,7 +238,7 @@ class AssistantService:
 
         try:
             model = build_model(model_name, self.config.assistant_api_key, self.config.assistant_base_url)
-            result = await build_agent(model, has_experiment_context=experiment is not None).run(
+            result = await build_agent(model).run(
                 prompt_with_page_context(data.message, page_context), deps=deps, message_history=history_for_model(turn.history),
                 usage_limits=UsageLimits(request_limit=6, tool_calls_limit=8), model_settings={"max_tokens": 1500},
                 event_stream_handler=publish_text if emit is not None else None,
@@ -252,8 +257,8 @@ class AssistantService:
                 if isinstance(message, ModelResponse):
                     if index == len(messages) - 1:
                         content["text"] = result.output
-                        if deps.progress_read and experiment is not None:
-                            content["source_experiment_id"] = experiment.id
+                        if deps.source_experiment_id is not None:
+                            content["source_experiment_id"] = deps.source_experiment_id
                     row = Message(session_id=turn.session_id, role="assistant", content=content,
                                   model_provider=message.provider_name or "openai",
                                   model_name=message.model_name or model_name)
