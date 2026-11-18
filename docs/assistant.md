@@ -1,6 +1,16 @@
 # EvalForge 评测助手
 
-在登录后的工作台顶部打开「评测助手」，可以在同一会话中跨页面追问。实验详情默认提供当前实验；Job、数据集和 Runner 明细内的「询问评测助手」提供该对象作为上下文。助手使用 Pydantic AI，已注册 [17 个基础工具](assistant-tools.md)。读取工具查当前用户可访问的数据，写工具在对话中生成待确认操作，点击「确认执行」后才调用业务接口。
+在登录后的工作台顶部打开「评测助手」，可以在同一会话中跨页面追问。实验详情默认提供当前实验；Job、数据集和 Runner 明细内的「询问评测助手」提供该对象作为上下文。助手使用 PydanticAI，已注册 [17 个基础工具](assistant-tools.md)。查询工具直接读取数据，五个写工具通过原生 Deferred Tools 等待用户批准后，由后端调用业务 Service，真实结果交给模型继续回答。
+
+## Conversation 与审批
+
+已实现 [Deferred Tools 审批与持久化方案](AgentDeferredTools_审批与持久化方案.md)：前端收齐全部批准/拒绝决定后一次提交，待审批期间不能发送新普通消息。同批写工具逐个执行；拒绝的工具不执行。卡片参数由服务端保存的 Conversation 提供，前端不提交执行参数。
+
+Conversation 先通过异步 fake 函数存入进程内字典，支持同一进程中跨 HTTP 请求恢复；仅支持单个后端进程，重启丢失现场。暂不修改助手数据库表，也不新增 Action 表。获批工具仍操作真实业务数据库，已有消息记录不等于可恢复的 Conversation。
+
+网页使用统一 `POST /api/v1/assistant/stream`，通过 `type=message/decision` 分流。数据库继续保存可展示消息与原有执行租约，fake 记录完整执行现场并以会话级锁协调同一进程内的运行。重启后已有历史可看，但现场缺失的旧会话需新建后再聊天；不会根据旧历史重放审批。
+
+后续 [ConversationStore 数据库存储](ConversationStore方案.md) 的两张表及 ORM、增量迁移已定义；尚未接入 Backend，旧助手表仍保留。执行迁移不代表审批现场已经改为数据库保存。
 
 ## 启用
 
@@ -33,10 +43,14 @@ python -m alembic stamp head
 | --- | --- |
 | `GET /sessions` | 最近 50 个会话和允许选择的模型名称 |
 | `POST /sessions`，`{"title":"实验对话"}` | 新会话的 ID、标题与初始版本 |
-| `GET /sessions/{id}` | 会话版本与最近 100 条可见消息 |
-| `POST /sessions/{id}/chat` | 默认返回本轮消息、更新后的会话版本和待确认操作；发送 `Accept: text/event-stream` 可逐段接收回答 |
+| `GET /sessions/{id}` | 会话版本、最近 100 条可见消息、`status`、待审批 `actions`、`credential_call_ids` 和 `error` |
+| `POST /stream` | 统一 SSE 入口，接收普通消息或整批审批决定，结构见[方案](AgentDeferredTools_审批与持久化方案.md#5-请求与响应) |
+| `POST /sessions/{id}/chat` | 兼容旧普通消息请求；默认 JSON，Accept 为 SSE 时返回事件流；同样使用原生审批 |
+| `POST /sessions/{id}/runner-credentials/{tool_call_id}` | 当前用户一次性领取 Agent 创建的 Runner 的完整创建响应；已领取或不存在返回 `404` |
 
-聊天请求示例：`{"page_context":{"type":"experiment","id":42},"expected_version":0,"message":"跑到哪里了？","model_name":"配置中的模型名"}`。省略模型时使用默认值。每轮带入最多 12 个完整历史轮次；会话忙、版本过期或失去执行权时返回 `409`。
+统一入口请求示例：`{"type":"message","session_id":42,"page_context":{"type":"experiment","id":7},"expected_version":0,"message":"跑到哪里了？","model_name":"配置中的模型名"}`。省略模型时使用默认值；审批恢复沿用暂停时的模型。历史通过完整 Conversation 继续，不再从 SQL 截取最近 12 轮重建。会话忙、版本过期、现场丢失或失去执行权返回 `409`。
+
+凭证只存进程内独立容器，领取需登录 Cookie 和 CSRF，不进入模型、Conversation、普通 SSE 或查询缓存。网络失败后可能无法再次领取；进程重启也会丢失未领取凭证，此时可删除并重建 Runner。
 
 ## 页面上下文
 
@@ -60,9 +74,10 @@ python -m alembic stamp head
 | 事件 | `data` | 客户端处理 |
 | --- | --- | --- |
 | `text_delta` | `{"text":"实验正在"}` | 追加到临时预览，JSON 内的换行保留 |
-| `done` | `{"version":1,"messages":[...],"actions":[]}` | 整轮已经入库，更新会话版本，展示待确认操作 |
+| `action_required` | `{"version":1,"actions":[{"tool_call_id":"call_1","tool":"RUNNER_create_runner","arguments":{"name":"本地开发"}}]}` | Conversation 已保存，按工具类型展示卡片 |
+| `done` | `{"version":1,"status":"awaiting_approval","messages":[...],"actions":[...]}` | 本次 Run 已保存；`completed` 表示本次完成，`awaiting_approval` 表示需审批后继续 |
 | `error` | `{"code":"assistant_timeout","message":"助手回答超时，请重试"}` | 丢弃临时预览，提示失败 |
 
-无事件时每 15 秒发一条 SSE 注释保活。分片本身不持久化；如果流提前结束且没收到 `done`，重新读取会话详情确认本轮是否入库，再决定是否重试。服务端检测到断开会取消仍在运行的对话并尝试释放租约；已经提交的结果仍可从历史读取。现有网页继续使用默认 JSON 响应。
+无事件时每 15 秒发一条 SSE 注释保活。分片本身不持久化；未收到 `done` 时重新读取会话详情，不自动重放批准请求。断开会取消仍在运行的 Run 并释放租约；审批恢复中断则记录 `assistant_execution_uncertain`，阻止继续重放，应先查询真实业务状态再新建会话。已提交的消息仍可从 SQL 历史读取。真实模型调用与审批恢复不具备跨进程、跨重启的持久执行保证。
 
 表结构和事务边界见 [会话与消息设计](Agent会话与消息表设计.md)。

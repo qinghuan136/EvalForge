@@ -1,4 +1,31 @@
 {
+  "assistant_conversation_records": {
+    "conversation_id": false,
+    "head_id": true,
+    "revision": false,
+    "scope": false,
+    "usage": false,
+    "deferred_tool_requests": true,
+    "forked_from": true,
+    "forked_at": true,
+    "branches": false,
+    "updated_at": false,
+    "format_version": false,
+    "user_id": false,
+    "title": false,
+    "status": false,
+    "active_run_id": true,
+    "lease_expires_at": true,
+    "resume_model_name": true,
+    "last_error": true,
+    "created_at": false
+  },
+  "assistant_conversation_entries": {
+    "id": false,
+    "parent_id": true,
+    "message": false,
+    "kind": false
+  },
   "assistant_sessions": {
     "id": false,
     "user_id": false,

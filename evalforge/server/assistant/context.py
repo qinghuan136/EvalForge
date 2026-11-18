@@ -1,18 +1,18 @@
 """Resolve page references and render the model-facing message context."""
 
 import json
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
+from collections.abc import Awaitable, Callable
 from typing import assert_never
 
-from pydantic_ai import ModelMessagesTypeAdapter
-from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from evalforge.db.models import DatasetVersion, Experiment, Job, Runner
 
 from ..errors import APIError
-from ..schemas.assistant import AssistantAction
+from ..schemas.runners import RunnerCreateResponse
 from ..schemas.page_context import DatasetPageContext, ExperimentPageContext, JobPageContext, PageContext, RunnerPageContext
 from ..services.datasets import DatasetService, require_owned_dataset
 from ..services.experiments import ExperimentService
@@ -27,7 +27,9 @@ class AssistantDeps:
     runners: RunnerService
     datasets: DatasetService
     traces: TraceQueryService
-    actions: list[AssistantAction] = field(default_factory=list)
+    auth_version: int
+    check_execution: Callable[[], Awaitable[None]]
+    deliver_credential: Callable[[str, RunnerCreateResponse], None]
     source_experiment_id: int | None = None
 
 
@@ -75,11 +77,3 @@ def with_user_text(message: ModelRequest, text: str) -> ModelRequest:
         replace(part, content=text) if isinstance(part, UserPromptPart) else part
         for part in message.parts
     ])
-
-
-def history_for_model(stored: list[dict]) -> list[ModelMessage]:
-    messages = ModelMessagesTypeAdapter.validate_python([entry["message"] for entry in stored])
-    for index, (message, entry) in enumerate(zip(messages, stored, strict=True)):
-        if isinstance(message, ModelRequest) and (context := entry.get("page_context")) is not None:
-            messages[index] = with_user_text(message, prompt_with_page_context(entry["text"], context))
-    return messages

@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 from datetime import datetime
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, StringConstraints, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, StrictBool, StringConstraints, model_validator
 
 from .common import PositiveDbId, StoredText
 from .page_context import ExperimentPageContext, PageContext
@@ -62,12 +64,15 @@ class AssistantMessageView(BaseModel):
 
 class AssistantSessionDetail(AssistantSessionSummary):
     messages: list[AssistantMessageView]
+    status: str = "completed"
+    actions: list[AssistantAction] = Field(default_factory=list)
+    credential_call_ids: list[str] = Field(default_factory=list)
+    error: dict[str, str] | None = None
 
 
 class AssistantAction(BaseModel):
-    id: str
-    tool: Literal["RUNNER_create_runner", "RUNNER_delete_runner", "DATASET_import_dataset",
-                  "EXPERIMENT_create_experiment", "EXPERIMENT_cancel_experiment"]
+    tool_call_id: str
+    tool: str
     arguments: dict[str, JsonValue]
 
 
@@ -75,3 +80,20 @@ class AssistantChatResponse(BaseModel):
     version: int
     messages: list[AssistantMessageView]
     actions: list[AssistantAction] = Field(default_factory=list)
+    status: Literal["completed", "awaiting_approval"] = "completed"
+
+
+class AssistantMessageRequest(AssistantChatRequest):
+    type: Literal["message"]
+    session_id: PositiveDbId
+
+
+class AssistantDecisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["decision"]
+    session_id: PositiveDbId
+    expected_version: Annotated[int, Field(strict=True, ge=0)]
+    decisions: dict[str, StrictBool] = Field(min_length=1, max_length=100)
+
+
+AssistantStreamRequest = Annotated[AssistantMessageRequest | AssistantDecisionRequest, Field(discriminator="type")]

@@ -2,10 +2,14 @@
 
 工具名采用 `领域_动作_资源`，领域名大写。详情查询统一使用 `领域_get_资源_detail`。下文定义 17 个工具的输入和模型可见输出，后端路径统一省略 `/api/v1`。
 
+本文对应原生 Deferred Tools 审批实现，执行与 fake 存储边界见文末。
+
 - 参数默认必填，`?` 表示可省略。数值型资源 ID 为正整数。`page?: int` 从 `1` 开始，默认 `1`。`pagesize?: int` 默认为 `20`，范围为 `1–100`。`Page<T>` 返回 `{items: T[], page, pagesize, total}`。
 - 资源归属由当前登录用户决定。用户 ID、登录凭证和 CSRF Token 由调用层处理。失败沿用后端 `{error: {code, message}}`。
-- 查询工具直接返回数据。五个写工具在模型调用时返回 `{status: "requires_confirmation", action_id}`，聊天 JSON 或 SSE 的 `done` 同时带回 `actions: [{id, tool, arguments}]`。下表的写操作成功响应描述用户确认后的业务结果。
-- 网页从本轮 `actions` 展示参数，用户确认后调用表中的业务接口。操作卡片只在当前网页会话中有效，刷新后需要重新提出操作。执行结果在卡片上显示，后续对话可查询最新状态。Runner 凭证只从创建接口交给浏览器，助手模型与会话历史都接收不到该凭证。
+- 查询工具直接返回数据。五个写工具注册 `requires_approval=True`；Run 返回 `DeferredToolRequests`，保存 Conversation 后发送 `action_required`，数据为 `actions: [{tool_call_id, tool, arguments}]`。
+- 网页一次提交全部 `decisions` 后由服务端恢复 Agent，写工具逐个调用业务 Service。拒绝不执行，脱敏结果交给模型继续回答。同一进程中刷新可恢复提案，但未提交的选择清空；重启丢失 fake 现场。
+
+表中 HTTP 路径仅为对应业务入口；所有工具在后端直接调用 Service，网页不再根据工具提案直接请求写业务接口。
 
 ## Runner
 
@@ -43,7 +47,7 @@
 
 创建字段包括 `name: string`（1–100 字符）和 `execution_config`。后者要求 `runner_id: string`、`agent_target_id: string`，可选 `timeout_seconds`（默认 60，范围 `(0, 3600]`）和 `stream_output`（默认 `false`）。路径中的 `runner_id` 取自 `execution_config.runner_id`。
 
-可选字段包括 `description`（最多 2,000 字符，可空）、`dataset_version_id: int`（省略时取最新版本）、`repetitions: int`（默认 1，范围 1–100）、`metadata`（JSON 对象，默认 `{}`）。样例数乘重复次数最多 10,000。
+工具调用必须提供 `dataset_version_id: int`，先查询数据集得到版本，确保审批参数与实际执行版本一致；普通 REST 创建接口仍允许省略版本。可选字段包括 `description`（最多 2,000 字符，可空）、`repetitions: int`（默认 1，范围 1–100）、`metadata`（JSON 对象，默认 `{}`）。样例数乘重复次数最多 10,000。
 
 可传 `dataset_evaluator_ids?: int[]` 或 `evaluators?: EvaluatorConfig[]`，两者默认 `[]`，各最多 100 项，不能同时非空。评分配置含 `name`、`evaluator_key`、`description?`、`input_mapping`（`path_mapping?` 和 `literal_mapping?`）。[创建字段与评分配置](api/实验创建与查询.md#1-创建实验)
 
@@ -74,3 +78,14 @@
 - `TraceSummary` 含 `trace_id`、`title`、`service_name`、`root_span_id`、`status_code` 和起止时间。
 - `SpanSummary` 含 `span_id`、`parent_span_id`、`name`、`kind`、`status_code` 和起止时间。起止时间字段为 `start_time_unix_nano` 和 `end_time_unix_nano`，均是十进制字符串。
 - `SpanDetail` 另含 `trace_id`、`status_message`、`trace_state`、`flags`、`attributes`、`events`、`links`、`resource`、`instrumentation_scope`、`dropped_attributes_count`、`dropped_events_count`、`dropped_links_count`。[Trace 查询接口](api/Trace查询.md)
+
+## Deferred Tools 执行约定
+
+完整约定见 [审批与持久化方案](AgentDeferredTools_审批与持久化方案.md)。17 个工具的业务能力继续保留，主要调整执行方式：
+
+- 查询工具正常执行；创建 Runner、删除 Runner、导入数据集、创建实验、取消实验五个工具注册 `requires_approval=True`，批准后由工具体调用对应业务 Service。
+- 已移除手写 `_propose()`、`requires_confirmation` 和业务 `action_id`。待审批参数由 fake 存储的完整 Conversation 提供，卡片使用 `tool_call_id`。
+- 前端收齐全部决定后提交 `decisions: {tool_call_id: boolean}`；后端校验归属、版本和决定集合后恢复 Agent，前端不直接请求表中的写业务接口。
+- 工具执行结果脱敏后进入模型上下文；业务 Service 仍负责权限及实时条件校验。参数校验与必要的版本固定不能因审批改造而遗漏。
+- fake 存储只支持单进程、进程存活期间恢复卡片，刷新丢弃未提交的选择；暂无数据库 Action 状态、逐项审批记录或重启恢复。
+- Runner 创建结果只向模型返回 Runner 摘要。凭证通过 `POST /api/v1/assistant/sessions/{id}/runner-credentials/{tool_call_id}` 单独一次性领取；需登录和 CSRF，不进入 Conversation、普通 SSE 或数据库消息，进程重启后不可找回。

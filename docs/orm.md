@@ -1,6 +1,6 @@
 # 核心 ORM
 
-基于 Phoenix commit `14c193cfa`，按云端 + 轻客户端方案调整；当前 25 张表，含停用后保留的旧配置表、身份与凭证、评测助手和 Trace 存储。
+基于 Phoenix commit `14c193cfa`，按云端 + 轻客户端方案调整；当前 27 张表，含停用后保留的旧配置表、身份与凭证、评测助手和 Trace 存储。新增 ConversationRecord / Entry 尚未接入业务，旧助手会话与消息表暂保留，完成迁移后再删除。
 本页介绍存储结构；应用启动不自动建表，部署方式见 [数据库说明](database.md)。
 
 ## 代码入口
@@ -12,7 +12,7 @@
 | `evalforge/db/orm/experiments.py` | Experiment、样本快照关联、Job、JobEvaluation |
 | `evalforge/db/orm/attempts.py` | 云端 Attempt、完整派发/结果快照、活动容量约束 |
 | `evalforge/db/orm/auth.py` | User、Runner、RunnerCredential；字段和 ER 图见 [鉴权数据结构](auth-schema.md) |
-| `evalforge/db/orm/assistant.py` | 助手会话、消息与执行租约；字段和 ER 图见 [Agent 会话与消息表设计](Agent会话与消息表设计.md) |
+| `evalforge/db/orm/assistant.py` | ConversationRecord / Entry 与过渡期旧会话、消息表；字段和 ER 图见 [Agent 会话与消息表设计](Agent会话与消息表设计.md) |
 | `evalforge/db/orm/traces.py` | Trace、Span；字段和 ER 图见 [Trace 与 Span 表设计](Trace与Span表设计.md) |
 | `evalforge/db/orm/evaluators.py` | 评分器公共定义、三个子类型、源码版本、数据集使用配置 |
 | `evalforge/db/orm/experiment_configs.py` | 旧 ExperimentConfig 已停用；保留 Prompt、EVAL_ONLY 和原评分关联的表与外键 |
@@ -106,7 +106,7 @@ users、traces 和 spans 已有真实模型；Prompt、沙箱等仍未建表。
 模型专项测试使用内存 SQLite 真正执行建表、写入、查询和约束失败；另行编译全部 PostgreSQL DDL，验证 JSONB、时区字段及复合外键。
 这些不替代真实 PostgreSQL 集成测试。
 
-25 张表与 ORM 契约一致；SQLite 验证唯一约束、身份引用、默认有效期及历史保护，PostgreSQL DDL 验证 JSON、JSONB、BYTEA、时间类型及索引。Runner 接口验证见 [Runner 管理](server-runners.md)。
+27 张表与 ORM 契约一致；SQLite 验证唯一约束、身份引用、默认有效期及历史保护，PostgreSQL DDL 验证 JSON、JSONB、BYTEA、时间类型及索引。ConversationRecord / Entry 验证共享历史、外键保护、scope 与租约约束，详见 [ConversationStore 方案](ConversationStore方案.md)。Runner 接口验证见 [Runner 管理](server-runners.md)。
 临时从活动索引移除 unknown 后，容量测试按预期失败；恢复源码后完整测试通过。数据字典的字段名和可空性已逐表核对，编译检查及 git diff --check 通过。
 
 实例就绪后生成迁移：

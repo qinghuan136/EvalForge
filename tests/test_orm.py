@@ -41,9 +41,12 @@ class SchemaContractTests(unittest.TestCase):
                     ("runner_credentials", "runner_id"): "RESTRICT",
                     ("runner_attempts", "runner_id"): "RESTRICT",
                     ("experiments", "user_id"): "SET NULL",
+                    ("assistant_conversation_entries", "parent_id"): "RESTRICT",
+                    ("assistant_conversation_records", "head_id"): "RESTRICT",
+                    ("assistant_conversation_records", "forked_at"): "RESTRICT",
                 }.get((table.name, foreign_key.parent.name), "CASCADE")
                 self.assertEqual(foreign_key.ondelete, expected)
-        self.assertEqual(len(Base.metadata.sorted_tables), 25)
+        self.assertEqual(len(Base.metadata.sorted_tables), 27)
         for name in ("prompts", "projects", "sandbox_configs", "languages"):
             self.assertNotIn(name, Base.metadata.tables)
         self.assertEqual(Dataset.__table__.c.user_id.info["deferred_foreign_key"]["target"], "users.id")

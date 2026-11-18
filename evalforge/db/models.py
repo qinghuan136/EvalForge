@@ -5,7 +5,7 @@
 """
 
 from .base import Base
-from .orm.assistant import AssistantMessage, AssistantSession
+from .orm.assistant import AssistantConversationEntry, AssistantConversationRecord, AssistantMessage, AssistantSession
 from .orm.attempts import RunnerAttempt
 from .orm.auth import Runner, RunnerCredential, User
 from .orm.datasets import Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion
@@ -28,4 +28,5 @@ __all__ = [
     "DatasetEvaluators", "ExperimentConfig", "ExperimentPromptTask", "ExperimentEvalOnlyConfig",
     "ExperimentDatasetEvaluator", "RunnerAttempt", "User", "Runner", "RunnerCredential",
     "Trace", "Span",
+    "AssistantConversationRecord", "AssistantConversationEntry",
 ]

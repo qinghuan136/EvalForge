@@ -7,7 +7,9 @@ from ..dependencies import Authenticated, current_user, require_csrf
 from ..schemas.assistant import (
     AssistantChatRequest, AssistantChatResponse, AssistantSessionCreate, AssistantSessionDetail,
     AssistantSessionList, AssistantSessionSummary,
+    AssistantStreamRequest,
 )
+from ..schemas.runners import RunnerCreateResponse
 from ..schemas.common import MAX_DB_ID
 from ..services.assistant import AssistantService
 
@@ -42,6 +44,23 @@ async def chat(data: AssistantChatRequest, request: Request, response: Response,
                session_id: int = Path(ge=1, le=MAX_DB_ID),
                identity: Authenticated = Depends(current_user), service: AssistantService = Depends(assistant_service)):
     if accepts_event_stream(", ".join(request.headers.getlist("accept"))):
-        return AssistantEventResponse(service, identity.user.id, session_id, data)
+        return AssistantEventResponse(service, identity.user.id, session_id, data, identity.session.auth_version)
     response.headers["Vary"] = "Accept"
-    return await service.chat(identity.user.id, session_id, data)
+    return await service.chat(identity.user.id, session_id, data, identity.session.auth_version)
+
+
+@router.post("/stream", dependencies=[Depends(require_csrf)],
+             responses={200: {"content": {"text/event-stream": {"schema": {"type": "string"}}}}})
+async def stream(data: AssistantStreamRequest, identity: Authenticated = Depends(current_user),
+                 service: AssistantService = Depends(assistant_service)):
+    return AssistantEventResponse(service, identity.user.id, data.session_id, data, identity.session.auth_version)
+
+
+@router.post("/sessions/{session_id}/runner-credentials/{tool_call_id}", response_model=RunnerCreateResponse,
+             dependencies=[Depends(require_csrf)])
+async def take_runner_credential(session_id: int = Path(ge=1, le=MAX_DB_ID),
+                                 tool_call_id: str = Path(min_length=1, max_length=256),
+                                 identity: Authenticated = Depends(current_user),
+                                 service: AssistantService = Depends(assistant_service)):
+    await service.get(identity.user.id, session_id)
+    return service.conversations.take_credential(identity.user.id, session_id, tool_call_id)

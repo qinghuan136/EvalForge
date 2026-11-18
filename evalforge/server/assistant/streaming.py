@@ -11,7 +11,7 @@ from starlette.types import Receive, Scope, Send
 
 from ..errors import APIError
 from ..experiment_events import event_frame
-from ..schemas.assistant import AssistantChatRequest
+from ..schemas.assistant import AssistantChatRequest, AssistantDecisionRequest
 from ..services.assistant import AssistantService, AssistantTurn
 
 logger = logging.getLogger(__name__)
@@ -37,13 +37,15 @@ def accepts_event_stream(accept: str) -> bool:
 class AssistantEventResponse(Response):
     media_type = "text/event-stream"
 
-    def __init__(self, service: AssistantService, user_id: int, session_id: int, data: AssistantChatRequest):
+    def __init__(self, service: AssistantService, user_id: int, session_id: int,
+                 data: AssistantChatRequest | AssistantDecisionRequest, auth_version: int):
         super().__init__()
         self.service, self.user_id, self.session_id, self.data = service, user_id, session_id, data
+        self.auth_version = auth_version
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         # Reject conflicts and ownership errors before sending HTTP response headers.
-        async with self.service.prepare_chat(self.user_id, self.session_id, self.data) as turn:
+        async with self.service.prepare_chat(self.user_id, self.session_id, self.data, self.auth_version) as turn:
             events = stream_events(self.service, turn)
             response = StreamingResponse(events, media_type=self.media_type, headers={
                 "Vary": "Accept", "Cache-Control": "no-store", "X-Accel-Buffering": "no",
@@ -75,6 +77,9 @@ async def stream_events(service: AssistantService, turn: AssistantTurn) -> Async
             logger.error("Assistant stream failed session_id=%d error_type=%s", turn.session_id, type(exc).__name__)
             await queue.put(("error", {"code": "internal_error", "message": "助手暂时无法完成对话"}))
         else:
+            if result.actions:
+                await queue.put(("action_required", {"version": result.version,
+                    "actions": [action.model_dump(mode="json") for action in result.actions]}))
             await queue.put(("done", result.model_dump(mode="json")))
 
     task = asyncio.create_task(run())

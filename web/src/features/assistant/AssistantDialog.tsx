@@ -4,10 +4,9 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router'
 import { privateKey } from '../../app/queryClient'
 import { Dialog } from '../../components/ui/Dialog'
-import { ApiError, errorMessage } from '../../lib/api'
-import { AssistantActionCard } from './AssistantActionCard'
-import { createAssistantSession, getAssistantSession, getAssistantSessions, sendAssistantMessage } from './api'
-import type { AssistantAction } from './api'
+import { errorMessage } from '../../lib/api'
+import { AssistantApprovals, AssistantRunnerCredential } from './AssistantActionCard'
+import { createAssistantSession, getAssistantSession, getAssistantSessions, streamAssistant } from './api'
 import { pageContextLabel } from './pageContext'
 import type { PageContext } from './pageContext'
 
@@ -18,8 +17,7 @@ export function AssistantDialog({ userId, open, pageContext, onClose }: {
   const [sessionId, setSessionId] = useState<number>()
   const [selectedModel, setSelectedModel] = useState('')
   const [draft, setDraft] = useState('')
-  const [actions, setActions] = useState<AssistantAction[]>([])
-  const [actionBusy, setActionBusy] = useState(false)
+  const [preview, setPreview] = useState('')
   const sessionsKey = [...privateKey, userId, 'assistant-sessions'] as const
   const transcriptKey = [...privateKey, userId, 'assistant-session', sessionId] as const
   const sessions = useQuery({
@@ -31,57 +29,59 @@ export function AssistantDialog({ userId, open, pageContext, onClose }: {
     queryKey: transcriptKey,
     queryFn: ({ signal }) => getAssistantSession(sessionId!, signal),
     enabled: open && sessionId !== undefined,
+    refetchInterval: (query) => query.state.data?.status === 'running' ? 1000 : false,
   })
   const models = sessions.data?.models ?? []
   const model = models.includes(selectedModel) ? selectedModel : models[0] ?? ''
   const send = useMutation({
-    mutationFn: async ({ message, modelName, context }: { message: string; modelName: string; context?: PageContext }) => {
-      const title = context ? `${pageContextLabel(context)} 对话` : '新对话'
+    mutationFn: async (input: { type: 'message'; message: string } | { type: 'decision'; decisions: Record<string, boolean> }) => {
+      setPreview('')
+      const title = pageContext ? `${pageContextLabel(pageContext)} 对话` : '新对话'
       const session = transcript.data ?? await createAssistantSession(title)
       if (!transcript.data) {
-        client.setQueryData([...privateKey, userId, 'assistant-session', session.id], { ...session, messages: [] })
+        client.setQueryData([...privateKey, userId, 'assistant-session', session.id], {
+          ...session, messages: [], actions: [], status: 'completed', credential_call_ids: [], error: null,
+        })
         setSessionId(session.id)
         void client.invalidateQueries({ queryKey: sessionsKey })
       }
-      const turn = await sendAssistantMessage(session.id, session.version, message, modelName, context)
-      return { session, turn, previous: transcript.data?.messages ?? [] }
+      const request = { session_id: session.id, expected_version: session.version }
+      const turn = await streamAssistant(input.type === 'message'
+        ? { ...request, ...input, model_name: model, page_context: pageContext }
+        : { ...request, ...input }, (text) => setPreview((previous) => previous + text))
+      return { session, turn }
     },
-    onSuccess: async ({ session, turn, previous }) => {
+    onSuccess: async ({ session }) => {
       const key = [...privateKey, userId, 'assistant-session', session.id] as const
       await client.cancelQueries({ queryKey: key, exact: true })
-      client.setQueryData<typeof transcript.data>(key, (current) => {
-        if (current && current.version >= turn.version) return current
-        return { ...session, version: turn.version, messages: [...previous, ...turn.messages].slice(-100) }
-      })
+      await client.invalidateQueries({ queryKey: key, exact: true })
       setDraft('')
-      setActions(turn.actions ?? [])
-      void client.invalidateQueries({ queryKey: sessionsKey })
+      void client.invalidateQueries({ queryKey: [...privateKey, userId] })
     },
-    onError: (error) => {
-      if (error instanceof ApiError && error.status === 409) {
-        void client.invalidateQueries({ queryKey: [...privateKey, userId, 'assistant-session'] })
-      }
-    },
+    onError: async () => { await client.invalidateQueries({ queryKey: [...privateKey, userId, 'assistant-session'] }) },
+    onSettled: () => setPreview(''),
   })
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const message = draft.trim()
     if (message && model && !send.isPending && (sessionId === undefined || transcript.data)) {
-      send.mutate({ message, modelName: model, context: pageContext })
+      send.mutate({ type: 'message', message })
     }
   }
 
   if (!open) return null
 
-  const busy = send.isPending || actionBusy
+  const busy = send.isPending
+  const blocked = transcript.data?.status === 'awaiting_approval' || transcript.data?.status === 'unavailable'
+    || transcript.data?.status === 'running' || transcript.data?.error?.code === 'assistant_execution_uncertain'
 
-  return <Dialog title="评测助手" onClose={() => { setActions([]); onClose() }} busy={busy}>
+  return <Dialog title="评测助手" onClose={onClose} busy={busy}>
     <div className="dialog-body">
       <p className="muted">当前上下文：{pageContext ? pageContextLabel(pageContext) : '未选择对象'}</p>
       <label className="field">会话
         <select value={sessionId ?? ''} disabled={busy}
-          onChange={(event) => { setSessionId(Number(event.target.value) || undefined); setActions([]); send.reset() }}>
+          onChange={(event) => { setSessionId(Number(event.target.value) || undefined); send.reset(); setPreview('') }}>
           <option value="">新对话</option>
           {sessions.data?.items.map((session) => <option key={session.id} value={session.id}>
             {session.title}（#{session.id}）
@@ -103,24 +103,29 @@ export function AssistantDialog({ userId, open, pageContext, onClose }: {
           {message.source_experiment_id !== null ? <Link to={`/experiments/${message.source_experiment_id}`}>查看数据来源</Link> : null}
         </li>)}
       </ol> : null}
-      {actions.map((action) => <AssistantActionCard key={action.id} action={action} disabled={busy} onBusy={setActionBusy}
-        onSuccess={() => void client.invalidateQueries({ queryKey: [...privateKey, userId] })} />)}
+      {preview ? <p aria-label="助手实时回答" aria-live="polite">{preview}</p> : null}
+      {transcript.data?.error ? <p role="alert" className="error-message">{transcript.data.error.message}</p> : null}
+      {transcript.data?.actions.length ? <AssistantApprovals key={`${sessionId}:${transcript.data.version}`}
+        actions={transcript.data.actions} disabled={busy}
+        onSubmit={(decisions) => send.mutate({ type: 'decision', decisions })} /> : null}
+      {sessionId !== undefined ? transcript.data?.credential_call_ids.map((callId) =>
+        <AssistantRunnerCredential key={`${sessionId}:${callId}`} sessionId={sessionId} callId={callId} />) : null}
       {sessions.isSuccess && !models.length ? <p role="status">管理员尚未配置助手模型。</p> : null}
       <form className="dialog-form" onSubmit={submit}>
         {models.length > 1 ? <label className="field">本轮模型
-          <select value={model} disabled={busy} onChange={(event) => setSelectedModel(event.target.value)}>
+          <select value={model} disabled={busy || blocked} onChange={(event) => setSelectedModel(event.target.value)}>
             {models.map((name) => <option key={name}>{name}</option>)}
           </select>
         </label> : null}
         <label className="field">消息
           <textarea rows={3} maxLength={4000}
             placeholder={pageContext?.type === 'experiment' ? '这次实验跑到哪了？' : '输入你的问题'} value={draft}
-            disabled={!model || busy} onChange={(event) => setDraft(event.target.value)} />
+            disabled={!model || busy || blocked} onChange={(event) => setDraft(event.target.value)} />
         </label>
         {send.isError ? <p role="alert" className="error-message">{errorMessage(send.error)}</p> : null}
         {send.isPending ? <p role="status">助手正在回答…</p> : null}
         <div className="dialog-actions"><button className="button button-primary" type="submit"
-          disabled={!model || !draft.trim() || busy || (sessionId !== undefined && !transcript.data)}>
+          disabled={!model || !draft.trim() || busy || blocked || (sessionId !== undefined && !transcript.data)}>
           发送
         </button></div>
       </form>

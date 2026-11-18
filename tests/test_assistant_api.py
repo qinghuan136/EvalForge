@@ -137,7 +137,7 @@ class AssistantAPITests(APITestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["actions"], [])
 
-    async def test_write_tools_return_confirmable_arguments_without_writing(self):
+    async def test_write_tools_are_deferred_without_writing(self):
         runner = (await self.client.post("/api/v1/runners", json={"name": "测试 Runner"})).json()["runner"]
         content = '{"input":{"question":"hello"}}\n'
         imported = await self.client.post("/api/v1/datasets/import", data={"name": "源数据集", "format": "jsonl"},
@@ -149,6 +149,7 @@ class AssistantAPITests(APITestCase):
             "RUNNER_delete_runner": {"runner_id": runner["runner_id"]},
             "DATASET_import_dataset": {"name": "待导入", "format": "jsonl", "content": content},
             "EXPERIMENT_create_experiment": {"dataset_id": dataset["dataset_id"], "name": "待启动",
+                                             "dataset_version_id": dataset["dataset_version_id"],
                                              "execution_config": {"runner_id": runner["runner_id"], "agent_target_id": "agent"}},
             "EXPERIMENT_cancel_experiment": {"experiment_id": self.experiment_id},
         }
@@ -157,13 +158,13 @@ class AssistantAPITests(APITestCase):
             returns = [part for part in messages[-1].parts if isinstance(part, ToolReturnPart)]
             if not returns:
                 return ModelResponse(parts=[ToolCallPart(tool, args, tool_call_id=tool) for tool, args in requests.items()])
-            self.assertEqual({part.content["status"] for part in returns}, {"requires_confirmation"})
-            return ModelResponse(parts=[TextPart("请确认待执行操作")])
+            self.fail("Deferred tools must end the run before a model receives tool results")
 
         with patch("evalforge.server.services.assistant.build_model", return_value=FunctionModel(respond)):
             response = await self.chat(experiment_id=None)
         self.assertEqual(response.status_code, 200, response.text)
         actions = {action["tool"]: action["arguments"] for action in response.json()["actions"]}
+        self.assertEqual(response.json()["status"], "awaiting_approval")
         self.assertEqual(actions.keys(), requests.keys())
         self.assertEqual(actions["EXPERIMENT_create_experiment"]["dataset_version_id"], dataset["dataset_version_id"])
         self.assertEqual(actions["DATASET_import_dataset"]["content"], content)
@@ -376,7 +377,7 @@ class AssistantAPITests(APITestCase):
                 self.assertTrue(completed.startswith("event: done\n"))
                 result = json.loads(completed.splitlines()[1].removeprefix("data: "))
                 detail = (await self.client.get(self.path)).json()
-                self.assertEqual(result, {"version": 1, "messages": detail["messages"], "actions": []})
+                self.assertEqual(result, {"version": 1, "messages": detail["messages"], "actions": [], "status": "completed"})
                 self.assertEqual(result["messages"][-1]["source_experiment_id"], self.experiment_id)
                 self.assertEqual(result["messages"][-1]["text"], "实验正在执行")
                 await asyncio.wait_for(task, 5)

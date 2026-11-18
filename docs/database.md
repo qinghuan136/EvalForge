@@ -45,7 +45,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m alembic heads
 ```
 
-当前仓库迁移头为 `20261116_assistant`。
+当前仓库迁移头为 `20261118_conversation_store`：仅新增 ConversationRecord / Entry 表，Backend 与旧助手历史迁移尚未接入，不自动删除旧表。
 
 ## 有实例后
 
