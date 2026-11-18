@@ -1,6 +1,6 @@
 # 核心 ORM
 
-基于 Phoenix commit `14c193cfa`，按云端 + 轻客户端方案调整；当前 27 张表，含停用后保留的旧配置表、身份与凭证、评测助手和 Trace 存储。新增 ConversationRecord / Entry 尚未接入业务，旧助手会话与消息表暂保留，完成迁移后再删除。
+基于 Phoenix commit `14c193cfa`，按云端 + 轻客户端方案调整；当前 27 张表，含停用后保留的旧配置表、身份与凭证、评测助手和 Trace 存储。ConversationRecord / Entry 已接入助手业务，旧助手会话与消息表暂保留用于历史兼容。
 本页介绍存储结构；应用启动不自动建表，部署方式见 [数据库说明](database.md)。
 
 ## 代码入口

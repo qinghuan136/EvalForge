@@ -2,12 +2,12 @@
 
 工具名采用 `领域_动作_资源`，领域名大写。详情查询统一使用 `领域_get_资源_detail`。下文定义 17 个工具的输入和模型可见输出，后端路径统一省略 `/api/v1`。
 
-本文对应原生 Deferred Tools 审批实现，执行与 fake 存储边界见文末。
+本文对应原生 Deferred Tools 审批实现，执行与数据库存储边界见文末。
 
 - 参数默认必填，`?` 表示可省略。数值型资源 ID 为正整数。`page?: int` 从 `1` 开始，默认 `1`。`pagesize?: int` 默认为 `20`，范围为 `1–100`。`Page<T>` 返回 `{items: T[], page, pagesize, total}`。
 - 资源归属由当前登录用户决定。用户 ID、登录凭证和 CSRF Token 由调用层处理。失败沿用后端 `{error: {code, message}}`。
-- 查询工具直接返回数据。五个写工具注册 `requires_approval=True`；Run 返回 `DeferredToolRequests`，保存 Conversation 后发送 `action_required`，数据为 `actions: [{tool_call_id, tool, arguments}]`。
-- 网页一次提交全部 `decisions` 后由服务端恢复 Agent，写工具逐个调用业务 Service。拒绝不执行，脱敏结果交给模型继续回答。同一进程中刷新可恢复提案，但未提交的选择清空；重启丢失 fake 现场。
+- 查询工具直接返回数据。五个写工具注册 `requires_approval=True`；Run 返回 `DeferredToolRequests`，保存 Conversation 后发送 `approval_required`，数据为 `{revision, cards: [{tool_call_id, tool, title, description, arguments}]}`。
+- 网页一次提交全部 `decisions` 后由服务端恢复 Agent，写工具逐个调用业务 Service。拒绝不执行，脱敏结果交给模型继续回答。Conversation 已保存到数据库，刷新或换实例后可恢复提案，未提交的选择清空。
 
 表中 HTTP 路径仅为对应业务入口；所有工具在后端直接调用 Service，网页不再根据工具提案直接请求写业务接口。
 
@@ -84,8 +84,10 @@
 完整约定见 [审批与持久化方案](AgentDeferredTools_审批与持久化方案.md)。17 个工具的业务能力继续保留，主要调整执行方式：
 
 - 查询工具正常执行；创建 Runner、删除 Runner、导入数据集、创建实验、取消实验五个工具注册 `requires_approval=True`，批准后由工具体调用对应业务 Service。
-- 已移除手写 `_propose()`、`requires_confirmation` 和业务 `action_id`。待审批参数由 fake 存储的完整 Conversation 提供，卡片使用 `tool_call_id`。
+- 已移除手写 `_propose()`、`requires_confirmation` 和业务 `action_id`。待审批参数由数据库中的完整 Conversation 提供，卡片使用 `tool_call_id`。
 - 前端收齐全部决定后提交 `decisions: {tool_call_id: boolean}`；后端校验归属、版本和决定集合后恢复 Agent，前端不直接请求表中的写业务接口。
 - 工具执行结果脱敏后进入模型上下文；业务 Service 仍负责权限及实时条件校验。参数校验与必要的版本固定不能因审批改造而遗漏。
-- fake 存储只支持单进程、进程存活期间恢复卡片，刷新丢弃未提交的选择；暂无数据库 Action 状态、逐项审批记录或重启恢复。
-- Runner 创建结果只向模型返回 Runner 摘要。凭证通过 `POST /api/v1/assistant/sessions/{id}/runner-credentials/{tool_call_id}` 单独一次性领取；需登录和 CSRF，不进入 Conversation、普通 SSE 或数据库消息，进程重启后不可找回。
+- ConversationStore 保存完整历史和待审批请求，支持跨实例和重启恢复。逐项选择在统一提交前留在前端。
+- Runner 创建结果向模型返回摘要，完整凭证通过当前 SSE 的 `display` 卡片交付，详见 [事件与卡片协议](assistant-sse.md)。卡片保存在当前页面内存，刷新后丢失。
+
+五个写工具可传可选的 `approval_description`（最多 500 字符）说明操作目的。该字段作为批准卡片的描述，业务服务只接收其余业务参数。省略时由后端生成默认描述。

@@ -1,6 +1,6 @@
 # EvalForge Assistant：Deferred Tools 审批与持久化方案
 
-本文合并原两份 Deferred Tools 方案，记录已实现的第一阶段：原生审批、统一 SSE 与内存 fake Conversation 存储。工具参数见 [基础工具](assistant-tools.md)，接入说明见 [评测助手](assistant.md)。
+本文保留第一阶段的历史设计。当前已用数据库 ConversationStore 替换 fake，最新事件使用 approval_required 和 display，协议见 [助手 SSE 与卡片](assistant-sse.md)，恢复边界见 [评测助手](assistant.md)。以下记录第一阶段：原生审批、统一 SSE 与内存 fake Conversation 存储。工具参数见 [基础工具](assistant-tools.md)，接入说明见 [评测助手](assistant.md)。
 
 ## 1. 本阶段范围
 

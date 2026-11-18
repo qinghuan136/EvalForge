@@ -1,4 +1,4 @@
-"""Assistant storage models. Legacy tables remain until ConversationStore is connected."""
+"""ConversationStore records and entries, with legacy tables retained for history import."""
 
 from datetime import datetime
 from typing import Any

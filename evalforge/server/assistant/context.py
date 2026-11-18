@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from evalforge.db.models import DatasetVersion, Experiment, Job, Runner
 
 from ..errors import APIError
-from ..schemas.runners import RunnerCreateResponse
+from ..schemas.assistant import AssistantDisplayCard
 from ..schemas.page_context import DatasetPageContext, ExperimentPageContext, JobPageContext, PageContext, RunnerPageContext
 from ..services.datasets import DatasetService, require_owned_dataset
 from ..services.experiments import ExperimentService
@@ -29,7 +29,7 @@ class AssistantDeps:
     traces: TraceQueryService
     auth_version: int
     check_execution: Callable[[], Awaitable[None]]
-    deliver_credential: Callable[[str, RunnerCreateResponse], None]
+    display: Callable[[AssistantDisplayCard], Awaitable[None]]
     source_experiment_id: int | None = None
 
 

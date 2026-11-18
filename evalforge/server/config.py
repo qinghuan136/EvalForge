@@ -49,8 +49,8 @@ class ServerSettings:
     assistant_api_key: str | None = field(default=None, repr=False)
     assistant_base_url: str | None = None
     assistant_timeout_seconds: int = 90
-    assistant_lease_seconds: int = 45
-    assistant_heartbeat_seconds: int = 10
+    assistant_lease_seconds: int = 180
+    assistant_heartbeat_seconds: int = 60
 
     def __post_init__(self):
         if len(set(self.assistant_models)) != len(self.assistant_models) or any(
@@ -139,6 +139,6 @@ class ServerSettings:
             assistant_api_key=values.get("EVALFORGE_ASSISTANT_API_KEY") or None,
             assistant_base_url=values.get("EVALFORGE_ASSISTANT_BASE_URL") or None,
             assistant_timeout_seconds=int(values.get("EVALFORGE_ASSISTANT_TIMEOUT_SECONDS", "90")),
-            assistant_lease_seconds=int(values.get("EVALFORGE_ASSISTANT_LEASE_SECONDS", "45")),
-            assistant_heartbeat_seconds=int(values.get("EVALFORGE_ASSISTANT_HEARTBEAT_SECONDS", "10")),
+            assistant_lease_seconds=int(values.get("EVALFORGE_ASSISTANT_LEASE_SECONDS", "180")),
+            assistant_heartbeat_seconds=int(values.get("EVALFORGE_ASSISTANT_HEARTBEAT_SECONDS", "60")),
         )

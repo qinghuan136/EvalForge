@@ -14,6 +14,7 @@ from ..schemas.datasets import MAX_DATASET_UPLOAD_BYTES, DatasetImportOptions
 from ..schemas.evaluators import EvaluatorConfig
 from ..schemas.experiments import ExecutionConfig, ExperimentCreate, JobStatus
 from ..schemas.runners import RunnerName
+from ..schemas.assistant import AssistantDisplayCard, AssistantDisplayField
 from .context import AssistantDeps
 
 Page = Annotated[int, Field(ge=1, le=MAX_DB_ID)]
@@ -21,6 +22,7 @@ PageSize = Annotated[int, Field(ge=1, le=100)]
 ResourceId = Annotated[StoredText, Field(min_length=1, max_length=128, pattern=r"\S")]
 TraceId = Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
 SpanId = Annotated[str, Field(pattern=r"^[0-9a-f]{16}$")]
+ApprovalDescription = Annotated[StoredText, Field(max_length=500)]
 
 
 def _error(code: str, message: str) -> dict:
@@ -34,7 +36,8 @@ async def _read(result: Awaitable[BaseModel]) -> dict:
         return _error(exc.code, exc.message)
 
 
-async def RUNNER_create_runner(ctx: RunContext[AssistantDeps], name: str) -> dict:
+async def RUNNER_create_runner(ctx: RunContext[AssistantDeps], name: str,
+                               approval_description: ApprovalDescription | None = None) -> dict:
     """Create a Runner by name after user approval. Credentials are delivered separately."""
     try:
         data = RunnerName(name=name)
@@ -45,11 +48,22 @@ async def RUNNER_create_runner(ctx: RunContext[AssistantDeps], name: str) -> dic
         result = await ctx.deps.runners.create(ctx.deps.owner_id, ctx.deps.auth_version, data.name)
     except APIError as exc:
         return _error(exc.code, exc.message)
-    ctx.deps.deliver_credential(ctx.tool_call_id, result)
+    await ctx.deps.display(AssistantDisplayCard(
+        id=f"runner-credential:{ctx.tool_call_id}", tool_call_id=ctx.tool_call_id,
+        title="Runner 已创建", description="请保存连接凭证，用于配置本地 Runner。刷新页面后无法再次查看。",
+        fields=[
+            AssistantDisplayField(label="名称", value=result.runner.name),
+            AssistantDisplayField(label="Runner ID", value=result.runner.runner_id),
+            AssistantDisplayField(label="连接凭证", value=result.credential.token, sensitive=True),
+            AssistantDisplayField(label="凭证有效期", value=result.credential.expires_at.isoformat()),
+            AssistantDisplayField(label="连接地址", value=result.connection.websocket_url),
+        ],
+    ))
     return result.runner.model_dump(mode="json")
 
 
-async def RUNNER_delete_runner(ctx: RunContext[AssistantDeps], runner_id: ResourceId) -> dict:
+async def RUNNER_delete_runner(ctx: RunContext[AssistantDeps], runner_id: ResourceId,
+                               approval_description: ApprovalDescription | None = None) -> dict:
     """Delete the specified Runner and revoke its credentials after user approval."""
     await ctx.deps.check_execution()
     try:
@@ -73,6 +87,7 @@ async def DATASET_import_dataset(
     ctx: RunContext[AssistantDeps], name: str, format: Literal["csv", "jsonl"], content: StoredText,
     description: str | None = None, input_keys: list[str] | None = None,
     output_keys: list[str] | None = None, metadata_keys: list[str] | None = None,
+    approval_description: ApprovalDescription | None = None,
 ) -> dict:
     """Import a dataset after approval. CSV requires input columns; JSONL uses input, output and metadata objects."""
     try:
@@ -112,6 +127,7 @@ async def EXPERIMENT_create_experiment(
     dataset_version_id: PositiveDbId, description: str | None = None, repetitions: int = 1,
     metadata: dict[str, JsonValue] | None = None, dataset_evaluator_ids: list[PositiveDbId] | None = None,
     evaluators: list[EvaluatorConfig] | None = None,
+    approval_description: ApprovalDescription | None = None,
 ) -> dict:
     """Create an experiment after approval. First query the dataset and supply its explicit version ID."""
     try:
@@ -146,7 +162,8 @@ async def EXPERIMENT_get_experiment_detail(ctx: RunContext[AssistantDeps], exper
     return result
 
 
-async def EXPERIMENT_cancel_experiment(ctx: RunContext[AssistantDeps], experiment_id: PositiveDbId) -> dict:
+async def EXPERIMENT_cancel_experiment(ctx: RunContext[AssistantDeps], experiment_id: PositiveDbId,
+                                       approval_description: ApprovalDescription | None = None) -> dict:
     """Cancel the entire experiment after user approval, keeping its execution history."""
     await ctx.deps.check_execution()
     return await _read(ctx.deps.experiments.cancel(ctx.deps.owner_id, ctx.deps.auth_version, experiment_id))

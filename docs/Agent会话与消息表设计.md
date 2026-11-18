@@ -2,7 +2,7 @@
 
 目标存储为 `assistant_conversation_records` + `assistant_conversation_entries`，不新增 Action 表。完整字段字典、约束与 Backend 约定见 [ConversationStore 方案](ConversationStore方案.md#3-已确定的表结构)。
 
-ORM 已在 `evalforge/db/orm/assistant.py` 定义，通过 `evalforge.db.models` 导入 `AssistantConversationRecord`、`AssistantConversationEntry`。迁移 `20261118_conversation_store` 只创建新表，尚未执行或接入运行链路。
+ORM 已在 `evalforge/db/orm/assistant.py` 定义，通过 `evalforge.db.models` 导入 `AssistantConversationRecord`、`AssistantConversationEntry`。迁移 `20261118_conversation_store` 创建新表，启动前需应用。助手运行链路已接入。
 
 ## ER 图
 
@@ -52,13 +52,13 @@ erDiagram
 
 - `revision` 是保存时的乐观并发 Token；不另加整数 version，不用于控制模型执行权。
 - `active_run_id` 和 `lease_expires_at` 同空或同非空，`status=running` 与存在租约对应；`awaiting_approval` 要有待处理请求。
-- 短事务领取执行权 → 事务外运行模型与工具 → 保存后释放；暂沿用 45 秒租约、10 秒续租。心跳不改变 Revision，等待审批不占用执行权。
+- 短事务领取执行权 → 事务外运行模型与工具 → 保存后释放；默认 180 秒租约、60 秒续租。心跳不改变 Revision，等待审批不占用执行权。
 - 执行者续租、业务动作前检查、保存及释放均校验持有者。租约不能撤销已经执行的业务操作，异常结果不确定时仍需查询和对账。
 
 ## 与当前运行代码的衔接
 
-当前助手仍使用 `AssistantSession` / `AssistantMessage` 保存会话元信息、租约和展示消息，以进程内 fake 保存完整 Conversation；新表尚未被业务读写。
+当前助手使用 ConversationStore 保存完整消息、待审批请求和 Revision，Record 保存执行租约及状态。Run 完成时消息和执行状态在同一事务中提交。
 
-本次保留旧两张表及原字段，避免破坏已跑通的审批链路。后续接入 ConversationStore Backend、适配接口 ID / Revision、迁移旧历史，再删除旧表和旧 ORM。不要直接删除旧表，也不要把原消息记录视为已完成新存储迁移。
+旧会话和消息表保留，已有 SQL 历史导入为只读会话。新运行只写 Record/Entry，原 fake 已移除。
 
-部署迁移与现有助手启用方式见 [评测助手](assistant.md)。新表的定义不代表已实现跨实例恢复、业务幂等或持久化 Runner 明文凭证。
+部署迁移与现有助手启用方式见 [评测助手](assistant.md)。Runner 凭证通过 SSE display 卡片直接交付，业务幂等和故障对账仍由业务服务负责。

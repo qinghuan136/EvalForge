@@ -9,6 +9,8 @@ from .common import PositiveDbId, StoredText
 from .page_context import ExperimentPageContext, PageContext
 
 MessageText = Annotated[StoredText, StringConstraints(strip_whitespace=True, min_length=1, max_length=4000)]
+ConversationId = Annotated[StoredText, Field(strict=True, min_length=1, max_length=128)]
+Revision = Annotated[StoredText, Field(strict=True, min_length=1, max_length=128)]
 
 
 class AssistantSessionCreate(BaseModel):
@@ -22,7 +24,7 @@ class AssistantChatRequest(BaseModel):
 
     page_context: PageContext | None = None
     experiment_id: PositiveDbId | None = Field(default=None, json_schema_extra={"deprecated": True})
-    expected_version: Annotated[int, Field(strict=True, ge=0)]
+    expected_revision: Revision
     message: MessageText
     model_name: Annotated[StoredText, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)] | None = None
 
@@ -39,9 +41,9 @@ class AssistantChatRequest(BaseModel):
 class AssistantSessionSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    id: int
+    conversation_id: str
     title: str
-    version: int
+    revision: str
     created_at: datetime
     updated_at: datetime
 
@@ -52,7 +54,7 @@ class AssistantSessionList(BaseModel):
 
 
 class AssistantMessageView(BaseModel):
-    id: int
+    id: str
     role: Literal["user", "assistant"]
     text: str
     model_provider: str | None
@@ -66,18 +68,45 @@ class AssistantSessionDetail(AssistantSessionSummary):
     messages: list[AssistantMessageView]
     status: str = "completed"
     actions: list[AssistantAction] = Field(default_factory=list)
-    credential_call_ids: list[str] = Field(default_factory=list)
     error: dict[str, str] | None = None
 
 
 class AssistantAction(BaseModel):
     tool_call_id: str
     tool: str
+    title: Literal["批准请求"] = "批准请求"
+    description: str
     arguments: dict[str, JsonValue]
 
 
+class AssistantDisplayField(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    label: str = Field(min_length=1)
+    value: str
+    sensitive: bool = False
+
+
+class AssistantDisplayCard(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(min_length=1)
+    tool_call_id: str
+    title: str = Field(min_length=1)
+    description: str
+    fields: list[AssistantDisplayField] = Field(min_length=1)
+
+
+class AssistantApprovalRequired(BaseModel):
+    revision: str
+    cards: list[AssistantAction]
+
+
+class AssistantDone(BaseModel):
+    revision: str
+    status: Literal["completed", "awaiting_approval"]
+
+
 class AssistantChatResponse(BaseModel):
-    version: int
+    revision: str
     messages: list[AssistantMessageView]
     actions: list[AssistantAction] = Field(default_factory=list)
     status: Literal["completed", "awaiting_approval"] = "completed"
@@ -85,14 +114,14 @@ class AssistantChatResponse(BaseModel):
 
 class AssistantMessageRequest(AssistantChatRequest):
     type: Literal["message"]
-    session_id: PositiveDbId
+    conversation_id: ConversationId
 
 
 class AssistantDecisionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     type: Literal["decision"]
-    session_id: PositiveDbId
-    expected_version: Annotated[int, Field(strict=True, ge=0)]
+    conversation_id: ConversationId
+    expected_revision: Revision
     decisions: dict[str, StrictBool] = Field(min_length=1, max_length=100)
 
 

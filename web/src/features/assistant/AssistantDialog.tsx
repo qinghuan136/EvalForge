@@ -5,7 +5,8 @@ import { Link } from 'react-router'
 import { privateKey } from '../../app/queryClient'
 import { Dialog } from '../../components/ui/Dialog'
 import { errorMessage } from '../../lib/api'
-import { AssistantApprovals, AssistantRunnerCredential } from './AssistantActionCard'
+import { AssistantApprovals, AssistantDisplayCard } from './AssistantActionCard'
+import type { ApprovalRequired, DisplayCard } from './api'
 import { createAssistantSession, getAssistantSession, getAssistantSessions, streamAssistant } from './api'
 import { pageContextLabel } from './pageContext'
 import type { PageContext } from './pageContext'
@@ -14,10 +15,23 @@ export function AssistantDialog({ userId, open, pageContext, onClose }: {
   userId: number; open: boolean; pageContext?: PageContext; onClose: () => void
 }) {
   const client = useQueryClient()
-  const [sessionId, setSessionId] = useState<number>()
+  const selectedKey = `evalforge.assistant.selected:${userId}`
+  const [sessionId, setSessionId] = useState<string | undefined>(() => {
+    try { return sessionStorage.getItem(selectedKey) || undefined }
+    catch { return undefined }
+  })
+  function selectSession(id?: string) {
+    setSessionId(id)
+    try {
+      if (id) sessionStorage.setItem(selectedKey, id)
+      else sessionStorage.removeItem(selectedKey)
+    } catch { /* Selection remains available in memory when storage is disabled. */ }
+  }
   const [selectedModel, setSelectedModel] = useState('')
   const [draft, setDraft] = useState('')
   const [preview, setPreview] = useState('')
+  const [approval, setApproval] = useState<(ApprovalRequired & { conversationId: string })>()
+  const [displays, setDisplays] = useState<{ conversationId: string; card: DisplayCard }[]>([])
   const sessionsKey = [...privateKey, userId, 'assistant-sessions'] as const
   const transcriptKey = [...privateKey, userId, 'assistant-session', sessionId] as const
   const sessions = useQuery({
@@ -39,26 +53,39 @@ export function AssistantDialog({ userId, open, pageContext, onClose }: {
       const title = pageContext ? `${pageContextLabel(pageContext)} 对话` : '新对话'
       const session = transcript.data ?? await createAssistantSession(title)
       if (!transcript.data) {
-        client.setQueryData([...privateKey, userId, 'assistant-session', session.id], {
-          ...session, messages: [], actions: [], status: 'completed', credential_call_ids: [], error: null,
+        client.setQueryData([...privateKey, userId, 'assistant-session', session.conversation_id], {
+          ...session, messages: [], actions: [], status: 'completed', error: null,
         })
-        setSessionId(session.id)
+        selectSession(session.conversation_id)
         void client.invalidateQueries({ queryKey: sessionsKey })
       }
-      const request = { session_id: session.id, expected_version: session.version }
+      const revision = input.type === 'decision' && approval?.conversationId === session.conversation_id
+        ? approval.revision : session.revision
+      const request = { conversation_id: session.conversation_id, expected_revision: revision }
       const turn = await streamAssistant(input.type === 'message'
         ? { ...request, ...input, model_name: model, page_context: pageContext }
-        : { ...request, ...input }, (text) => setPreview((previous) => previous + text))
+        : { ...request, ...input }, {
+          onText: (text) => setPreview((previous) => previous + text),
+          onApproval: (batch) => setApproval({ ...batch, conversationId: session.conversation_id }),
+          onDisplay: (card) => setDisplays((previous) => [
+            ...previous.filter((item) => item.conversationId !== session.conversation_id || item.card.id !== card.id),
+            { conversationId: session.conversation_id, card },
+          ]),
+        })
       return { session, turn }
     },
-    onSuccess: async ({ session }) => {
-      const key = [...privateKey, userId, 'assistant-session', session.id] as const
+    onSuccess: async ({ session, turn }) => {
+      if (turn.status === 'completed') setApproval(undefined)
+      const key = [...privateKey, userId, 'assistant-session', session.conversation_id] as const
       await client.cancelQueries({ queryKey: key, exact: true })
       await client.invalidateQueries({ queryKey: key, exact: true })
       setDraft('')
       void client.invalidateQueries({ queryKey: [...privateKey, userId] })
     },
-    onError: async () => { await client.invalidateQueries({ queryKey: [...privateKey, userId, 'assistant-session'] }) },
+    onError: async () => {
+      setApproval(undefined)
+      await client.invalidateQueries({ queryKey: [...privateKey, userId, 'assistant-session'] })
+    },
     onSettled: () => setPreview(''),
   })
 
@@ -73,18 +100,21 @@ export function AssistantDialog({ userId, open, pageContext, onClose }: {
   if (!open) return null
 
   const busy = send.isPending
-  const blocked = transcript.data?.status === 'awaiting_approval' || transcript.data?.status === 'unavailable'
+  const currentApproval = approval?.conversationId === sessionId ? approval : undefined
+  const actions = currentApproval?.cards ?? transcript.data?.actions ?? []
+  const blocked = actions.length > 0 || transcript.data?.status === 'awaiting_approval' || transcript.data?.status === 'unavailable'
     || transcript.data?.status === 'running' || transcript.data?.error?.code === 'assistant_execution_uncertain'
+    || transcript.data?.error?.code === 'assistant_legacy_read_only'
 
   return <Dialog title="评测助手" onClose={onClose} busy={busy}>
     <div className="dialog-body">
       <p className="muted">当前上下文：{pageContext ? pageContextLabel(pageContext) : '未选择对象'}</p>
       <label className="field">会话
         <select value={sessionId ?? ''} disabled={busy}
-          onChange={(event) => { setSessionId(Number(event.target.value) || undefined); send.reset(); setPreview('') }}>
+          onChange={(event) => { selectSession(event.target.value || undefined); setApproval(undefined); send.reset(); setPreview('') }}>
           <option value="">新对话</option>
-          {sessions.data?.items.map((session) => <option key={session.id} value={session.id}>
-            {session.title}（#{session.id}）
+          {sessions.data?.items.map((session) => <option key={session.conversation_id} value={session.conversation_id}>
+            {session.title}
           </option>)}
         </select>
       </label>
@@ -105,11 +135,11 @@ export function AssistantDialog({ userId, open, pageContext, onClose }: {
       </ol> : null}
       {preview ? <p aria-label="助手实时回答" aria-live="polite">{preview}</p> : null}
       {transcript.data?.error ? <p role="alert" className="error-message">{transcript.data.error.message}</p> : null}
-      {transcript.data?.actions.length ? <AssistantApprovals key={`${sessionId}:${transcript.data.version}`}
-        actions={transcript.data.actions} disabled={busy}
+      {actions.length ? <AssistantApprovals key={`${sessionId}:${currentApproval?.revision ?? transcript.data?.revision}`}
+        actions={actions} disabled={busy}
         onSubmit={(decisions) => send.mutate({ type: 'decision', decisions })} /> : null}
-      {sessionId !== undefined ? transcript.data?.credential_call_ids.map((callId) =>
-        <AssistantRunnerCredential key={`${sessionId}:${callId}`} sessionId={sessionId} callId={callId} />) : null}
+      {displays.filter((item) => item.conversationId === sessionId).map(({ card }) =>
+        <AssistantDisplayCard key={card.id} card={card} />)}
       {sessions.isSuccess && !models.length ? <p role="status">管理员尚未配置助手模型。</p> : null}
       <form className="dialog-form" onSubmit={submit}>
         {models.length > 1 ? <label className="field">本轮模型

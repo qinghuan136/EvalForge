@@ -9,10 +9,13 @@ from uuid import uuid4
 
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart, ToolReturnPart, UserPromptPart
 from pydantic_ai.models.function import DeltaToolCall, FunctionModel
+from pydantic_ai import ModelMessagesTypeAdapter
+from pydantic_ai.messages import ModelRequest
+from evalforge.db.models import AssistantMessage as LegacyMessage, AssistantSession as LegacySession
 from sqlalchemy import func, select, update
 
 from api_support import APITestCase
-from evalforge.db.models import AssistantMessage, AssistantSession, Dataset, DatasetExample, DatasetVersion, Experiment, Job, Runner
+from evalforge.db.models import AssistantConversationEntry as AssistantMessage, AssistantConversationRecord as AssistantSession, Dataset, DatasetExample, DatasetVersion, Experiment, Job, Runner
 from evalforge.server.assistant.tools import ASSISTANT_TOOLS
 from evalforge.server.schemas.page_context import PageContextCatalog
 
@@ -38,15 +41,19 @@ class AssistantAPITests(APITestCase):
         self.service.config = replace(self.config, assistant_api_key="unused", assistant_models=("model-a", "model-b"))
         response = await self.client.post(SESSIONS, json={"title": "实验会话"})
         self.assertEqual(response.status_code, 201, response.text)
-        self.session_id = response.json()["id"]
+        self.session_id = response.json()["conversation_id"]
+        self.revisions = {0: response.json()["revision"]}
         self.path = f"{SESSIONS}/{self.session_id}"
 
     async def chat(self, version=0, text="跑到哪里了？", model="model-a", **overrides):
-        return await self.client.post(self.path + "/chat", json=self.chat_body(version, text, model, **overrides))
+        response = await self.client.post(self.path + "/chat", json=self.chat_body(version, text, model, **overrides))
+        if response.status_code == 200:
+            self.revisions[version + 1] = response.json()["revision"]
+        return response
 
     def chat_body(self, version=0, text="跑到哪里了？", model="model-a", **overrides):
         return {
-            "experiment_id": self.experiment_id, "expected_version": version,
+            "experiment_id": self.experiment_id, "expected_revision": self.revisions[version],
             "message": text, "model_name": model, **overrides,
         }
 
@@ -101,15 +108,15 @@ class AssistantAPITests(APITestCase):
         self.assertEqual(seen_history, [[], ["model-a"]])
         detail = await self.client.get(self.path)
         self.assertEqual(detail.headers.get("cache-control"), "no-store")
-        self.assertEqual(detail.json()["version"], 2)
+        self.assertEqual(detail.json()["revision"], second.json()["revision"])
+        self.assertNotEqual(detail.json()["revision"], first.json()["revision"])
         visible = detail.json()["messages"]
         self.assertEqual([m["role"] for m in visible], ["user", "assistant", "user", "assistant"])
         self.assertEqual([m["model_name"] for m in visible], [None, "model-a-resolved", None, "model-b-resolved"])
         self.assertEqual(visible[-1]["source_experiment_id"], self.experiment_id)
         async with self.database.transaction() as db:
             rows = (await db.scalars(select(AssistantMessage).order_by(AssistantMessage.id))).all()
-            self.assertEqual([m.role for m in rows], ["user", "assistant", "tool", "assistant"] * 2)
-            self.assertEqual([m.content["v"] for m in rows], [1] * 8)
+            self.assertEqual([m.message["kind"] for m in rows], ["request", "response", "request", "response"] * 2)
 
     async def test_runner_tool_checks_ownership_without_page_context(self):
         own = (await self.client.post("/api/v1/runners", json={"name": "本人的 Runner"})).json()
@@ -182,14 +189,32 @@ class AssistantAPITests(APITestCase):
         await self.login(other, username="bob")
         self.assertEqual((await other.get(self.path)).status_code, 404)
         self.assertEqual((await other.get(SESSIONS)).json()["items"], [])
-        their_session = (await other.post(SESSIONS, json={})).json()["id"]
-        payload = {"experiment_id": self.experiment_id, "expected_version": 0, "message": "hello"}
+        their_record = (await other.post(SESSIONS, json={})).json()
+        their_session = their_record["conversation_id"]
+        payload = {"experiment_id": self.experiment_id, "expected_revision": self.revisions[0], "message": "hello"}
         self.assertEqual((await other.post(self.path + "/chat", json=payload)).status_code, 404)
-        forbidden_reference = await other.post(f"{SESSIONS}/{their_session}/chat", json=payload)
+        forbidden_reference = await other.post(f"{SESSIONS}/{their_session}/chat", json={**payload, "expected_revision": their_record["revision"]})
         self.assertEqual(forbidden_reference.json()["error"]["code"], "experiment_not_found")
         self.assertEqual((await self.chat(model="unlisted")).status_code, 422)
         self.client.headers.pop("X-CSRF-Token")
         self.assertEqual((await self.chat()).status_code, 403)
+
+    async def test_legacy_history_remains_readable_without_replaying_tools(self):
+        async with self.database.transaction() as db:
+            session = LegacySession(user_id=self.user_id, title="旧会话", version=1)
+            db.add(session)
+            await db.flush()
+            old_id = session.id
+            encoded = ModelMessagesTypeAdapter.dump_python([ModelRequest(parts=[UserPromptPart("旧问题")])], mode="json")[0]
+            db.add(LegacyMessage(session_id=old_id, role="user", content={"v": 1, "message": encoded, "text": "旧问题"}))
+        listing = (await self.client.get(SESSIONS)).json()
+        legacy = next(item for item in listing["items"] if item["conversation_id"] == f"legacy-{old_id}")
+        detail = (await self.client.get(f"{SESSIONS}/{old_id}")).json()
+        self.assertEqual(detail["messages"][0]["text"], "旧问题")
+        self.assertEqual(detail["error"]["code"], "assistant_legacy_read_only")
+        blocked = await self.client.post(f"{SESSIONS}/{legacy['conversation_id']}/chat", json={
+            "expected_revision": legacy["revision"], "message": "继续"})
+        self.assertEqual(blocked.json()["error"]["code"], "assistant_legacy_read_only")
 
     async def page_contexts(self) -> tuple[list[dict], list[tuple[dict, str]]]:
         async with self.database.transaction() as db:
@@ -234,11 +259,12 @@ class AssistantAPITests(APITestCase):
 
         with patch("evalforge.server.services.assistant.build_model", return_value=FunctionModel(respond)):
             for version, context in enumerate([*contexts, None]):
-                body = {"expected_version": version, "message": f"问题 {version}"}
+                body = {"expected_revision": self.revisions[version], "message": f"问题 {version}"}
                 if context is not None:
                     body["page_context"] = context
                 response = await self.client.post(self.path + "/chat", json=body)
                 self.assertEqual(response.status_code, 200, response.text)
+                self.revisions[version + 1] = response.json()["revision"]
                 user_message, assistant_message = response.json()["messages"]
                 self.assertEqual(user_message["text"], f"问题 {version}")
                 self.assertEqual(user_message["page_context"], context)
@@ -256,23 +282,25 @@ class AssistantAPITests(APITestCase):
         saved = (await self.client.get(self.path)).json()["messages"]
         self.assertEqual([m["page_context"] for m in saved if m["role"] == "user"], [*contexts, None])
         async with self.database.transaction() as db:
-            rows = (await db.scalars(select(AssistantMessage).where(AssistantMessage.role == "user"))).all()
+            rows = (await db.scalars(select(AssistantMessage))).all()
             for row in rows:
-                part = next(p for p in row.content["message"]["parts"] if p["part_kind"] == "user-prompt")
-                self.assertEqual(part["content"], row.content["text"])
+                metadata = (row.message.get("metadata") or {}).get("evalforge", {})
+                if row.message["kind"] == "request" and "text" in metadata:
+                    self.assertTrue(metadata["text"].startswith("问题 "))
 
     async def test_context_requests_reject_invalid_shape_parent_or_owner_before_sse_starts(self):
         contexts, mismatches = await self.page_contexts()
-        body = {"expected_version": 0, "message": "检查上下文"}
+        body = {"expected_revision": self.revisions[0], "message": "检查上下文"}
         other = self.new_client()
         await self.register("bob", other)
         await self.login(other, username="bob")
-        their_session = (await other.post(SESSIONS, json={})).json()["id"]
+        their_record = (await other.post(SESSIONS, json={})).json()
+        their_session = their_record["conversation_id"]
         their_url = f"{SESSIONS}/{their_session}/chat"
         ours = self.path + "/chat"
         with patch("evalforge.server.services.assistant.build_model") as build:
             for context, code in zip(contexts, ("experiment", "job", "dataset", "runner"), strict=True):
-                response = await other.post(their_url, json={**body, "page_context": context}, headers=SSE)
+                response = await other.post(their_url, json={**body, "expected_revision": their_record["revision"], "page_context": context}, headers=SSE)
                 self.assertEqual(response.status_code, 404, response.text)
                 self.assertEqual(response.json()["error"]["code"], f"{code}_not_found")
             for context, code in mismatches:
@@ -288,7 +316,7 @@ class AssistantAPITests(APITestCase):
                 self.assertEqual((await self.client.post(ours, json={**body, **invalid})).status_code, 422)
             build.assert_not_called()
         detail = (await self.client.get(self.path)).json()
-        self.assertEqual((detail["version"], detail["messages"]), (0, []))
+        self.assertEqual((detail["revision"], detail["messages"]), (self.revisions[0], []))
 
     async def test_busy_request_and_late_holder_cannot_save_or_clear_new_lease(self):
         started, reply = asyncio.Event(), asyncio.Event()
@@ -305,7 +333,7 @@ class AssistantAPITests(APITestCase):
                 self.assertEqual((await self.chat()).json()["error"]["code"], "assistant_session_busy")
                 successor = uuid4()
                 async with self.database.transaction() as db:
-                    await db.execute(update(AssistantSession).where(AssistantSession.id == self.session_id).values(
+                    await db.execute(update(AssistantSession).where(AssistantSession.conversation_id == self.session_id).values(
                         active_run_id=successor, lease_expires_at=func.datetime("now", "+30 seconds"),
                     ))
                 reply.set()
@@ -315,16 +343,16 @@ class AssistantAPITests(APITestCase):
                 await asyncio.gather(task, return_exceptions=True)
         async with self.database.transaction() as db:
             row = await db.get(AssistantSession, self.session_id)
-            self.assertEqual((row.active_run_id, row.version), (successor, 0))
+            self.assertEqual((row.active_run_id, row.revision), (successor, self.revisions[0]))
             self.assertEqual(await db.scalar(select(func.count()).select_from(AssistantMessage)), 0)
-            await db.execute(update(AssistantSession).where(AssistantSession.id == self.session_id)
+            await db.execute(update(AssistantSession).where(AssistantSession.conversation_id == self.session_id)
                              .values(lease_expires_at=func.datetime("now", "-2 seconds")))
         with patch("evalforge.server.services.assistant.build_model", return_value=FunctionModel(
             lambda *_: ModelResponse(parts=[TextPart("接管成功")])
         )):
             taken_over = await self.chat()
         self.assertEqual(taken_over.status_code, 200, taken_over.text)
-        self.assertEqual(taken_over.json()["version"], 1)
+        self.assertNotEqual(taken_over.json()["revision"], self.revisions[0])
 
     async def test_model_timeout_releases_lease_without_committing_partial_turn(self):
         self.service.config = replace(self.service.config, assistant_timeout_seconds=1)
@@ -338,7 +366,7 @@ class AssistantAPITests(APITestCase):
         self.assertEqual((await self.client.get(self.path)).json()["messages"], [])
         async with self.database.transaction() as db:
             row = await db.get(AssistantSession, self.session_id)
-            self.assertEqual((row.active_run_id, row.lease_expires_at, row.version), (None, None, 0))
+            self.assertEqual((row.active_run_id, row.lease_expires_at, row.revision), (None, None, self.revisions[0]))
 
     async def test_sse_streams_tool_answer_before_commit_and_returns_saved_turn(self):
         continue_model = asyncio.Event()
@@ -366,7 +394,7 @@ class AssistantAPITests(APITestCase):
                 first = await asyncio.wait_for(frames.get(), 5)
                 self.assertIn("event: text_delta\ndata: {\"text\":\"实验\"}", first["body"].decode())
                 detail = await self.client.get(self.path)
-                self.assertEqual((detail.json()["version"], detail.json()["messages"]), (0, []))
+                self.assertEqual((detail.json()["revision"], detail.json()["messages"]), (self.revisions[0], []))
                 conflicting = await self.client.post(self.path + "/chat", json=self.chat_body(), headers=SSE)
                 self.assertEqual(conflicting.status_code, 409)
                 self.assertEqual(conflicting.json()["error"]["code"], "assistant_session_busy")
@@ -377,9 +405,10 @@ class AssistantAPITests(APITestCase):
                 self.assertTrue(completed.startswith("event: done\n"))
                 result = json.loads(completed.splitlines()[1].removeprefix("data: "))
                 detail = (await self.client.get(self.path)).json()
-                self.assertEqual(result, {"version": 1, "messages": detail["messages"], "actions": [], "status": "completed"})
-                self.assertEqual(result["messages"][-1]["source_experiment_id"], self.experiment_id)
-                self.assertEqual(result["messages"][-1]["text"], "实验正在执行")
+                self.assertEqual(result, {"revision": detail["revision"], "status": "completed"})
+                self.assertNotEqual(result["revision"], self.revisions[0])
+                self.assertEqual(detail["messages"][-1]["source_experiment_id"], self.experiment_id)
+                self.assertEqual(detail["messages"][-1]["text"], "实验正在执行")
                 await asyncio.wait_for(task, 5)
             finally:
                 continue_model.set()
@@ -411,7 +440,7 @@ class AssistantAPITests(APITestCase):
 
         async with self.database.transaction() as db:
             row = await db.get(AssistantSession, self.session_id)
-            self.assertEqual((row.active_run_id, row.lease_expires_at, row.version), (None, None, 0))
+            self.assertEqual((row.active_run_id, row.lease_expires_at, row.revision), (None, None, self.revisions[0]))
             self.assertEqual(await db.scalar(select(func.count()).select_from(AssistantMessage)), 0)
 
     async def test_sse_errors_use_http_before_start_and_event_after_start(self):

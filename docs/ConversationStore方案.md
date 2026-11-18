@@ -1,13 +1,13 @@
 # EvalForge Assistant — ConversationStore存储设计方案
 
-> 状态：表结构、ORM 与增量迁移已定义；数据库 Backend 尚未接入｜日期：2026-11-18
+> 状态：表结构、ORM、迁移及数据库 Backend 已实现；已接入助手运行链路｜日期：2026-11-18
 > 适用范围：EvalForge Assistant的Conversation持久化、历史管理与Deferred Tools恢复。
 
 ## 1. 设计决策
 
 - 使用PydanticAI的`ConversationStore`，基于现有SQLAlchemy/Alembic实现数据库Backend。
 - **只新建两张表**：`assistant_conversation_records`、`assistant_conversation_entries`；暂不建立独立`Action`表。
-- 最终由 Record 替代旧 `assistant_sessions`、Entry 替代旧 `assistant_messages`。当前代码仍使用旧表和 fake Conversation，故本次只新增 ORM 与迁移，不删除旧表、不搬运历史数据，也不改变运行链路。
+- 最终由 Record 替代旧 `assistant_sessions`、Entry 替代旧 `assistant_messages`。Backend 已接入助手编排，接口使用 conversation_id / revision。旧历史导入为只读记录，旧表保留待后续清理。
 - **每次Agent Run结束后保存一次**；普通SSE片段和普通Tool调用过程中不逐条写库。因Deferred Tools暂停也视为一次Run结束。
 - `ConversationStore`负责增量追加、历史重建、Revision校验、Branch/Fork逻辑；EvalForge负责SQL、事务、身份隔离与业务幂等。
 - 多个待审批调用由前端一次性收集全部批准/拒绝结果，再提交恢复；不持久化逐项点击的中间决定。
@@ -112,14 +112,16 @@ PydanticAI 规定对象的数据与存储语义，不强制 SQL 列结构。框�
 
 ### 3.3 执行权与迁移边界
 
-- 沿用短事务领取、45 秒租约、10 秒续租的方式；模型请求与业务 API 等待均在事务之外。
+- 短事务领取执行权，默认 180 秒租约、60 秒续租；模型请求与业务 API 等待均在事务之外。正常结束立即释放租约。
 - 领取、续租、保存和释放都检查当前持有者。等待审批时释放租约，不保留协程或长期数据库锁。
 - 心跳只更新租约，不推进 `revision`；`write_record` 更新框架字段时不得覆盖标题、归属、租约和恢复配置等业务列。
 - `revision` 负责保存冲突，租约负责执行权；租约过期不证明副作用没有发生。`last_error.code=assistant_execution_uncertain` 用于阻止盲目重放，实际幂等与对账仍由业务 Service 负责。
-- 新迁移 `20261118_conversation_store` 仅创建两张新表，接在 `20261117_trace` 之后。不自动执行迁移，不删除原会话/消息表，不迁移旧历史；当前 fake 运行方式保持不变。
-- 后续完成 Backend、接口 ID/Revision 适配与历史迁移后，再移除 `AssistantSession`、`AssistantMessage` 及旧表。最终收敛为两张表，而不是长期维护两套会话存储。
+- 新迁移 `20261118_conversation_store` 仅创建两张新表，接在 `20261117_trace` 之后。启动前需应用迁移；新链路读写新表，旧 SQL 历史幂等导入为只读会话。
+- 运行链路和接口已接入，后续确认旧历史保留后再移除 `AssistantSession`、`AssistantMessage` 及旧表。最终收敛为两张表，而不是长期维护两套会话存储。
 
 ## 4. ConversationStore Backend
+
+实现位于 `evalforge/server/assistant/conversation_store.py`，类名为 `DatabaseConversationStore`。构造时传入 `database` 和认证后的 `user_id`，由 Backend 派生用户 scope。助手编排通过该类加载和保存，结束事务共享同一个 AsyncSession，原子提交消息、Revision 和执行状态。
 
 继承`pydantic_ai.conversation_store.ConversationStore`，按当前官方接口实现以下**5个必需方法**：
 
@@ -149,6 +151,8 @@ async def read_entry(entry_id: str) -> ConversationEntry: ...
 - `delete_record`：按预期Revision删除Record；共享Entry的清理需另行设计，MVP可先保守保留孤立Entry。
 - `read_entry`：按ID读取并恢复完整Entry。
 
+写入采用 `WHERE revision = expected_revision` 条件更新，冲突抛出 `ConversationConflict` 并回滚本批 Entry。首次保存通过主键冲突检查处理并发创建。新增 Entry 按父节点在前的顺序插入，已有 Entry 不覆盖。Record 更新仅写框架字段，标题、归属、执行租约和恢复模型等业务列由编排层管理。用户可访问的历史从其 Record 的 `head_id`、`forked_at` 和 `branches` 推导，禁止跨用户引用。删除 Record 保留共享 Entry。
+
 **建议额外重写（非必需）：**
 
 ```python
@@ -158,6 +162,8 @@ async def read_history(
 ```
 
 基类的`load()`等方法已经通过`self.read_history()`调用它；子类同名覆盖即可生效，**无需注册**。建议使用SQLite/PostgreSQL递归CTE批量读取，减少默认沿`parent_id`逐条查库的N次查询。返回顺序必须为**旧→新**，并正确处理`limit`、缺失Entry。
+
+当前覆盖实现使用单条递归 CTE 查询，在递归中限制最近消息数，再按深度倒序返回。无起点或 `limit=0` 返回空列表，历史缺失或循环抛出 `LookupError`。专项测试见 `tests/test_conversation_store.py`。
 
 ## 5. 会话写入与Deferred Tools链路
 
@@ -175,13 +181,13 @@ await store.save(result, scope=scope)
 ### 需要用户审批
 
 1. Agent遇到`requires_approval=True`的工具，结束本次Run；`result.conversation.deferred_tool_requests`自动包含待审批调用。
-2. **先**`store.save(result, scope=scope)`，成功后再向React发送SSE `action_required`（附`tool_call_id`、工具名、参数）；本次流以`done(status=awaiting_approval)`结束。
+2. **先**`store.save(result, scope=scope)`，成功后再向React发送SSE `approval_required`（附`tool_call_id`、工具名、参数）；本次流以`done(status=awaiting_approval)`结束。
 3. 用户刷新页面：按`conversation_id`加载会话，读取`deferred_tool_requests.approvals`，重新生成审批卡片。
 4. 前端收集**全部**审批结果，一次性向统一`POST /assistant/stream`提交`type=decision`、会话ID及`tool_call_id → approve/deny`映射。
 5. 后端校验会话归属、全部待处理ID与审批权限，构造`DeferredToolResults`，使用原Conversation启动**新的**`agent.run(conversation=..., deferred_tool_results=..., deps=...)`。
 6. 新Run结束后再次`store.save(result, scope=scope)`；可能完成，也可能返回下一批Deferred Tools。统一走原SSE结果处理逻辑。
 
-**统一约定：** 不将逐Token SSE、普通Tool进度逐项写库；只有Run完成或Deferred暂停形成可保存的Conversation时写库。`action_required`与最终`done`须在持久化成功后发出。
+**统一约定：** 不将逐Token SSE、普通Tool进度逐项写库；只有Run完成或Deferred暂停形成可保存的Conversation时写库。`approval_required`与最终`done`须在持久化成功后发出。
 
 ## 6. 并发、可靠性与边界
 
