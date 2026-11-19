@@ -2,6 +2,7 @@
 
 from collections.abc import Awaitable
 from typing import Annotated, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, Field, JsonValue, ValidationError
 from pydantic_ai import RunContext
@@ -12,7 +13,7 @@ from ..errors import APIError
 from ..schemas.common import MAX_DB_ID, PositiveDbId, StoredText
 from ..schemas.datasets import MAX_DATASET_UPLOAD_BYTES, DatasetImportOptions
 from ..schemas.evaluators import EvaluatorConfig
-from ..schemas.experiments import ExecutionConfig, ExperimentCreate, JobStatus
+from ..schemas.experiments import MAX_EXPERIMENT_JOBS, ExecutionConfig, ExperimentCreate, ExperimentRunCreate, JobStatus
 from ..schemas.runners import RunnerName
 from ..schemas.assistant import AssistantDisplayCard, AssistantDisplayField
 from .context import AssistantDeps
@@ -129,7 +130,7 @@ async def EXPERIMENT_create_experiment(
     evaluators: list[EvaluatorConfig] | None = None,
     approval_description: ApprovalDescription | None = None,
 ) -> dict:
-    """Create an experiment after approval. First query the dataset and supply its explicit version ID."""
+    """Legacy standalone experiment entry. Prefer EXPERIMENT_start_run for saved configurations."""
     try:
         data = ExperimentCreate.model_validate({
             "name": name, "execution_config": execution_config, "description": description,
@@ -146,6 +147,38 @@ async def EXPERIMENT_create_experiment(
         return _error("empty_experiment_dataset", "数据集版本没有有效样本")
     await ctx.deps.check_execution()
     return await _read(ctx.deps.experiments.create(ctx.deps.owner_id, ctx.deps.auth_version, dataset_id, data))
+
+
+async def EXPERIMENT_list_configs(ctx: RunContext[AssistantDeps], dataset_id: PositiveDbId | None = None,
+                                  page: Page = 1, pagesize: PageSize = 20) -> dict:
+    """List the latest saved experiment configurations, optionally by dataset."""
+    return await _read(ctx.deps.experiment_configs.list(ctx.deps.owner_id, page, pagesize, dataset_id))
+
+
+async def EXPERIMENT_list_config_versions(ctx: RunContext[AssistantDeps], group_id: UUID,
+                                          page: Page = 1, pagesize: PageSize = 20) -> dict:
+    """List saved versions of one experiment configuration group, newest first."""
+    return await _read(ctx.deps.experiment_configs.versions(ctx.deps.owner_id, group_id, page, pagesize))
+
+
+async def EXPERIMENT_start_run(
+    ctx: RunContext[AssistantDeps], config_id: PositiveDbId, runner_id: ResourceId, dataset_version_id: PositiveDbId,
+    example_ids: Annotated[list[PositiveDbId], Field(min_length=1, max_length=MAX_EXPERIMENT_JOBS)] | None = None,
+    approval_description: ApprovalDescription | None = None,
+) -> dict:
+    """Start a Run after approval. Use the saved configuration row ID and its Runner. Null example_ids runs all."""
+    fields = {"dataset_version_id": dataset_version_id}
+    if example_ids is not None:
+        fields["example_ids"] = example_ids
+    try:
+        data = ExperimentRunCreate.model_validate(fields)
+    except ValidationError:
+        return _error("invalid_request", "Run 启动参数不合法")
+    await ctx.deps.check_execution()
+    return await _read(ctx.deps.experiments.start_run(
+        ctx.deps.owner_id, ctx.deps.auth_version, config_id, data, runner_id=runner_id,
+        check_local=ctx.deps.check_local_runner,
+    ))
 
 
 async def EXPERIMENT_list_experiments(ctx: RunContext[AssistantDeps], dataset_id: PositiveDbId,
@@ -199,13 +232,14 @@ async def TRACE_get_span_detail(ctx: RunContext[AssistantDeps], trace_id: TraceI
 
 WRITE_TOOL_NAMES = frozenset({
     "RUNNER_create_runner", "RUNNER_delete_runner", "DATASET_import_dataset",
-    "EXPERIMENT_create_experiment", "EXPERIMENT_cancel_experiment",
+    "EXPERIMENT_create_experiment", "EXPERIMENT_start_run", "EXPERIMENT_cancel_experiment",
 })
 
 ASSISTANT_TOOLS = (
     RUNNER_create_runner, RUNNER_delete_runner, RUNNER_list_runners, RUNNER_get_runner_detail,
     DATASET_import_dataset, DATASET_list_datasets, DATASET_get_dataset_detail, DATASET_list_examples,
     EXPERIMENT_create_experiment, EXPERIMENT_list_experiments, EXPERIMENT_get_experiment_detail,
+    EXPERIMENT_list_configs, EXPERIMENT_list_config_versions, EXPERIMENT_start_run,
     EXPERIMENT_cancel_experiment, JOB_list_jobs, JOB_get_job_detail,
     TRACE_list_traces, TRACE_get_trace_detail, TRACE_get_span_detail,
 )

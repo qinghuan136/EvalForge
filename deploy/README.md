@@ -19,7 +19,7 @@
 
 ## 验证请求路由
 
-1. 注册账号，导入一个数据集，配置本地 Runner 和 Agent。Runner 连接后，等管理页面显示「已就绪」。通过浏览器创建实验，确认 Job 被派发并返回结果。
+1. 注册账号，导入一个数据集，配置本地 Runner 和 Agent。保存一组实验配置，等 Runner 管理页面显示「已就绪」，选择样本并启动 Run，确认 Job 被派发并返回结果。
 2. 用 `docker compose --env-file .env.compose logs nginx` 查看代理日志。创建请求有一条 `uri=/internal/runner-route` 记录，显示哪台后端执行归属查询。接着主请求的 `route=cloud-a` 或 `route=cloud-b` 显示选中的会话进程。两条记录的 `upstream` 可以不同。取消实验、查询列表或详情时只有业务请求记录。
 3. 断开 Runner，等页面显示离线，再发起定向创建请求。Nginx 返回 `403 runner_not_routable`，已存在的实验仍可通过取消接口处理。
 

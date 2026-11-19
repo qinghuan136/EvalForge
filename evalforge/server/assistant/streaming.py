@@ -68,9 +68,12 @@ async def stream_events(service: AssistantService, turn: AssistantTurn) -> Async
     async def display(card: AssistantDisplayCard) -> None:
         await queue.put(("display", card.model_dump(mode="json")))
 
+    async def emit_event(name: str, data: dict) -> None:
+        await queue.put((name, data))
+
     async def run() -> None:
         try:
-            result = await service.execute_chat(turn, emit, display)
+            result = await service.execute_chat(turn, emit, display, emit_event)
         except APIError as exc:
             await queue.put(("error", {"code": exc.code, "message": exc.message}))
         except SQLAlchemyError as exc:

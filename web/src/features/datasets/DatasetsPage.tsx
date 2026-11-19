@@ -4,7 +4,7 @@ import { Link, Navigate, useSearchParams } from 'react-router'
 import { privateKey } from '../../app/queryClient'
 import { Dialog } from '../../components/ui/Dialog'
 import { errorMessage } from '../../lib/api'
-import { AskAssistantButton } from '../assistant/AskAssistantButton'
+import { useAssistantPageContext } from '../assistant/AssistantPageContext'
 import { getDataset, getDatasets, getExamples } from './api'
 import { ImportDialog } from './ImportDialog'
 
@@ -14,6 +14,7 @@ export function DatasetDetail({ userId, id, onClose, versionId }: { userId: numb
   const examples = useQuery({ queryKey: [...privateKey, userId, 'examples', id, page, versionId], queryFn: ({ signal }) => getExamples(id, page, signal, versionId) })
   const lastPage = examples.data ? Math.max(1, Math.ceil(examples.data.total / examples.data.pagesize)) : 1
   const displayedVersion = versionId ?? (examples.data ? examples.data.dataset_version_id : detail.data?.latest_version_id)
+  useAssistantPageContext({ type: 'dataset', id, version_id: displayedVersion ?? undefined }, detail.data?.name)
   return (
     <Dialog title={detail.data?.name ?? '数据集详情'} onClose={onClose}>
       <div className="dialog-body">
@@ -22,7 +23,6 @@ export function DatasetDetail({ userId, id, onClose, versionId }: { userId: numb
         {detail.data ? <>
           <p className="muted">{detail.data.description || '无描述'}</p>
           <p>{displayedVersion == null ? '暂无版本' : `${versionId ? '实验版本' : '最新版本'} #${displayedVersion}`}，共 {examples.data?.total ?? '…'} 条样本</p>
-          <div><AskAssistantButton pageContext={{ type: 'dataset', id, version_id: displayedVersion ?? undefined }} /></div>
         </> : null}
         <h3>样本</h3>
         {examples.isPending ? <p role="status">正在加载样本…</p> : null}

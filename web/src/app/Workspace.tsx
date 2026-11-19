@@ -1,13 +1,11 @@
-import { useCallback, useState } from 'react'
+import { useState } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router'
 import { Brand } from '../components/ui/Brand'
 import { errorMessage } from '../lib/api'
 import { logout } from '../features/auth/api'
 import type { Session } from '../features/auth/api'
-import { AssistantDialog } from '../features/assistant/AssistantDialog'
-import { OpenAssistantContext } from '../features/assistant/AskAssistantButton'
-import { derivePageContext } from '../features/assistant/pageContext'
-import type { PageContext } from '../features/assistant/pageContext'
+import { AssistantController } from '../features/assistant/AssistantController'
+import { AssistantPageContextProvider } from '../features/assistant/AssistantPageContext'
 import { updateSession } from './queryClient'
 
 const navigation = [
@@ -22,12 +20,6 @@ export function Workspace({ user }: { user: Session['user'] }) {
   const current = navigation.find(({ to }) => location.pathname === to || location.pathname.startsWith(to + '/'))
   const [leaving, setLeaving] = useState(false)
   const [logoutError, setLogoutError] = useState('')
-  const [assistant, setAssistant] = useState<{ locationKey: string; context?: PageContext } | null>(null)
-  const openAssistant = useCallback((context?: PageContext) => {
-    setAssistant({ locationKey: location.key, context })
-  }, [location.key])
-  const detailContext = assistant?.locationKey === location.key ? assistant.context : undefined
-  const pageContext = detailContext ?? derivePageContext(location.pathname)
 
   async function signOut() {
     setLeaving(true)
@@ -42,7 +34,7 @@ export function Workspace({ user }: { user: Session['user'] }) {
     }
   }
 
-  return <OpenAssistantContext.Provider value={openAssistant}>
+  return <AssistantPageContextProvider>
     <div className="workspace">
       <aside className="sidebar">
         <Brand />
@@ -57,7 +49,6 @@ export function Workspace({ user }: { user: Session['user'] }) {
           </div>
           <div className="account">
             <span title={user.username}>{user.display_name || user.username}</span>
-            <button className="button button-quiet" type="button" onClick={() => openAssistant()}>评测助手</button>
             <button className="button button-quiet" type="button" disabled={leaving} onClick={() => void signOut()}>
               {leaving ? '退出中…' : '退出登录'}
             </button>
@@ -69,7 +60,6 @@ export function Workspace({ user }: { user: Session['user'] }) {
         </div>
       </main>
     </div>
-    <AssistantDialog key={user.id} userId={user.id} open={assistant !== null}
-      pageContext={pageContext} onClose={() => setAssistant(null)} />
-  </OpenAssistantContext.Provider>
+    <AssistantController key={user.id} userId={user.id} />
+  </AssistantPageContextProvider>
 }

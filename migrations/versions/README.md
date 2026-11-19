@@ -6,3 +6,5 @@
 全新开发库和已有自管迁移链的接入方式见 [评测助手](../../docs/assistant.md#启用)。
 
 `20261118_conversation_store` 接在 Trace 迁移之后，新增 `assistant_conversation_records` 和 `assistant_conversation_entries`，包含归属、共享历史保护和执行租约约束；不修改旧助手表、不迁移历史数据。执行 `python -m alembic upgrade head` 可建表，但助手仍使用现有 fake 链路，数据库 Backend 后续接入。结构见 [ConversationStore 方案](../../docs/ConversationStore方案.md)。
+
+`20261119_experiment_config` 创建版本化配置表和 Run 外键，移除旧配置表。已有开发库可执行 `python -m alembic upgrade head`。迁移要求实验和旧配置表为空，检测到旧记录会中止。用当前 ORM 全量建表的新库沿用 `alembic stamp head`。回退使用升级前的备份。

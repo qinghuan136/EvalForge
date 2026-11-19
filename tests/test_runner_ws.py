@@ -234,7 +234,14 @@ class RunnerWebSocketTests(APITestCase):
                                      "timeout_seconds": 12, "stream_output": stream_output},
             }
             if stream_output:
-                create_path = f"/api/v1/runners/{self.runner_id}/datasets/{dataset_id}/experiments"
+                saved = await self.client.post("/api/v1/experiment-configs", json={
+                    "dataset_id": dataset_id, **{key: value for key, value in payload.items() if key != "execution_config"},
+                    **payload["execution_config"],
+                })
+                self.assertEqual(saved.status_code, 201, saved.text)
+                config_id = saved.json()["id"]
+                create_path = f"/api/v1/runners/{self.runner_id}/experiment-configs/{config_id}/runs"
+                payload = {"dataset_version_id": versions[0], "example_ids": [example_id]}
                 rejected = await self.client.post(create_path, json=payload)
                 self.assertEqual((rejected.status_code, rejected.json()["error"]["code"]),
                                  (503, "runner_not_ready_here"))
@@ -249,6 +256,7 @@ class RunnerWebSocketTests(APITestCase):
             experiment_id = response.json()["experiment_id"]
             self.assertEqual(response.json()["progress"]["queued"], 2)
             if stream_output:
+                self.assertEqual(response.json()["experiment_config_id"], config_id)
                 dispatch = await recv(ws)
             else:
                 await send(ws, "runner.sync", {"runner_id": self.runner_id, "active_jobs": [], "pending_results": []})

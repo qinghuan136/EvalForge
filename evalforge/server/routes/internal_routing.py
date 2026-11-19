@@ -13,7 +13,11 @@ from ..errors import APIError
 from ..schemas.common import MAX_DB_ID
 
 router = APIRouter(include_in_schema=False)
-CREATE_PATH = re.compile(r"/api/v1/runners/([a-zA-Z0-9_-]{1,128})/datasets/([1-9][0-9]{0,9})/experiments")
+CREATE_PATH = re.compile(
+    r"/api/v1/runners/(?P<runner>[a-zA-Z0-9_-]{1,128})/"
+    r"(?:datasets/(?P<dataset>[1-9][0-9]{0,9})/experiments|"
+    r"experiment-configs/(?P<config>[1-9][0-9]{0,9})/runs|assistant/stream)"
+)
 EVENTS_PATH = re.compile(r"/api/v1/experiments/([1-9][0-9]{0,9})/jobs/[a-zA-Z0-9_-]{1,128}/events")
 
 
@@ -25,8 +29,8 @@ async def runner_route(request: Request) -> Response:
         raise APIError(403, "route_lookup_forbidden", "内部归属查询不可访问")
 
     path = request.headers.get("X-Original-Path", "")
-    if (match := CREATE_PATH.fullmatch(path)) and int(match[2]) <= MAX_DB_ID:
-        runner_id = match[1]
+    if (match := CREATE_PATH.fullmatch(path)) and int(match["dataset"] or match["config"] or 0) <= MAX_DB_ID:
+        runner_id = match["runner"]
     elif (match := EVENTS_PATH.fullmatch(path)) and (experiment_id := int(match[1])) <= MAX_DB_ID:
         try:
             async with request.app.state.database.transaction() as db:

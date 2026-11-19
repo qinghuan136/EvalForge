@@ -2,7 +2,7 @@
 
 import unittest
 from datetime import datetime, timedelta, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import create_engine, event, func, select
 from sqlalchemy.dialects import postgresql
@@ -38,7 +38,10 @@ class RemoteORMTests(unittest.TestCase):
         dataset = Dataset(name=f"dataset-{self.counter}")
         version = DatasetVersion(dataset=dataset)
         example = DatasetExample(dataset=dataset)
-        experiment = Experiment(dataset=dataset, dataset_version=version, name="remote", repetitions=1,
+        runner = session.get(Runner, "runner-01")
+        config = ExperimentConfig(config_group_id=uuid4(), version=1, user=runner.owner, runner=runner,
+                                  dataset=dataset, name="remote", agent_target_id="agent")
+        experiment = Experiment(experiment_config=config, dataset=dataset, dataset_version=version, name="remote", repetitions=1,
                                 execution_config={"runner_id": "runner-01", "agent_target_id": "agent", "timeout_seconds": 30})
         run = Job(experiment=experiment, dataset_example=example, repetition_number=1)
         session.add(run)
@@ -55,7 +58,7 @@ class RemoteORMTests(unittest.TestCase):
         return {"job_id": run.job_id, "attempt_id": attempt, "status": status, "output": None,
                 "duration_ms": 1, "http_status": None, "error": {"code": "timeout", "message": "Timed out"}}
 
-    def test_queued_job_and_experiment_do_not_require_legacy_job(self):
+    def test_queued_job_belongs_to_run_with_a_config_version(self):
         with Session(self.engine) as session, session.begin():
             run = self.seed_run(session)
             self.assertEqual(run.status, "queued")
@@ -64,9 +67,8 @@ class RemoteORMTests(unittest.TestCase):
             self.assertIsNone(run.latency_ms)
             self.assertEqual(str(UUID(run.job_id)), run.job_id)
             self.assertEqual(run.experiment.status, "pending")
-            self.assertIsNone(run.experiment.legacy_config)
+            self.assertEqual(run.experiment.experiment_config.version, 1)
             self.assertEqual(run.experiment.execution_config["agent_target_id"], "agent")
-            self.assertTrue(ExperimentConfig.__table__.info["deprecated"])
             self.assertEqual(run.attempts, [])
             self.assertEqual(next(iter(RunnerAttempt.__table__.c.runner_id.foreign_keys)).target_fullname,
                              "runners.runner_id")

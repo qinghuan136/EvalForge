@@ -4,6 +4,7 @@ import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
 from sqlalchemy import create_engine, event, func, select, text
 from sqlalchemy.dialects import postgresql
@@ -13,10 +14,9 @@ from sqlalchemy.schema import CreateIndex, CreateTable
 
 from evalforge.db.models import (
     Base, BuiltinEvaluator, CodeEvaluator, CodeEvaluatorVersion, Dataset,
-    DatasetEvaluators, DatasetExample, DatasetExampleRevision, DatasetVersion,
-    Evaluator, Experiment, ExperimentDatasetEvaluator, ExperimentDatasetExample,
-    ExperimentEvalOnlyConfig, ExperimentConfig, ExperimentPromptTask, Job,
-    JobEvaluation, LLMEvaluator, Span, Trace, User,
+    DatasetExample, DatasetExampleRevision, DatasetVersion,
+    Evaluator, Experiment, ExperimentConfig, ExperimentDatasetExample, Job,
+    JobEvaluation, LLMEvaluator, Runner, Span, Trace, User,
 )
 from evalforge.models import Dataset as InMemoryDataset, Example
 
@@ -41,12 +41,16 @@ class SchemaContractTests(unittest.TestCase):
                     ("runner_credentials", "runner_id"): "RESTRICT",
                     ("runner_attempts", "runner_id"): "RESTRICT",
                     ("experiments", "user_id"): "SET NULL",
+                    ("experiments", "experiment_config_id"): "NO ACTION",
+                    ("experiment_config", "user_id"): "RESTRICT",
+                    ("experiment_config", "runner_id"): "RESTRICT",
+                    ("experiment_config", "dataset_version_id"): "NO ACTION",
                     ("assistant_conversation_entries", "parent_id"): "RESTRICT",
                     ("assistant_conversation_records", "head_id"): "RESTRICT",
                     ("assistant_conversation_records", "forked_at"): "RESTRICT",
                 }.get((table.name, foreign_key.parent.name), "CASCADE")
                 self.assertEqual(foreign_key.ondelete, expected)
-        self.assertEqual(len(Base.metadata.sorted_tables), 27)
+        self.assertEqual(len(Base.metadata.sorted_tables), 25)
         for name in ("prompts", "projects", "sandbox_configs", "languages"):
             self.assertNotIn(name, Base.metadata.tables)
         self.assertEqual(Dataset.__table__.c.user_id.info["deferred_foreign_key"]["target"], "users.id")
@@ -62,7 +66,8 @@ class SchemaContractTests(unittest.TestCase):
         self.assertIn("JSONB", sql)
         self.assertIn("TIMESTAMP WITH TIME ZONE", sql)
         self.assertIn("FOREIGN KEY(kind, id) REFERENCES evaluators (kind, id)", sql)
-        self.assertIn("FOREIGN KEY(type, id) REFERENCES experiment_jobs (type, id)", sql)
+        self.assertIn("FOREIGN KEY(experiment_config_id) REFERENCES experiment_config (id)", sql)
+        self.assertIn("UNIQUE (config_group_id, version)", sql)
         self.assertNotIn("score", Job.__table__.c)
         self.assertNotIn("evaluator_id", JobEvaluation.__table__.c)
 
@@ -150,7 +155,12 @@ class PersistenceTests(unittest.TestCase):
             dataset_example=example, dataset_version=version, input={"product": "A"},
             output={"price": 100}, revision_kind="CREATE",
         )
-        experiment = Experiment(dataset=dataset, dataset_version=version, name="baseline", repetitions=1)
+        owner = User(username="experiment-owner", password_hash="test-only-hash")
+        config = ExperimentConfig(config_group_id=uuid4(), version=1, user=owner, name="baseline",
+                                  dataset=dataset, dataset_version=version,
+                                  runner=Runner(name="test runner", owner=owner), agent_target_id="agent")
+        experiment = Experiment(experiment_config=config, dataset=dataset, dataset_version=version,
+                                user=owner, name="baseline", repetitions=1)
         experiment.experiment_dataset_examples.append(ExperimentDatasetExample(
             dataset_example=example, dataset_example_revision=revision,
         ))
@@ -240,7 +250,7 @@ class PersistenceTests(unittest.TestCase):
             session.delete(session.get(Dataset, dataset_id))
         with Session(self.engine) as session:
             for model in (Dataset, DatasetVersion, DatasetExample, DatasetExampleRevision,
-                          Experiment, ExperimentDatasetExample, Job, JobEvaluation):
+                          ExperimentConfig, Experiment, ExperimentDatasetExample, Job, JobEvaluation):
                 self.assertEqual(session.scalar(select(func.count()).select_from(model)), 0)
 
     def test_evaluator_joined_inheritance_and_code_versions(self):
@@ -272,39 +282,48 @@ class PersistenceTests(unittest.TestCase):
             with self.assertRaises(IntegrityError):
                 connection.execute(text("INSERT INTO llm_evaluators(id,kind,prompt_id,output_configs) VALUES (:id,'LLM',1,'[]')"), {"id": evaluator_id})
 
-    def test_prompt_and_eval_only_jobs_and_evaluator_links(self):
+    def test_runs_pin_a_config_version_and_allow_reuse(self):
         with Session(self.engine) as session, session.begin():
-            dataset, version, *_, experiment, run = self.seed_experiment(session)
-            evaluator = BuiltinEvaluator(name="builtin", key="exact", input_schema={}, output_configs=[])
-            configuration = DatasetEvaluators(dataset=dataset, evaluator=evaluator, name="match", input_mapping={"path_mapping": {}, "literal_mapping": {}}, project_id=1)
-            prompt = ExperimentPromptTask(
-                experiment=experiment, model_provider="OPENAI", model_name="example-model",
-                template_type="CHAT", template_format="MUSTACHE", template={"messages": []},
+            dataset, version, *_, first, _ = self.seed_experiment(session)
+            v1 = first.experiment_config
+            v2 = ExperimentConfig(
+                config_group_id=v1.config_group_id, version=2, user=v1.user, name="Updated",
+                dataset=dataset, runner=v1.runner, agent_target_id="other",
             )
-            prompt.dataset_evaluator_links.append(ExperimentDatasetEvaluator(dataset_evaluator=configuration))
-            eval_experiment = Experiment(dataset=dataset, dataset_version=version, name="eval-only", repetitions=1)
-            eval_job = ExperimentEvalOnlyConfig(experiment=eval_experiment)
-            session.add_all([prompt, eval_job])
+            second = Experiment(experiment_config=v1, dataset=dataset, dataset_version=version,
+                                name="Subset", repetitions=1)
+            third = Experiment(experiment_config=v2, dataset=dataset, dataset_version=version,
+                               name="Changed", repetitions=1)
+            session.add_all([second, third])
             session.flush()
-            prompt_id, eval_id = prompt.id, eval_job.id
-            self.assertEqual(prompt.status, "STOPPED")
-            self.assertEqual(prompt.max_concurrency, 10)
+            v1_id, v2_id = v1.id, v2.id
+            first_id, second_id, third_id = first.id, second.id, third.id
         with Session(self.engine) as session:
-            self.assertIsInstance(session.get(ExperimentConfig, prompt_id), ExperimentPromptTask)
-            self.assertIsInstance(session.get(ExperimentConfig, eval_id), ExperimentEvalOnlyConfig)
-            self.assertEqual(session.get(ExperimentConfig, prompt_id).dataset_evaluator_links[0].dataset_evaluator.name, "match")
-            self.assertEqual(session.scalar(select(func.count()).select_from(ExperimentPromptTask)), 1)
+            v1, v2 = (session.get(ExperimentConfig, config_id) for config_id in (v1_id, v2_id))
+            self.assertEqual({run.id for run in v1.runs}, {first_id, second_id})
+            self.assertEqual([run.id for run in v2.runs], [third_id])
+            self.assertEqual(v1.agent_target_id, "agent")
+            self.assertIsNone(v2.dataset_version_id)
+            self.assertIsNotNone(session.get(Experiment, third_id).dataset_version_id)
 
-    def test_prompt_connection_and_provider_are_mutually_exclusive(self):
-        with Session(self.engine) as session:
-            dataset, version, *_, experiment, run = self.seed_experiment(session)
-            session.add(ExperimentPromptTask(
-                experiment=experiment, model_provider="OPENAI", model_name="example-model",
-                template_type="CHAT", template_format="MUSTACHE", template={},
-                custom_provider_id=1, connection={"type": "openai"},
-            ))
-            with self.assertRaises(IntegrityError):
-                session.commit()
+    def test_config_version_constraints_and_run_reference(self):
+        with Session(self.engine) as session, session.begin():
+            dataset, version, *_, run, _ = self.seed_experiment(session)
+            config = run.experiment_config
+            for invalid_version in (0, config.version):
+                with self.assertRaises(IntegrityError), session.begin_nested():
+                    session.add(ExperimentConfig(
+                        config_group_id=config.config_group_id, version=invalid_version,
+                        user=config.user, dataset=dataset, runner=config.runner,
+                        name="Duplicate or invalid", agent_target_id="agent",
+                    ))
+                    session.flush()
+            with self.assertRaises(IntegrityError), session.begin_nested():
+                session.add(Experiment(dataset=dataset, dataset_version=version, name="Missing config", repetitions=1))
+                session.flush()
+            with self.assertRaises(IntegrityError), session.begin_nested():
+                session.delete(config)
+                session.flush()
 
 
 if __name__ == "__main__":

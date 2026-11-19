@@ -15,6 +15,7 @@ from ..errors import APIError
 from ..schemas.assistant import AssistantDisplayCard
 from ..schemas.page_context import DatasetPageContext, ExperimentPageContext, JobPageContext, PageContext, RunnerPageContext
 from ..services.datasets import DatasetService, require_owned_dataset
+from ..services.experiment_configs import ExperimentConfigService
 from ..services.experiments import ExperimentService
 from ..services.runners import RunnerService
 from ..services.traces import TraceQueryService
@@ -30,6 +31,8 @@ class AssistantDeps:
     auth_version: int
     check_execution: Callable[[], Awaitable[None]]
     display: Callable[[AssistantDisplayCard], Awaitable[None]]
+    experiment_configs: ExperimentConfigService
+    check_local_runner: Callable[[str, int], None]
     source_experiment_id: int | None = None
 
 

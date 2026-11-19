@@ -12,7 +12,12 @@ from ..base import Base, HasId, JSON_VALUE, UTC_TIMESTAMP
 
 
 class Experiment(HasId):
+    """一次实验 Run，引用启动时采用的配置版本。"""
+
     __tablename__ = "experiments"
+    experiment_config_id: Mapped[int] = mapped_column(
+        ForeignKey("experiment_config.id", ondelete="NO ACTION"), index=True,
+    )
 
     dataset_id: Mapped[int] = mapped_column(ForeignKey("datasets.id", ondelete="CASCADE"), index=True)
     dataset_version_id: Mapped[int] = mapped_column(ForeignKey("dataset_versions.id", ondelete="CASCADE"), index=True)
@@ -33,8 +38,7 @@ class Experiment(HasId):
     dataset_version: Mapped["DatasetVersion"] = relationship(back_populates="experiments")
     experiment_dataset_examples: Mapped[list["ExperimentDatasetExample"]] = relationship(back_populates="experiment", cascade="all, delete-orphan", passive_deletes=True)
     jobs: Mapped[list["Job"]] = relationship(back_populates="experiment", cascade="all, delete-orphan", passive_deletes=True)
-    # 旧配置关联仅为保留现有外键；新执行链路使用 status / execution_config。
-    legacy_config: Mapped["ExperimentConfig | None"] = relationship(back_populates="experiment", cascade="all, delete-orphan", passive_deletes=True, uselist=False)
+    experiment_config: Mapped["ExperimentConfig"] = relationship(back_populates="runs")
 
     __table_args__ = (
         CheckConstraint("repetitions > 0", name="positive_repetitions"),
@@ -45,6 +49,8 @@ class Experiment(HasId):
 
 
 class ExperimentDatasetExample(Base):
+    """一次 Run 选中的 Example 及其实际修订。"""
+
     __tablename__ = "experiments_dataset_examples"
 
     experiment_id: Mapped[int] = mapped_column(ForeignKey("experiments.id", ondelete="CASCADE"), primary_key=True)

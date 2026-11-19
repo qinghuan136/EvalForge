@@ -116,6 +116,7 @@
   },
   "experiments": {
     "id": false,
+    "experiment_config_id": false,
     "dataset_id": false,
     "dataset_version_id": false,
     "name": false,
@@ -272,35 +273,21 @@
     "created_at": false,
     "updated_at": false
   },
-  "experiment_jobs": {
+  "experiment_config": {
     "id": false,
-    "type": false,
-    "status": false,
-    "claimed_at": true,
-    "claimed_by": true,
-    "cooldown_until": true,
-    "max_concurrency": false,
+    "config_group_id": false,
+    "version": false,
+    "user_id": false,
+    "name": false,
+    "description": true,
+    "dataset_id": false,
+    "dataset_version_id": true,
+    "runner_id": false,
+    "agent_target_id": false,
+    "timeout_seconds": false,
+    "stream_output": false,
+    "repetitions": false,
+    "evaluators": false,
     "created_at": false
-  },
-  "experiment_prompt_tasks": {
-    "id": false,
-    "type": false,
-    "model_provider": false,
-    "model_name": false,
-    "custom_provider_id": true,
-    "template_type": false,
-    "template_format": false,
-    "template": false,
-    "tools": true,
-    "response_format": true,
-    "invocation_parameters": false,
-    "connection": true,
-    "prompt_version_id": true,
-    "playground_config": true,
-    "stream_model_output": false
-  },
-  "experiment_dataset_evaluators": {
-    "experiment_id": false,
-    "dataset_evaluator_id": false
   }
 }

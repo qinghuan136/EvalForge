@@ -4,7 +4,7 @@ import { Link, useLocation, useParams, useSearchParams } from 'react-router'
 import { privateKey } from '../../app/queryClient'
 import { Dialog } from '../../components/ui/Dialog'
 import { errorMessage } from '../../lib/api'
-import { AskAssistantButton } from '../assistant/AskAssistantButton'
+import { useAssistantPageContext } from '../assistant/AssistantPageContext'
 import { DatasetDetail } from '../datasets/DatasetsPage'
 import { cancelExperiment, getExperiment, getJob, getJobs, processed, statusLabels } from './api'
 import { JobOutputPreview } from './JobOutputPreview'
@@ -21,13 +21,14 @@ function JobDialog({ userId, experimentId, jobId, running, streamOutput, onClose
     queryFn: ({ signal }) => getJob(experimentId, jobId, signal),
     refetchInterval: running ? 4000 : false,
   })
+  useAssistantPageContext({ type: 'job', experiment_id: experimentId, job_id: jobId },
+    job.data ? `样本 #${job.data.example_id} · 第 ${job.data.repetition_number} 次` : undefined)
   return <Dialog title="Job 详情" onClose={onClose}><div className="dialog-body">
     {job.isPending ? <p role="status">正在加载 Job…</p> : null}
     {job.isError ? <><p className="error-message" role="alert">{errorMessage(job.error)}</p><button className="button" onClick={() => void job.refetch()}>重试</button></> : null}
     {job.data ? <>
       <p>样本 #{job.data.example_id}，第 {job.data.repetition_number} 次，{statusLabels[job.data.status] ?? job.data.status}</p>
       <div className="trace-job-actions">
-        <AskAssistantButton pageContext={{ type: 'job', experiment_id: experimentId, job_id: jobId }} />
         {job.data.trace_id ? <Link className="button" to={`/traces?trace_id=${encodeURIComponent(job.data.trace_id)}`}
           state={{ jobReturnTo: location.pathname + location.search }}>查看调用链</Link>
           : <span className="muted">尚未关联调用链</span>}
@@ -90,11 +91,12 @@ function ExperimentDetailPage({ userId, id }: { userId: number; id: number }) {
     onSuccess: (result) => {
       client.setQueryData([...privateKey, userId, 'experiment', id], result)
       void client.invalidateQueries({ queryKey: [...privateKey, userId, 'jobs', id] })
-      void client.invalidateQueries({ queryKey: [...privateKey, userId, 'experiments', result.dataset_id] })
+      void client.invalidateQueries({ queryKey: [...privateKey, userId, 'experiment-runs', result.config_group_id] })
       setConfirm(false)
     },
   })
   const item = detail.data
+  useAssistantPageContext({ type: 'experiment', id }, item?.name, 'page')
   const lastPage = jobs.data ? Math.max(1, Math.ceil(jobs.data.total / jobs.data.pagesize)) : 1
   function update(key: string, value: string) {
     const next = new URLSearchParams(params)
@@ -103,23 +105,22 @@ function ExperimentDetailPage({ userId, id }: { userId: number; id: number }) {
     setParams(next, { replace: key === 'job', state: location.state })
   }
   const back = (location.state as { returnTo?: string } | null)?.returnTo
-  const returnTo = back?.startsWith('/experiments?') ? back : item ? `/experiments?dataset=${item.dataset_id}` : '/experiments'
+  const returnTo = back?.startsWith('/experiments?') ? back : item ? `/experiments?group=${item.config_group_id}` : '/experiments'
   return <>
-    <header className="page-heading"><h1>{item?.name ?? '实验详情'}</h1>{item ? <p>EXP-{item.experiment_id}　数据集 #{item.dataset_id}　版本 #{item.dataset_version_id}　{statusLabels[item.status] ?? item.status}</p> : null}<Link className="button page-action" to={returnTo}>返回实验</Link></header>
+    <header className="page-heading"><h1>{item?.name ?? 'Run 详情'}</h1>{item ? <p>Run #{item.experiment_id}　配置 v{item.config_version}　数据集 #{item.dataset_id}　版本 #{item.dataset_version_id}　{statusLabels[item.status] ?? item.status}</p> : null}<Link className="button page-action" to={returnTo}>返回运行历史</Link></header>
     {detail.isPending ? <p role="status">正在加载实验…</p> : null}
     {detail.isError ? <div><p className="error-message" role="alert">{errorMessage(detail.error)}</p><button className="button" onClick={() => void detail.refetch()}>重试</button></div> : null}
     {item ? <>
       <div className="experiment-overview">
         <section className="detail-panel"><h2>执行进度</h2><p className="progress-number">{processed(item.progress)} / {item.progress.job_count}</p><p className="muted">个 Job 已处理</p>
           <dl className="detail-list">{jobStatuses.map((status) => <div key={status}><dt>{statusLabels[status]}</dt><dd>{item.progress[status as keyof typeof item.progress] as number}</dd></div>)}</dl>
-          <AskAssistantButton />
           {item.status === 'pending' || item.status === 'running' ? confirm ? <div className="dialog-actions"><span>将停止剩余任务。</span><button className="button" onClick={() => setConfirm(false)} disabled={cancel.isPending}>保留实验</button><button className="button danger" onClick={() => cancel.mutate()} disabled={cancel.isPending}>确认取消</button></div> : <button className="button" onClick={() => setConfirm(true)}>取消实验</button> : null}
           {cancel.error ? <p className="error-message" role="alert">{errorMessage(cancel.error)}</p> : null}
         </section>
         <div className="overview-stack"><section className="detail-panel"><h2>评分进度</h2>{item.progress.evaluations ? <><p>已保存 / 应评 {item.progress.evaluations.completed} / {item.progress.evaluations.expected}</p><p>其中评分错误 {item.progress.evaluations.errors}</p>{item.status === 'cancelled' ? <p className="muted">已保存的评分仍可查看。</p> : null}</> : <p className="muted">暂无评分进度。</p>}</section>
           <section className="detail-panel"><h2>实验配置</h2><dl className="detail-list">
             <div><dt>数据集版本</dt><dd>#{item.dataset_version_id}</dd></div><div><dt>Runner</dt><dd>{item.execution_config?.runner_id ?? '暂无'}</dd></div><div><dt>Agent 目标 ID</dt><dd>{item.execution_config?.agent_target_id ?? '暂无'}</dd></div><div><dt>执行方式</dt><dd>{item.execution_config?.stream_output ? '流式' : '普通'}</dd></div><div><dt>超时</dt><dd>{item.execution_config?.timeout_seconds ?? '暂无'} 秒</dd></div><div><dt>重复次数</dt><dd>{item.repetitions}</dd></div><div><dt>评分配置</dt><dd>{item.evaluators?.map((e) => e.name).join('、') || '未配置'}</dd></div>
-          </dl><button className="button" onClick={() => setShowSamples(true)}>查看实验版本样本</button></section></div>
+          </dl><button className="button" onClick={() => setShowSamples(true)}>查看数据集版本样本</button></section></div>
       </div>
       <section className="jobs-section"><div className="jobs-heading"><h2>Job 明细</h2><label className="field">状态<select value={status} onChange={(event) => update('status', event.target.value)}><option value="">全部状态</option>{jobStatuses.map((value) => <option key={value} value={value}>{statusLabels[value]}</option>)}</select></label></div>
         {jobs.isPending ? <p className="panel-message" role="status">正在加载 Job…</p> : null}

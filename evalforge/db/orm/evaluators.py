@@ -120,4 +120,3 @@ class DatasetEvaluators(HasId):
 
     dataset: Mapped["Dataset"] = relationship(back_populates="dataset_evaluators")
     evaluator: Mapped["Evaluator"] = relationship(back_populates="dataset_evaluators")
-    experiment_links: Mapped[list["ExperimentDatasetEvaluator"]] = relationship(back_populates="dataset_evaluator", passive_deletes="all")

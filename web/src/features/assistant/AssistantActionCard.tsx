@@ -4,7 +4,7 @@ import type { AssistantAction, DisplayCard, DisplayField } from './api'
 const labels: Record<string, string> = {
   RUNNER_create_runner: '创建 Runner', RUNNER_delete_runner: '删除 Runner 并撤销凭证',
   DATASET_import_dataset: '导入数据集', EXPERIMENT_create_experiment: '启动实验',
-  EXPERIMENT_cancel_experiment: '取消整场实验',
+  EXPERIMENT_start_run: '启动实验 Run', EXPERIMENT_cancel_experiment: '取消整场实验',
 }
 
 function DisplayValue({ field }: { field: DisplayField }) {

@@ -1,6 +1,6 @@
 # 核心 ORM
 
-基于 Phoenix commit `14c193cfa`，按云端 + 轻客户端方案调整；当前 27 张表，含停用后保留的旧配置表、身份与凭证、评测助手和 Trace 存储。ConversationRecord / Entry 已接入助手业务，旧助手会话与消息表暂保留用于历史兼容。
+基于 Phoenix commit `14c193cfa`，按云端 + 轻客户端方案调整。当前 ORM 注册 25 张表，覆盖实验配置、执行、身份与凭证、评测助手和 Trace。ConversationRecord / Entry 已接入助手业务，旧助手会话与消息表暂保留用于历史兼容。
 本页介绍存储结构；应用启动不自动建表，部署方式见 [数据库说明](database.md)。
 
 ## 代码入口
@@ -15,7 +15,7 @@
 | `evalforge/db/orm/assistant.py` | ConversationRecord / Entry 与过渡期旧会话、消息表；字段和 ER 图见 [Agent 会话与消息表设计](Agent会话与消息表设计.md) |
 | `evalforge/db/orm/traces.py` | Trace、Span；字段和 ER 图见 [Trace 与 Span 表设计](Trace与Span表设计.md) |
 | `evalforge/db/orm/evaluators.py` | 评分器公共定义、三个子类型、源码版本、数据集使用配置 |
-| `evalforge/db/orm/experiment_configs.py` | 旧 ExperimentConfig 已停用；保留 Prompt、EVAL_ONLY 和原评分关联的表与外键 |
+| `evalforge/db/orm/experiment_configs.py` | ExperimentConfig，每行保存一个配置版本 |
 | `evalforge/db/models.py` | 统一导入和注册入口，Alembic 由此获得完整 metadata |
 
 ```python
@@ -27,35 +27,39 @@ version = DatasetVersion(dataset=dataset, description="初始版本")
 ```
 
 现有 `evalforge/models.py` 继续保留 dataclass，不改动 V0 的 Task / Evaluator 接口。
-云端 `Job`、`JobEvaluation`、`ExperimentConfig` 仍分别映射到 `experiment_runs`、`experiment_run_annotations`、`experiment_jobs`。表名和外键列沿用原名。
+云端 `ExperimentConfig` 映射到 `experiment_config`，`Experiment` 对应 `experiments` 中的一次 Run。`Job` 和 `JobEvaluation` 分别映射到 `experiment_runs` 和 `experiment_run_annotations`。
 Result 不建独立表。Runner 身份使用独立的 runners 表，与本地 V0 的执行器概念分开。
 
 ## 云端远程执行模型
 
 ```text
-Experiment（整体状态、execution_config）
-  → Job（从排队到最终结果）
-    ├─ RunnerAttempt（一次派发尝试，可保留多次历史）
-    └─ JobEvaluation（已保存的一项评分）
+ExperimentConfig（一个配置版本）
+  → Experiment Run（整体状态、实际数据集版本、执行快照）
+    ├─ ExperimentDatasetExample（所选样本及其修订）
+    └─ Job（从排队到最终结果）
+       ├─ RunnerAttempt（一次派发尝试）
+       └─ JobEvaluation（已保存的一项评分）
 ```
 
-- Experiment.status：pending / running / cancelling / completed / failed / cancelled；默认 pending。execution_config 默认为 {}，可保存 runner_id、agent_target_id、timeout_seconds；不保存客户端 URL/请求头。
+- ExperimentConfig 按 `(config_group_id, version)` 唯一。从 v1 开始，保存服务比较最新版本，有差异时追加一版。`dataset_version_id` 可空，表示启动时选取具体版本。
+- Run 的 `experiment_config_id` 非空，指向具体版本。实际选择的 Example 通过现有样本快照表关联。Run 状态为 pending / running / cancelling / completed / failed / cancelled，默认 pending。
+- Run 的 `execution_config` 保存实际使用的 Runner、Agent 目标、调用参数和评分器快照。Runner 本地配置持有 URL 和请求头。
 - `Job.id` 是整数主键，在评分代码里称为 `job_pk`。`Job.job_id` 是协议使用的 UUID 字符串；`attempt_id` 是一次派发尝试的独立标识。
 - Job 默认 queued；assigned / running / unknown 均未产生最终结果。终态为 succeeded / failed / cancelled；output 包装成 `{"task_output": ...}`，有效 JSON null 与未产生结果的 SQL NULL 区分。
 - Job.error 改为 JSON `{code, message}`；HTTP 状态、客户端 duration_ms 单独保存。实际起止时间可空，不能用云端收到通知的时间伪造；latency_ms 优先 duration_ms，其次实际时间差，否则为空。
 - Attempt 保存 dispatch_json / result_json 与归属、取消意图、云端接收时间。runner_id 已建立到 runners.runner_id 的 RESTRICT 外键及普通索引；身份和凭证记录已定义，实际鉴权后续实现。
 - Attempt 的 assigned / accepted / running 占活动容量。部分唯一索引约束每个 Runner、每个 Job 最多一个活动 Attempt。unknown 保留为已跳过的历史记录，明确拒绝用 rejected + rejection_reason。
-- 旧 ExperimentConfig 的 table.info 标记 deprecated；Experiment.legacy_config 仅保留兼容关系。新实验不要求建立旧配置记录，也不新增远程配置子表。
+- `experiment_jobs`、`experiment_prompt_tasks`、`experiment_dataset_evaluators` 已移出 ORM。
 
-本阶段只定义 ORM 与约束。消息快照的字段形状、标识一致性、配置冻结、结果幂等与不可重写、采用哪次 Attempt、实验状态推进由后续写入服务实现；不自动重试或发送 ACK。评分表结构保持原样。
+新配置的版本分配、配置比较和按所选样本创建 Run 由后续服务接入。现有创建接口仍使用原请求结构，按新 ORM 建的库在写入非空 `experiment_config_id` 前无法通过该接口创建 Run。
+
+配置保存、启动 Run 与定向路由的目标契约见[实验配置与 Run 接口设计](api/实验配置与运行.md)。
 
 ## 数据类型与继承
 
 - PostgreSQL 业务 JSON 字段通常使用 JSONB。Span 原始明细使用 JSON，OTLP 纳秒时间使用 NUMERIC(20,0)；其他日期时间使用 TIMESTAMP WITH TIME ZONE。
 - `metadata_` 是 Python 属性名，对应数据库列 `metadata`。
 - Evaluator 使用 joined-table inheritance，通过 `(kind, id)` 复合外键关联子表。
-- ExperimentPromptTask 通过 `(type, id)` 关联 ExperimentConfig。
-- ExperimentEvalOnlyConfig 使用 single-table inheritance，共用 experiment_jobs，不增加表。
 - JSON 配置暂存普通 dict / list；完整配置校验、名称格式校验和版本写入服务后续实现。
 - JSON 原地修改需重新赋值属性以确保 SQLAlchemy 跟踪，例如 `row.metadata_ = {**row.metadata_, "key": "value"}`。
 - 异步查询需要的关联请显式预加载，如 `selectinload(Experiment.jobs)`，避免隐式关系加载触发额外 I/O。
@@ -64,9 +68,8 @@ Experiment（整体状态、execution_config）
 
 - 原核心链路内部外键及 CASCADE 删除；身份链路采用 RESTRICT 保护引用记录，experiments.user_id 使用 SET NULL 保留实验。
 - 数据集名称、外部样本标识、样本修订、任务执行、评分名称和关联表的唯一 / 联合主键约束。
-- revision_kind、annotator_kind、评分器和任务类型、后台任务状态的检查约束。
-- 评分器类型与子表、任务类型与子表的一致性约束。
-- Prompt 任务的 custom_provider_id 与 connection 互斥。
+- revision_kind、annotator_kind 和评分器类型的检查约束，以及评分器类型与子表的一致性约束。
+- 配置版本正数、组内版本唯一、名称和目标非空、超时与重复次数范围。仍有 Run 引用时，单独删除该配置版本会被拒绝。
 - PostgreSQL 临时实验的 updated_at 部分索引，以及字典中列出的其他索引。
 - 实验/重复序号正数、Job 状态、结果有无、有限非负耗时、HTTP 状态范围及时间顺序。
 - Attempt 终态的完整结果与接收时间、unknown/rejected 原因、取消原因与时间的一致性。
@@ -90,7 +93,6 @@ Experiment（整体状态、execution_config）
 | CodeEvaluator.language / sandbox_config_id | languages.name / sandbox_configs.id |
 | CodeEvaluator 的 sandbox_config_id + language | sandbox_configs 的 id + language |
 | DatasetEvaluators.project_id | projects.id（当前可空，按数据集归属校验访问） |
-| ExperimentPromptTask.custom_provider_id / prompt_version_id | generative_model_custom_providers.id / prompt_versions.id |
 
 字段的 Column.info、复合约束的 Table.info 保存目标信息，供后续补迁移时参考；它们本身不生成 SQL 约束。
 外部字段保留引用类型和索引。`dataset_evaluators.project_id` 在尚未接入项目模块时允许为空。已有开发库若按旧版 ORM 建表，需要在自己的 Alembic 迁移中移除该列的 `NOT NULL`。
@@ -99,15 +101,14 @@ users、traces 和 spans 已有真实模型；Prompt、沙箱等仍未建表。
 ## 验证与迁移
 
 ```powershell
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -p "test_*orm.py" -v
 ```
 
 测试契约 `tests/schema_contract.json` 固定了已确认字典的字段名与可空性。
 模型专项测试使用内存 SQLite 真正执行建表、写入、查询和约束失败；另行编译全部 PostgreSQL DDL，验证 JSONB、时区字段及复合外键。
 这些不替代真实 PostgreSQL 集成测试。
 
-27 张表与 ORM 契约一致；SQLite 验证唯一约束、身份引用、默认有效期及历史保护，PostgreSQL DDL 验证 JSON、JSONB、BYTEA、时间类型及索引。ConversationRecord / Entry 验证共享历史、外键保护、scope 与租约约束，详见 [ConversationStore 方案](ConversationStore方案.md)。Runner 接口验证见 [Runner 管理](server-runners.md)。
-临时从活动索引移除 unknown 后，容量测试按预期失败；恢复源码后完整测试通过。数据字典的字段名和可空性已逐表核对，编译检查及 git diff --check 通过。
+25 张表纳入 ORM 契约。配置测试覆盖版本唯一性、多个 Run 引用同一版本、受引用版本的删除保护，以及 Run 的非空配置外键。
 
 实例就绪后生成迁移：
 
@@ -119,4 +120,4 @@ users、traces 和 spans 已有真实模型；Prompt、沙箱等仍未建表。
 
 仓库未提供创建核心表的初始迁移；助手和 Trace 的增量迁移见 [迁移版本](../migrations/versions/README.md)。
 
-如已有旧数据库，不能直接套用结构变更：需先为历史 Run 回填唯一 job_id 与执行状态，将旧 error 文本转换为结构化 JSON，并处理身份字段的孤立引用，再添加约束；旧配置表继续保留。迁移由实例就绪后的实际数据决定，不通过 create_all 自动升级。
+当前没有旧实验数据，无需回填配置版本。已有空库仍需后续结构迁移，创建新配置表、为 Run 加外键，并按依赖顺序移除旧配置表。ORM 变更和 `create_all` 不会自动升级现有数据库。

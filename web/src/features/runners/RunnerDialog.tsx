@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { privateKey } from '../../app/queryClient'
 import { Dialog } from '../../components/ui/Dialog'
 import { errorMessage } from '../../lib/api'
-import { AskAssistantButton } from '../assistant/AskAssistantButton'
+import { useAssistantPageContext } from '../assistant/AssistantPageContext'
 import { createRunner, deleteRunner, getRunner, renameRunner } from './api'
 import type { RunnerCreated } from './api'
 
@@ -28,6 +28,8 @@ export function RunnerDialog({ userId, id, onClose }: { userId: number; id: stri
   const remove = useMutation({ mutationFn: () => deleteRunner(id!), onSuccess: () => { void refresh(); onClose() } })
   const busy = create.isPending || rename.isPending || remove.isPending
   const error = create.error || rename.error || remove.error
+  const contextId = created?.runner.runner_id ?? id
+  useAssistantPageContext(contextId ? { type: 'runner', id: contextId } : undefined, created?.runner.name ?? detail.data?.name)
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -66,7 +68,6 @@ export function RunnerDialog({ userId, id, onClose }: { userId: number; id: stri
                   <div><dt>已声明能力</dt><dd>{detail.data.connection.capabilities.join('、') || '无'}</dd></div>
                   <div><dt>流式输出</dt><dd>{detail.data.connection.capabilities.includes('http_json') && detail.data.connection.capabilities.includes('http_sse') ? '支持' : '当前不可用'}</dd></div>
                 </dl>
-                <div><AskAssistantButton pageContext={{ type: 'runner', id }} /></div>
                 <form className="dialog-form" onSubmit={submit}>
                   <label className="field">名称<input value={name} onChange={(event) => setName(event.target.value)} placeholder={detail.data.name} maxLength={100} required /></label>
                   <button className="button" disabled={busy}>保存名称</button>

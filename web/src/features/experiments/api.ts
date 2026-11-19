@@ -9,13 +9,14 @@ export type Progress = {
 }
 export type Experiment = {
   experiment_id: number; dataset_id: number; dataset_version_id: number; name: string
+  experiment_config_id: number; config_group_id: string; config_version: number
   status: 'pending' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled'
   repetitions: number; progress: Progress; created_at: string
   description?: string | null
   execution_config?: { runner_id?: string; agent_target_id?: string; timeout_seconds?: number; stream_output?: boolean }
   evaluators?: Evaluator[]
 }
-export type Evaluator = { dataset_evaluator_id: number | null; name: string; evaluator_key: string; description: string | null }
+export type Evaluator = EvaluatorConfig & { dataset_evaluator_id: number | null; output_configs: unknown[] }
 export type EvaluatorDefinition = {
   key: string
   description: string
@@ -27,6 +28,7 @@ export type EvaluatorDefinition = {
 export type EvaluatorConfig = {
   name: string
   evaluator_key: string
+  description?: string | null
   input_mapping: { path_mapping: Record<string, string>; literal_mapping: Record<string, unknown> }
 }
 export type Job = {
@@ -39,13 +41,31 @@ export type JobDetail = Job & {
   error: { code: string; message: string } | null; started_at: string | null; ended_at: string | null
   evaluations: { name: string; score: number | null; label: string | null; explanation: string | null; error: string | null }[]
 }
-export type CreateExperiment = {
-  name: string; description?: string; dataset_version_id: number; repetitions: number; evaluators: EvaluatorConfig[]
-  execution_config: { runner_id: string; agent_target_id: string; timeout_seconds: number; stream_output: boolean }
+export type ConfigInput = {
+  name: string; description: string | null; dataset_id: number; dataset_version_id: number | null
+  runner_id: string; agent_target_id: string; timeout_seconds: number; stream_output: boolean; repetitions: number
+  evaluators?: EvaluatorConfig[]; dataset_evaluator_ids?: number[]
 }
+export type ExperimentConfig = Omit<ConfigInput, 'evaluators' | 'dataset_evaluator_ids'> & {
+  id: number; config_group_id: string; version: number; evaluators: Evaluator[]; created_at: string
+}
+export type RunInput = { dataset_version_id: number; example_ids?: number[] }
 
-export function getExperiments(dataset: number, page: number, signal: AbortSignal) {
-  return apiRequest<Page<Experiment>>(`/datasets/${dataset}/experiments?page=${page}&pagesize=20`, { signal })
+export function getConfigs(dataset: number | undefined, page: number, signal: AbortSignal) {
+  const params = new URLSearchParams({ page: String(page), pagesize: '20' })
+  if (dataset) params.set('dataset_id', String(dataset))
+  return apiRequest<Page<ExperimentConfig>>(`/experiment-configs?${params}`, { signal })
+}
+export function getConfig(group: string, signal: AbortSignal) {
+  return apiRequest<ExperimentConfig>(`/experiment-configs/${group}`, { signal })
+}
+export function getVersions(group: string, signal: AbortSignal) {
+  return getAllPages<ExperimentConfig>(`/experiment-configs/${group}/versions`, signal)
+}
+export function getRuns(group: string, page: number, version: number | undefined, signal: AbortSignal) {
+  const params = new URLSearchParams({ page: String(page), pagesize: '20' })
+  if (version) params.set('version', String(version))
+  return apiRequest<Page<Experiment>>(`/experiment-configs/${group}/runs?${params}`, { signal })
 }
 export function getExperiment(id: number, signal: AbortSignal) {
   return apiRequest<Experiment>(`/experiments/${id}`, { signal })
@@ -53,9 +73,13 @@ export function getExperiment(id: number, signal: AbortSignal) {
 export function getBuiltinEvaluators(signal: AbortSignal) {
   return apiRequest<EvaluatorDefinition[]>('/evaluators/builtin', { signal })
 }
-export function createExperiment(dataset: number, data: CreateExperiment) {
-  const runner = encodeURIComponent(data.execution_config.runner_id)
-  return apiRequest<Experiment>(`/runners/${runner}/datasets/${dataset}/experiments`, { method: 'POST', json: data })
+export function saveConfig(data: ConfigInput, base?: ExperimentConfig) {
+  return apiRequest<ExperimentConfig>(base ? `/experiment-configs/${base.config_group_id}/versions` : '/experiment-configs',
+    { method: 'POST', json: base ? { base_version: base.version, config: data } : data })
+}
+export function startRun(config: ExperimentConfig, data: RunInput) {
+  const runner = encodeURIComponent(config.runner_id)
+  return apiRequest<Experiment>(`/runners/${runner}/experiment-configs/${config.id}/runs`, { method: 'POST', json: data })
 }
 export function cancelExperiment(id: number) {
   return apiRequest<Experiment>(`/experiments/${id}/cancel`, { method: 'POST' })

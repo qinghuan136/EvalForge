@@ -13,7 +13,9 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 from api_support import APITestCase
-from evalforge.db.models import AssistantConversationEntry as AssistantMessage, AssistantConversationRecord as AssistantSession, Runner
+from evalforge.db.models import (
+    AssistantConversationEntry as AssistantMessage, AssistantConversationRecord as AssistantSession, Experiment, Job, Runner,
+)
 from evalforge.server.runner_connections import RegisteredConnection
 from evalforge.server.assistant.conversation_store import DatabaseConversationStore
 from evalforge.server.services.assistant import AssistantService
@@ -83,8 +85,11 @@ class DeferredAssistantTests(APITestCase):
         with patch("evalforge.server.services.assistant.build_model", return_value=streaming_model(self.creator)):
             response = await self.message()
             self.assertEqual(response.status_code, 200, response.text)
-            self.assertEqual([event for event, _ in frames(response)], ["approval_required", "done"])
-            approval = frames(response)[0][1]
+            self.assertEqual([event for event, _ in frames(response)], ["tool_call", "tool_deferred", "approval_required", "done"])
+            approval = next(data for event, data in frames(response) if event == "approval_required")
+            pending = next(data for event, data in frames(response) if event == "tool_deferred")
+            self.assertEqual(pending["requests"]["approvals"][0]["tool_call_id"], "create")
+            self.assertNotIn("tool_result", [event for event, _ in frames(response)])
             self.assertEqual(approval["cards"][0]["title"], "批准请求")
             self.assertEqual(approval["cards"][0]["description"], "为本地测试创建 Runner。")
             self.assertEqual(approval["cards"][0]["arguments"], {"name": "审批创建"})
@@ -92,6 +97,7 @@ class DeferredAssistantTests(APITestCase):
             self.assertEqual(await self.runner_count(), 0)
             detail = (await self.client.get(self.path)).json()
             self.assertEqual(detail["actions"][0]["tool_call_id"], "create")
+            self.assertEqual(detail["conversation"]["deferred_tool_requests"], pending["requests"])
             resumed = await self.decide({"create": True})
             self.assertEqual(resumed.status_code, 200, resumed.text)
             self.assertEqual(frames(resumed)[-1][1]["status"], "completed")
@@ -127,7 +133,57 @@ class DeferredAssistantTests(APITestCase):
             self.assertEqual(blocked.json()["error"]["code"], "assistant_approval_required")
             resumed = await self.decide({"a": True, "b": False})
             self.assertEqual(frames(resumed)[-1][1]["status"], "completed")
+            returns = {data["part"]["tool_call_id"]: data["part"] for event, data in frames(resumed) if event == "tool_result"}
+            self.assertEqual(set(returns), {"a", "b"})
+            self.assertEqual(returns["b"]["outcome"], "denied")
         self.assertEqual(await self.runner_count(), 1)
+
+    async def test_start_run_approval_routes_to_the_ready_runner_and_freezes_scope(self):
+        runner = (await self.client.post("/api/v1/runners", json={"name": "测试 Runner"})).json()["runner"]
+        runner_id = runner["runner_id"]
+        imported = await self.client.post("/api/v1/datasets/import", data={"name": "源数据集", "format": "jsonl"},
+                                          files={"file": ("sample.jsonl", '{"input":{"id":1}}\n{"input":{"id":2}}\n')})
+        self.assertEqual(imported.status_code, 201, imported.text)
+        dataset = imported.json()
+        config = await self.client.post("/api/v1/experiment-configs", json={
+            "name": "已保存配置", "dataset_id": dataset["dataset_id"], "runner_id": runner_id,
+            "agent_target_id": "agent", "repetitions": 2,
+        })
+        self.assertEqual(config.status_code, 201, config.text)
+        examples = (await self.client.get(f"/api/v1/datasets/{dataset['dataset_id']}/examples")).json()
+        picked = examples["items"][1]["example_id"]
+        args = {"config_id": config.json()["id"], "runner_id": runner_id,
+                "dataset_version_id": dataset["dataset_version_id"], "example_ids": [picked]}
+        await self.app.state.experiments.connections.register(runner_id, RegisteredConnection(
+            session_id="on-a", phase="ready", capabilities=["http_json"], cloud_route_id="cloud-a",
+        ), 60)
+
+        def model(messages, _):
+            if isinstance(messages[-1].parts[-1], ToolReturnPart):
+                result = messages[-1].parts[-1].content
+                self.assertEqual(result["progress"]["job_count"], 2)
+                self.assertEqual(result["experiment_config_id"], args["config_id"])
+                return ModelResponse(parts=[TextPart("Run 已启动")])
+            return ModelResponse(parts=[ToolCallPart("EXPERIMENT_start_run", args, tool_call_id="run")])
+
+        with patch("evalforge.server.services.assistant.build_model", return_value=streaming_model(model)):
+            proposed = await self.message("只运行指定样本")
+            card = next(data["cards"][0] for event, data in frames(proposed) if event == "approval_required")
+            self.assertEqual(card["arguments"], args)
+            wrong_instance = await self.decide({"run": True})
+            self.assertEqual(wrong_instance.status_code, 503, wrong_instance.text)
+            async with self.database.transaction() as db:
+                self.assertEqual(await db.scalar(select(func.count()).select_from(Experiment)), 0)
+            with patch.object(self.service, "has_ready_runner", return_value=True):
+                approved = await self.client.post(f"/api/v1/runners/{runner_id}/assistant/stream", json={
+                    "type": "decision", "conversation_id": self.session, "expected_revision": self.revisions[1],
+                    "decisions": {"run": True},
+                })
+            self.assertEqual(approved.status_code, 200, approved.text)
+            self.assertEqual(frames(approved)[-1][1]["status"], "completed")
+        async with self.database.transaction() as db:
+            self.assertEqual(await db.scalar(select(func.count()).select_from(Experiment)), 1)
+            self.assertEqual(list(await db.scalars(select(Job.dataset_example_id))), [picked, picked])
 
     async def test_decision_and_secret_delivery_are_owner_scoped(self):
         with patch("evalforge.server.services.assistant.build_model", return_value=streaming_model(self.creator)):
@@ -165,7 +221,7 @@ class DeferredAssistantTests(APITestCase):
             with patch.object(DatabaseConversationStore, "save", side_effect=RuntimeError("storage unavailable")):
                 response = await self.decide({"create": True})
             self.assertEqual(frames(response)[-1][0], "error")
-            self.assertEqual(frames(response)[0][0], "display")
+            self.assertIn("display", [event for event, _ in frames(response)])
             self.assertEqual(await self.runner_count(), 1)
             detail = (await self.client.get(self.path)).json()
             self.assertEqual(detail["status"], "failed")
@@ -206,11 +262,16 @@ class DeferredAssistantTests(APITestCase):
             try:
                 self.assertEqual((await asyncio.wait_for(received.get(), 5))["status"], 200)
                 frame = (await asyncio.wait_for(received.get(), 5))["body"].decode()
+                self.assertTrue(frame.startswith("event: tool_call\n"), frame)
+                frame = (await asyncio.wait_for(received.get(), 5))["body"].decode()
                 self.assertTrue(frame.startswith("event: display\n"), frame)
                 card = json.loads(frame.splitlines()[1].removeprefix("data: "))
                 token = next(field["value"] for field in card["fields"] if field["sensitive"])
                 await asyncio.wait_for(failed.wait(), 5)
                 self.assertEqual(await self.runner_count(), 1)
+                tool_result = (await asyncio.wait_for(received.get(), 5))["body"].decode()
+                self.assertTrue(tool_result.startswith("event: tool_result\n"), tool_result)
+                self.assertNotIn(token, tool_result)
                 continue_model.set()
                 error = (await asyncio.wait_for(received.get(), 5))["body"].decode()
                 self.assertTrue(error.startswith("event: error\n"), error)

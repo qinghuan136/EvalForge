@@ -2,6 +2,7 @@
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 from sqlalchemy import create_engine, event, select
 from sqlalchemy.dialects import postgresql
@@ -10,7 +11,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.schema import CreateTable
 
 from evalforge.db.models import (
-    Base, Dataset, DatasetExample, DatasetVersion, Experiment, Job,
+    Base, Dataset, DatasetExample, DatasetVersion, Experiment, ExperimentConfig, Job,
     Runner, RunnerAttempt, RunnerCredential, User,
 )
 
@@ -142,7 +143,9 @@ class AuthORMTests(unittest.TestCase):
         with Session(self.engine) as session, session.begin():
             runner = self.seed_runner(session)
             dataset = Dataset(name="test")
-            experiment = Experiment(dataset=dataset, dataset_version=DatasetVersion(dataset=dataset),
+            config = ExperimentConfig(config_group_id=uuid4(), version=1, user=runner.owner, runner=runner,
+                                      dataset=dataset, name="test", agent_target_id="agent")
+            experiment = Experiment(experiment_config=config, dataset=dataset, dataset_version=DatasetVersion(dataset=dataset),
                                     user=runner.owner, name="test", repetitions=1)
             run = Job(experiment=experiment, dataset_example=DatasetExample(dataset=dataset), repetition_number=1)
             attempt = RunnerAttempt(job=run, runner=runner, dispatch_json={},
@@ -173,8 +176,12 @@ class AuthORMTests(unittest.TestCase):
     def test_experiment_remains_when_owner_without_runners_is_deleted(self):
         with Session(self.engine) as session, session.begin():
             owner = User(username="alice", password_hash="test-only-hash")
+            runner = Runner(name="runner", owner=User(username="runner-owner", password_hash="test-only-hash"))
             dataset = Dataset(name="test")
-            experiment = Experiment(dataset=dataset, dataset_version=DatasetVersion(dataset=dataset),
+            # A separate owner lets this test exercise the Run's SET NULL foreign key in isolation.
+            config = ExperimentConfig(config_group_id=uuid4(), version=1, user=runner.owner, runner=runner,
+                                      dataset=dataset, name="test", agent_target_id="agent")
+            experiment = Experiment(experiment_config=config, dataset=dataset, dataset_version=DatasetVersion(dataset=dataset),
                                     user=owner, name="test", repetitions=1)
             session.add(experiment)
             session.flush()

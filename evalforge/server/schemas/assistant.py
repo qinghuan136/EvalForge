@@ -64,8 +64,19 @@ class AssistantMessageView(BaseModel):
     created_at: datetime
 
 
+class AssistantConversationView(BaseModel):
+    """Display-only native Conversation structure; never an execution checkpoint."""
+
+    conversation_id: str
+    revision: str | None
+    usage: dict[str, JsonValue]
+    messages: list[dict[str, JsonValue]]
+    deferred_tool_requests: dict[str, JsonValue] | None
+
+
 class AssistantSessionDetail(AssistantSessionSummary):
     messages: list[AssistantMessageView]
+    conversation: AssistantConversationView
     status: str = "completed"
     actions: list[AssistantAction] = Field(default_factory=list)
     error: dict[str, str] | None = None
@@ -98,6 +109,22 @@ class AssistantDisplayCard(BaseModel):
 class AssistantApprovalRequired(BaseModel):
     revision: str
     cards: list[AssistantAction]
+
+
+class AssistantToolEvent(BaseModel):
+    conversation_id: str
+    run_id: str
+    part: dict[str, JsonValue]
+
+
+class AssistantToolCallEvent(AssistantToolEvent):
+    args_valid: bool | None
+
+
+class AssistantToolDeferredEvent(BaseModel):
+    conversation_id: str
+    run_id: str
+    requests: dict[str, JsonValue]
 
 
 class AssistantDone(BaseModel):

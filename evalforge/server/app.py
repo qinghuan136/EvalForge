@@ -13,9 +13,11 @@ from evalforge.redis import RedisSettings, RedisStore
 from .config import ServerSettings
 from .errors import install_handlers
 from .routes.assistant import router as assistant_router
+from .routes.assistant import routed_router as routed_assistant_router
 from .routes.auth import router as auth_router
 from .routes.datasets import router as datasets_router
 from .routes.evaluators import router as evaluators_router
+from .routes.experiment_configs import router as experiment_configs_router
 from .routes.experiments import router as experiments_router
 from .routes.internal_routing import router as internal_routing_router
 from .routes.otlp import router as otlp_router
@@ -36,6 +38,7 @@ from .services.attempts import AttemptService
 from .services.dispatch import DispatchService
 from .services.evaluations import EvaluationService
 from .services.evaluators import DatasetEvaluatorService
+from .services.experiment_configs import ExperimentConfigService
 from .services.experiments import ExperimentService
 from .services.runtime_loader import RuntimeLoader
 from .services.trace_ingest import TraceIngestService
@@ -75,6 +78,7 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
             app.state.runner_sessions.on_complete = scheduler.task_completed
             app.state.datasets = DatasetService(db)
             app.state.dataset_evaluators = DatasetEvaluatorService(db)
+            app.state.experiment_configs = ExperimentConfigService(db)
             app.state.experiments = ExperimentService(
                 db, connections, on_created=scheduler.experiment_created, on_cancelled=scheduler.experiment_cancelled)
             app.state.trace_ingest = TraceIngestService(db)
@@ -82,6 +86,7 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
             app.state.assistant = AssistantService(
                 db, app.state.experiments, config, runners=app.state.runners,
                 datasets=app.state.datasets, traces=app.state.trace_queries,
+                experiment_configs=app.state.experiment_configs, has_ready_runner=scheduler.has_ready_runner,
             )
             scheduler.start()
             resources.push_async_callback(scheduler.close)
@@ -99,18 +104,20 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
     async def no_auth_cache(request: Request, call_next):
         response = await call_next(request)
         path = request.url.path
-        if path in ("/api/v1/datasets", "/api/v1/traces") or path.startswith((
+        if path in ("/api/v1/datasets", "/api/v1/traces", "/api/v1/experiment-runs") or path.startswith((
             "/api/v1/auth/", "/api/v1/runners", "/api/v1/datasets/", "/api/v1/experiments/",
-            "/api/v1/evaluators/", "/api/v1/assistant/", "/api/v1/traces/",
+            "/api/v1/evaluators/", "/api/v1/assistant/", "/api/v1/traces/", "/api/v1/experiment-configs",
         )):
             response.headers["Cache-Control"] = "no-store"
         return response
 
     app.include_router(auth_router)
     app.include_router(assistant_router)
+    app.include_router(routed_assistant_router)
     app.include_router(datasets_router)
     app.include_router(evaluators_router)
     app.include_router(experiments_router)
+    app.include_router(experiment_configs_router)
     app.include_router(internal_routing_router)
     app.include_router(runners_router)
     app.include_router(runner_ws_router)

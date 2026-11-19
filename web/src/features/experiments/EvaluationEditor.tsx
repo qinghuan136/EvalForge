@@ -1,8 +1,8 @@
-import type { EvaluatorConfig, EvaluatorDefinition } from './api'
+import type { Evaluator, EvaluatorConfig, EvaluatorDefinition } from './api'
 
 type Source = 'default' | 'path' | 'literal'
 type Parameter = { source: Source; value: string }
-export type EvaluationDraft = { id: number; name: string; rule: string; parameters: Record<string, Parameter> }
+export type EvaluationDraft = { id: number; name: string; rule: string; parameters: Record<string, Parameter>; description?: string | null }
 
 const rules: Record<string, string> = {
   contains: '包含文本', exact_match: '完全匹配', regex: '正则匹配',
@@ -38,7 +38,21 @@ export function evaluationConfigs(drafts: EvaluationDraft[], definitions: Evalua
         }
       }
     }
-    return { name, evaluator_key: definition.key, input_mapping: { path_mapping, literal_mapping } }
+    return { name, description: draft.description, evaluator_key: definition.key, input_mapping: { path_mapping, literal_mapping } }
+  })
+}
+
+export function evaluationDrafts(evaluators: Evaluator[], definitions: EvaluatorDefinition[]): EvaluationDraft[] {
+  return evaluators.map((evaluator, id) => {
+    const schema = definitions.find((item) => item.key === evaluator.evaluator_key)?.input_schema.properties
+    const parameters: Record<string, Parameter> = {}
+    for (const [name, value] of Object.entries(evaluator.input_mapping.path_mapping)) {
+      parameters[name] = { source: 'path', value }
+    }
+    for (const [name, value] of Object.entries(evaluator.input_mapping.literal_mapping)) {
+      parameters[name] = { source: 'literal', value: schema?.[name]?.type === 'string' && typeof value === 'string' ? value : JSON.stringify(value) }
+    }
+    return { id, name: evaluator.name, rule: evaluator.evaluator_key, parameters, description: evaluator.description }
   })
 }
 

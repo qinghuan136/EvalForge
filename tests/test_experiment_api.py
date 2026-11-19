@@ -2,7 +2,7 @@
 
 from dataclasses import replace
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from redis.exceptions import ConnectionError as RedisConnectionError
 from sqlalchemy import delete, event, func, select, update
@@ -11,7 +11,7 @@ from sqlalchemy.exc import OperationalError
 from api_support import APITestCase
 from evalforge.db.models import (
     BuiltinEvaluator, Dataset, DatasetEvaluators, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment,
-    ExperimentDatasetExample, Job, JobEvaluation, Runner, RunnerAttempt,
+    ExperimentConfig, ExperimentDatasetExample, Job, JobEvaluation, Runner, RunnerAttempt,
 )
 from evalforge.server.runner_connections import RUNNER_SESSION_PREFIX, RegisteredConnection, RunnerConnections
 from evalforge.server.services.evaluation_queries import missing_evaluation_items
@@ -91,6 +91,102 @@ class ExperimentAPITests(APITestCase):
         response = await self.client.post(path or self.evaluator_path, json=self.evaluator_payload(**changes))
         self.assertEqual(response.status_code, 201, response.text)
         return response.json()
+
+    def config_payload(self, **changes):
+        return {"name": "订单回归", "dataset_id": self.dataset_id, "runner_id": self.runner_id,
+                "agent_target_id": "order-agent", **changes}
+
+    async def save_config(self, **changes):
+        response = await self.client.post("/api/v1/experiment-configs", json=self.config_payload(**changes))
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        return response.json()
+
+    async def test_config_revisions_only_advance_on_changes_and_list_latest_per_group(self):
+        await self.redis.delete(RUNNER_SESSION_PREFIX + self.runner_id)
+        first = await self.save_config(name="  订单回归  ")
+        self.assertEqual((first["version"], first["name"], first["dataset_version_id"]), (1, "订单回归", None))
+        group = f"/api/v1/experiment-configs/{first['config_group_id']}"
+        unchanged = await self.client.post(group + "/versions", json={"base_version": 1, "config": self.config_payload()})
+        self.assertEqual((unchanged.status_code, unchanged.json()), (200, first))
+        async with self.database.transaction() as db:
+            dataset = Dataset(name="另一数据集", user_id=self.owner_id)
+            db.add(dataset)
+            await db.flush()
+            new_dataset_id = dataset.id
+        revised = await self.client.post(group + "/versions", json={
+            "base_version": 1, "config": self.config_payload(dataset_id=new_dataset_id),
+        })
+        self.assertEqual(revised.status_code, 201, revised.text)
+        second = revised.json()
+        self.assertEqual(second["version"], 2)
+        self.assertEqual((await self.client.get(group)).json(), second)
+        self.assertEqual((await self.client.get(group + "/versions")).json()["items"], [second, first])
+        self.assertEqual((await self.client.get("/api/v1/experiment-configs",
+                                                params={"dataset_id": self.dataset_id})).json()["items"], [])
+        self.assertEqual((await self.client.get("/api/v1/experiment-configs")).json()["items"], [second])
+        stale = await self.client.post(group + "/versions", json={"base_version": 1, "config": self.config_payload()})
+        self.assert_error(stale, 409, "experiment_config_version_conflict")
+        other = self.new_client()
+        await self.register("bob", other)
+        await self.login(other, username="bob")
+        for suffix in ("", "/versions", "/runs"):
+            self.assert_error(await other.get(group + suffix), 404, "experiment_config_not_found")
+
+    async def test_start_runs_from_a_historical_config_with_exact_sample_revisions(self):
+        first = await self.save_config(repetitions=2, evaluators=[self.evaluator_payload()])
+        group = f"/api/v1/experiment-configs/{first['config_group_id']}"
+        next_config = await self.client.post(group + "/versions", json={"base_version": 1, "config": self.config_payload(
+            repetitions=3, agent_target_id="another-agent",
+        )})
+        self.assertEqual(next_config.status_code, 201, next_config.text)
+        path = f"/api/v1/runners/{self.runner_id}/experiment-configs/{first['id']}/runs"
+        notified = AsyncMock()
+        with (patch.object(self.app.state.scheduler, "has_ready_runner", return_value=True) as ready,
+              patch.object(self.app.state.experiments, "on_created", notified)):
+            partial = await self.client.post(path, json={"dataset_version_id": self.v2, "example_ids": [self.example_ids[0]]})
+            full = await self.client.post(path, json={"dataset_version_id": self.v1})
+        self.assertEqual(partial.status_code, 201, partial.text)
+        self.assertEqual(full.status_code, 201, full.text)
+        ready.assert_called_with(self.runner_id, self.owner_id)
+        result = partial.json()
+        self.assertEqual(partial.headers["location"], f"/api/v1/experiments/{result['experiment_id']}")
+        self.assertEqual((result["experiment_config_id"], result["config_version"]), (first["id"], 1))
+        self.assertEqual(result["config_group_id"], first["config_group_id"])
+        self.assertEqual(result["execution_config"]["agent_target_id"], "order-agent")
+        self.assertEqual(result["evaluators"], first["evaluators"])
+        self.assertEqual(result["progress"]["job_count"], 2)
+        self.assertEqual(full.json()["progress"]["job_count"], 6)
+        rows = (await self.client.get(partial.headers["location"] + "/jobs")).json()["items"]
+        self.assertEqual({row["example_id"] for row in rows}, {self.example_ids[0]})
+        detail = await self.client.get(partial.headers["location"] + "/jobs/" + rows[0]["job_id"])
+        self.assertEqual(detail.json()["input"], {"version": self.v2})
+        notified.assert_any_await(self.runner_id, result["experiment_id"])
+        listing = await self.client.get(group + "/runs", params={"version": 1, "pagesize": 1})
+        self.assertEqual(listing.json()["total"], 2)
+        self.assertEqual(listing.json()["items"][0]["experiment_id"], full.json()["experiment_id"])
+        self.assertEqual((await self.client.get(group + "/runs", params={"version": 2})).json()["total"], 0)
+
+    async def test_invalid_sample_scope_and_runner_leave_no_run(self):
+        config = await self.save_config(dataset_version_id=self.v2)
+        path = f"/api/v1/runners/{self.runner_id}/experiment-configs/{config['id']}/runs"
+        with patch.object(self.app.state.scheduler, "has_ready_runner", return_value=True):
+            for selection in ([], None, [self.example_ids[0]] * 2):
+                response = await self.client.post(path, json={"dataset_version_id": self.v2, "example_ids": selection})
+                self.assert_error(response, 422, "invalid_request")
+            self.assert_error(await self.client.post(path, json={"dataset_version_id": self.v2,
+                              "example_ids": self.example_ids}), 422, "invalid_experiment_examples")
+            self.assert_error(await self.client.post(path, json={"dataset_version_id": self.v1}),
+                              422, "dataset_version_mismatch")
+            wrong_runner = f"/api/v1/runners/different/experiment-configs/{config['id']}/runs"
+            self.assert_error(await self.client.post(wrong_runner, json={"dataset_version_id": self.v2}),
+                              422, "runner_id_mismatch")
+        self.assert_error(await self.client.post(path, json={"dataset_version_id": self.v2}), 503, "runner_not_ready_here")
+        await self.redis.delete(RUNNER_SESSION_PREFIX + self.runner_id)
+        self.assert_error(await self.client.post(path, json={"dataset_version_id": self.v2}), 409, "runner_offline")
+        async with self.database.transaction() as db:
+            self.assertEqual(await db.scalar(select(func.count()).select_from(Experiment)), 0)
+            self.assertEqual(await db.scalar(select(func.count()).select_from(ExperimentConfig)), 1)
 
     async def test_evaluator_catalog_and_dataset_binding_list(self):
         catalog_path = "/api/v1/evaluators/builtin"
@@ -355,6 +451,71 @@ class ExperimentAPITests(APITestCase):
             **item["progress"], "evaluations": {"expected": 0, "completed": 0, "errors": 0},
         })
 
+    async def test_global_run_list_filters_across_groups_and_datasets(self):
+        path = "/api/v1/experiment-runs"
+        config = await self.save_config()
+        group_id = config["config_group_id"]
+        saved = await self.client.post(f"/api/v1/experiment-configs/{group_id}/versions", json={
+            "base_version": 1, "config": self.config_payload(name="订单回归 v2"),
+        })
+        self.assertEqual(saved.status_code, 201, saved.text)
+
+        async def start(config_id):
+            response = await self.client.post(f"/api/v1/runners/{self.runner_id}/experiment-configs/{config_id}/runs",
+                                              json={"dataset_version_id": self.v2})
+            self.assertEqual(response.status_code, 201, response.text)
+            return response.json()["experiment_id"]
+
+        with patch.object(self.app.state.scheduler, "has_ready_runner", return_value=True):
+            first_id = await start(config["id"])
+            second_id = await start(saved.json()["id"])
+        cancelled = await self.client.post(f"/api/v1/experiments/{second_id}/cancel")
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+
+        imported = await self.client.post("/api/v1/datasets/import", data={"name": "另一个数据集", "format": "jsonl"},
+                                          files={"file": ("sample.jsonl", '{"input":{"value":"example"}}\n')})
+        self.assertEqual(imported.status_code, 201, imported.text)
+        other_dataset_id = imported.json()["dataset_id"]
+        third = await self.client.post(f"/api/v1/datasets/{other_dataset_id}/experiments", json=self.payload())
+        self.assertEqual(third.status_code, 201, third.text)
+        third_id = third.json()["experiment_id"]
+        async with self.database.transaction() as db:
+            await db.execute(update(Experiment).values(created_at=datetime(2026, 11, 19, tzinfo=timezone.utc)))
+
+        response = await self.client.get(path, params={"pagesize": 2})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(response.json()["total"], 3)
+        self.assertEqual([item["experiment_id"] for item in response.json()["items"]], [third_id, second_id])
+        self.assertEqual(response.json()["items"][0]["dataset_id"], other_dataset_id)
+        page_two = (await self.client.get(path, params={"page": 2, "pagesize": 2})).json()
+        self.assertEqual([item["experiment_id"] for item in page_two["items"]], [first_id])
+
+        for params, expected in (
+            ({"group_id": group_id}, [second_id, first_id]),
+            ({"version": 1}, [third_id, first_id]),
+            ({"status": "cancelled"}, [second_id]),
+            ({"group_id": group_id, "version": 2, "status": "cancelled"}, [second_id]),
+            ({"group_id": group_id, "version": 2, "status": "pending"}, []),
+        ):
+            with self.subTest(params=params):
+                result = await self.client.get(path, params=params)
+                self.assertEqual(result.status_code, 200, result.text)
+                self.assertEqual(result.json()["total"], len(expected))
+                self.assertEqual([item["experiment_id"] for item in result.json()["items"]], expected)
+        summary = response.json()["items"][1]
+        self.assertEqual((summary["config_version"], summary["progress"]["cancelled"]), (2, 2))
+
+        self.assert_error(await self.new_client().get(path), 401, "not_authenticated")
+        other = self.new_client()
+        await self.register("bob", other)
+        await self.login(other, username="bob")
+        self.assertEqual((await other.get(path)).json(), {"items": [], "page": 1, "pagesize": 20, "total": 0})
+        self.assert_error(await other.get(path, params={"group_id": group_id}), 404, "experiment_config_not_found")
+        for params in ({"group_id": "invalid"}, {"version": 0}, {"status": "succeeded"},
+                       {"page": 0}, {"pagesize": 101}):
+            self.assert_error(await self.client.get(path, params=params), 422, "invalid_request")
+
     async def test_detail_and_cancel_report_saved_evaluations_against_frozen_config(self):
         names = ("first", "second", "missing")
         ids = [(await self.create_evaluator(name=name))["dataset_evaluator_id"] for name in names]
@@ -581,7 +742,9 @@ class ExperimentAPITests(APITestCase):
         await self.connections.register(self.runner_id, record, 60)
         self.assert_error(await lookup(creation_path), 503, "runner_route_unavailable")
         await self.connections.register(self.runner_id, record.model_copy(update={"cloud_route_id": "cloud-a"}), 60)
-        for path in [creation_path, base + "/jobs/job/events"]:
+        for path in [creation_path, base + "/jobs/job/events",
+                     f"/api/v1/runners/{self.runner_id}/experiment-configs/42/runs",
+                     f"/api/v1/runners/{self.runner_id}/assistant/stream"]:
             result = await lookup(path)
             self.assertEqual(result.status_code, 204, result.text)
             self.assertEqual(result.headers["X-EvalForge-Cloud-Route-Id"], "cloud-a")

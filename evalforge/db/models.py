@@ -14,19 +14,14 @@ from .orm.evaluators import (
     LLMEvaluator,
 )
 from .orm.experiments import Experiment, ExperimentDatasetExample, Job, JobEvaluation
+from .orm.experiment_configs import ExperimentConfig
 from .orm.traces import Span, Trace
-
-# Register the experiments table before mapping the inherited legacy config.
-from .orm.experiment_configs import (
-    ExperimentConfig, ExperimentDatasetEvaluator, ExperimentEvalOnlyConfig, ExperimentPromptTask,
-)
 
 __all__ = [
     "Base", "AssistantMessage", "AssistantSession", "Dataset", "DatasetVersion", "DatasetExample", "DatasetExampleRevision",
     "Experiment", "ExperimentDatasetExample", "Job", "JobEvaluation",
     "Evaluator", "CodeEvaluator", "CodeEvaluatorVersion", "LLMEvaluator", "BuiltinEvaluator",
-    "DatasetEvaluators", "ExperimentConfig", "ExperimentPromptTask", "ExperimentEvalOnlyConfig",
-    "ExperimentDatasetEvaluator", "RunnerAttempt", "User", "Runner", "RunnerCredential",
+    "DatasetEvaluators", "ExperimentConfig", "RunnerAttempt", "User", "Runner", "RunnerCredential",
     "Trace", "Span",
     "AssistantConversationRecord", "AssistantConversationEntry",
 ]

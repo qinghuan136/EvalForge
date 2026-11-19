@@ -15,7 +15,7 @@ from evalforge.db.models import AssistantMessage as LegacyMessage, AssistantSess
 from sqlalchemy import func, select, update
 
 from api_support import APITestCase
-from evalforge.db.models import AssistantConversationEntry as AssistantMessage, AssistantConversationRecord as AssistantSession, Dataset, DatasetExample, DatasetVersion, Experiment, Job, Runner
+from evalforge.db.models import AssistantConversationEntry as AssistantMessage, AssistantConversationRecord as AssistantSession, Dataset, DatasetExample, DatasetVersion, Experiment, ExperimentConfig, Job, Runner
 from evalforge.server.assistant.tools import ASSISTANT_TOOLS
 from evalforge.server.schemas.page_context import PageContextCatalog
 
@@ -32,7 +32,10 @@ class AssistantAPITests(APITestCase):
         async with self.database.transaction() as db:
             dataset = Dataset(name="助手数据集", user_id=self.user_id)
             version = DatasetVersion(dataset=dataset)
-            experiment = Experiment(name="问答实验", dataset=dataset, dataset_version=version,
+            config = ExperimentConfig(config_group_id=uuid4(), version=1, user_id=self.user_id, dataset=dataset,
+                                      runner=Runner(owner_user_id=self.user_id, name="测试 Runner"),
+                                      name="问答实验", agent_target_id="test")
+            experiment = Experiment(experiment_config=config, name="问答实验", dataset=dataset, dataset_version=version,
                                     user_id=self.user_id, repetitions=1, status="running")
             db.add(experiment)
             await db.flush()
@@ -114,6 +117,13 @@ class AssistantAPITests(APITestCase):
         self.assertEqual([m["role"] for m in visible], ["user", "assistant", "user", "assistant"])
         self.assertEqual([m["model_name"] for m in visible], [None, "model-a-resolved", None, "model-b-resolved"])
         self.assertEqual(visible[-1]["source_experiment_id"], self.experiment_id)
+        conversation = detail.json()["conversation"]
+        self.assertEqual(conversation["conversation_id"], self.session_id)
+        self.assertEqual(conversation["revision"], detail.json()["revision"])
+        self.assertEqual([part["tool_call_id"] for message in conversation["messages"] for part in message["parts"]
+                          if part["part_kind"] == "tool-return"], ["model-a", "model-b"])
+        self.assertTrue(all(message["run_id"] for message in conversation["messages"]))
+        self.assertFalse(any("instructions" in message for message in conversation["messages"]))
         async with self.database.transaction() as db:
             rows = (await db.scalars(select(AssistantMessage).order_by(AssistantMessage.id))).all()
             self.assertEqual([m.message["kind"] for m in rows], ["request", "response", "request", "response"] * 2)
@@ -158,6 +168,8 @@ class AssistantAPITests(APITestCase):
             "EXPERIMENT_create_experiment": {"dataset_id": dataset["dataset_id"], "name": "待启动",
                                              "dataset_version_id": dataset["dataset_version_id"],
                                              "execution_config": {"runner_id": runner["runner_id"], "agent_target_id": "agent"}},
+            "EXPERIMENT_start_run": {"config_id": 1, "runner_id": runner["runner_id"],
+                                      "dataset_version_id": dataset["dataset_version_id"]},
             "EXPERIMENT_cancel_experiment": {"experiment_id": self.experiment_id},
         }
 
@@ -176,7 +188,7 @@ class AssistantAPITests(APITestCase):
         self.assertEqual(actions["EXPERIMENT_create_experiment"]["dataset_version_id"], dataset["dataset_version_id"])
         self.assertEqual(actions["DATASET_import_dataset"]["content"], content)
         async with self.database.transaction() as db:
-            self.assertEqual(await db.scalar(select(func.count()).select_from(Runner)), 1)
+            self.assertEqual(await db.scalar(select(func.count()).select_from(Runner)), 2)
             self.assertTrue(await db.scalar(select(Runner.enabled).where(Runner.runner_id == runner["runner_id"])))
             self.assertEqual(await db.scalar(select(func.count()).select_from(Dataset)), 2)
             self.assertEqual(await db.scalar(select(func.count()).select_from(Experiment)), 1)
@@ -221,13 +233,15 @@ class AssistantAPITests(APITestCase):
             experiment = await db.get(Experiment, self.experiment_id)
             other_dataset = Dataset(name="另一数据集", user_id=self.user_id)
             other_version = DatasetVersion(dataset=other_dataset)
+            runner = Runner(owner_user_id=self.user_id, name="本地 Runner")
+            config = ExperimentConfig(config_group_id=uuid4(), version=1, user_id=self.user_id, dataset=other_dataset,
+                                      runner=runner, name="另一实验", agent_target_id="test")
             other_experiment = Experiment(
-                name="另一实验", dataset=other_dataset, dataset_version=other_version,
+                experiment_config=config, name="另一实验", dataset=other_dataset, dataset_version=other_version,
                 user_id=self.user_id, repetitions=1,
             )
             example = DatasetExample(dataset_id=experiment.dataset_id)
             job = Job(experiment=experiment, dataset_example=example, repetition_number=1)
-            runner = Runner(owner_user_id=self.user_id, name="本地 Runner")
             deleted = Runner(owner_user_id=self.user_id, name="已删 Runner", enabled=False,
                              deleted_at=datetime.now(timezone.utc))
             db.add_all([other_experiment, job, runner, deleted])
@@ -271,7 +285,7 @@ class AssistantAPITests(APITestCase):
                 self.assertIsNone(assistant_message["page_context"])
 
         registered = [tool.__name__ for tool in ASSISTANT_TOOLS]
-        self.assertEqual(len(set(registered)), 17)
+        self.assertEqual(len(set(registered)), 20)
         self.assertTrue(all(tools == registered for _, tools in seen))
         all_prompts = seen[-1][0]
         for index, context in enumerate(contexts):
@@ -369,7 +383,13 @@ class AssistantAPITests(APITestCase):
             self.assertEqual((row.active_run_id, row.lease_expires_at, row.revision), (None, None, self.revisions[0]))
 
     async def test_sse_streams_tool_answer_before_commit_and_returns_saved_turn(self):
-        continue_model = asyncio.Event()
+        continue_model, tool_entered, continue_tool = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        original_get = self.service.experiments.get
+
+        async def slow_get(*args):
+            tool_entered.set()
+            await continue_tool.wait()
+            return await original_get(*args)
 
         async def model(messages, _):
             if not isinstance(messages[-1].parts[-1], ToolReturnPart):
@@ -383,7 +403,8 @@ class AssistantAPITests(APITestCase):
             yield "正在执行"
 
         frames, disconnected = asyncio.Queue(), asyncio.Event()
-        with patch("evalforge.server.services.assistant.build_model", return_value=FunctionModel(stream_function=model)):
+        with patch("evalforge.server.services.assistant.build_model", return_value=FunctionModel(stream_function=model)), \
+                patch.object(self.service.experiments, "get", side_effect=slow_get):
             task = asyncio.create_task(self.open_asgi_stream(frames, disconnected))
             try:
                 start = await asyncio.wait_for(frames.get(), 5)
@@ -391,6 +412,20 @@ class AssistantAPITests(APITestCase):
                 headers = dict(start["headers"])
                 self.assertTrue(headers[b"content-type"].startswith(b"text/event-stream"))
                 self.assertEqual(headers[b"x-accel-buffering"], b"no")
+                call = await asyncio.wait_for(frames.get(), 5)
+                self.assertIn(b"event: tool_call\n", call["body"])
+                call_data = json.loads(call["body"].decode().splitlines()[1].removeprefix("data: "))
+                self.assertEqual(call_data["conversation_id"], self.session_id)
+                self.assertEqual(call_data["part"]["tool_call_id"], "progress")
+                self.assertTrue(call_data["args_valid"])
+                await asyncio.wait_for(tool_entered.wait(), 5)
+                self.assertTrue(frames.empty(), "Tool call must arrive while the tool is still waiting")
+                continue_tool.set()
+                result = await asyncio.wait_for(frames.get(), 5)
+                self.assertIn(b"event: tool_result\n", result["body"])
+                result_data = json.loads(result["body"].decode().splitlines()[1].removeprefix("data: "))
+                self.assertEqual(result_data["run_id"], call_data["run_id"])
+                self.assertEqual(result_data["part"]["tool_call_id"], "progress")
                 first = await asyncio.wait_for(frames.get(), 5)
                 self.assertIn("event: text_delta\ndata: {\"text\":\"实验\"}", first["body"].decode())
                 detail = await self.client.get(self.path)
@@ -409,8 +444,13 @@ class AssistantAPITests(APITestCase):
                 self.assertNotEqual(result["revision"], self.revisions[0])
                 self.assertEqual(detail["messages"][-1]["source_experiment_id"], self.experiment_id)
                 self.assertEqual(detail["messages"][-1]["text"], "实验正在执行")
+                native = detail["conversation"]["messages"]
+                self.assertEqual({m["run_id"] for m in native}, {call_data["run_id"]})
+                self.assertEqual(next(p for m in native for p in m["parts"] if p["part_kind"] == "tool-call"), call_data["part"])
+                self.assertEqual(next(p for m in native for p in m["parts"] if p["part_kind"] == "tool-return"), result_data["part"])
                 await asyncio.wait_for(task, 5)
             finally:
+                continue_tool.set()
                 continue_model.set()
                 disconnected.set()
                 await asyncio.gather(task, return_exceptions=True)

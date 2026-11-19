@@ -9,10 +9,12 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 from anyio import CancelScope
+from pydantic import JsonValue
 from pydantic_ai import ModelMessagesTypeAdapter
 from pydantic_ai.conversation import Conversation
 from pydantic_ai.conversation_store import ConversationConflict, ConversationEntry
-from pydantic_ai.messages import ModelRequest, ModelResponse, PartDeltaEvent, PartStartEvent, TextPart, TextPartDelta, UserPromptPart
+from pydantic_ai.messages import (DeferredToolRequestsEvent, FunctionToolCallEvent, FunctionToolResultEvent,
+                                 ModelRequest, ModelResponse, PartDeltaEvent, PartStartEvent, TextPart, TextPartDelta, UserPromptPart)
 from pydantic_ai.usage import UsageLimits
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
@@ -24,11 +26,14 @@ from evalforge.db.models import AssistantMessage, AssistantSession
 from ..assistant.agent import build_agent, build_model
 from ..assistant.conversation_store import DatabaseConversationStore
 from ..assistant.context import AssistantDeps, prompt_with_page_context, require_accessible_page_context
+from ..assistant.presentation import display_conversation, display_deferred, display_tool_part
 from ..config import ServerSettings
 from ..errors import APIError
 from ..schemas.assistant import (AssistantAction, AssistantChatRequest, AssistantChatResponse, AssistantDecisionRequest,
-                                 AssistantDisplayCard, AssistantMessageView, AssistantSessionDetail, AssistantSessionList, AssistantSessionSummary)
+                                 AssistantDisplayCard, AssistantMessageView, AssistantSessionDetail, AssistantSessionList, AssistantSessionSummary,
+                                 AssistantToolCallEvent, AssistantToolDeferredEvent, AssistantToolEvent)
 from .datasets import DatasetService
+from .experiment_configs import ExperimentConfigService
 from .experiments import ExperimentService
 from .runners import RunnerService
 from .traces import TraceQueryService
@@ -36,6 +41,7 @@ from .traces import TraceQueryService
 logger = logging.getLogger(__name__)
 EmitText = Callable[[str], Awaitable[None]]
 EmitDisplay = Callable[[AssistantDisplayCard], Awaitable[None]]
+EmitEvent = Callable[[str, dict[str, JsonValue]], Awaitable[None]]
 
 
 def _lease_clock(db, seconds: int = 0):
@@ -50,11 +56,12 @@ def _actions(conversation: Conversation) -> list[AssistantAction]:
     cards = []
     labels = {"RUNNER_create_runner": "创建 Runner", "RUNNER_delete_runner": "删除 Runner 并撤销凭证",
               "DATASET_import_dataset": "导入数据集", "EXPERIMENT_create_experiment": "启动实验",
-              "EXPERIMENT_cancel_experiment": "取消整场实验"}
+              "EXPERIMENT_start_run": "启动实验 Run", "EXPERIMENT_cancel_experiment": "取消整场实验"}
     for call in requests.approvals if requests else []:
         arguments = dict(call.args_as_dict())
         description = arguments.pop("approval_description", None)
-        target = arguments.get("name") or arguments.get("runner_id") or arguments.get("experiment_id") or ""
+        target = (arguments.get("name") or arguments.get("config_id") or arguments.get("runner_id")
+                  or arguments.get("experiment_id") or "")
         cards.append(AssistantAction(tool_call_id=call.tool_call_id, tool=call.tool_name, arguments=arguments,
             description=description or f"{labels.get(call.tool_name, call.tool_name)} {target}".strip()))
     return cards
@@ -92,9 +99,17 @@ class AssistantTurn:
 
 class AssistantService:
     def __init__(self, database: Database, experiments: ExperimentService, config: ServerSettings, *,
-                 runners: RunnerService, datasets: DatasetService, traces: TraceQueryService):
+                 runners: RunnerService, datasets: DatasetService, traces: TraceQueryService,
+                 experiment_configs: ExperimentConfigService | None = None,
+                 has_ready_runner: Callable[[str, int], bool] | None = None):
         self.database, self.experiments, self.config = database, experiments, config
         self.runners, self.datasets, self.traces = runners, datasets, traces
+        self.experiment_configs = experiment_configs or ExperimentConfigService(database)
+        self.has_ready_runner = has_ready_runner
+
+    def check_local_runner(self, runner_id: str, user_id: int) -> None:
+        if self.has_ready_runner is not None and not self.has_ready_runner(runner_id, user_id):
+            raise APIError(503, "runner_not_ready_here", "当前实例没有就绪的 Runner 会话，请稍后重试")
 
     def store(self, user_id: int, *, session=None):
         return DatabaseConversationStore(self.database, user_id, session=session)
@@ -179,6 +194,7 @@ class AssistantService:
             if conversation is not None and current is not None and summary.revision == conversation.revision == current.revision:
                 messages = [view for entry in entries or [] if (view := _view(entry)) is not None][-100:]
                 return AssistantSessionDetail(**summary.model_dump(), status=status, error=error, messages=messages,
+                    conversation=display_conversation(conversation),
                     actions=_actions(conversation) if status == "awaiting_approval" else [])
         raise APIError(409, "assistant_history_changed", "会话历史已变化，请刷新后重试")
 
@@ -214,6 +230,11 @@ class AssistantService:
                     raise APIError(409, "assistant_no_pending_approval", "当前没有可恢复的审批")
                 if set(data.decisions) != {action.tool_call_id for action in actions}:
                     raise APIError(422, "assistant_invalid_decisions", "必须一次提交全部待审批调用的决定")
+                for action in actions:
+                    if action.tool == "EXPERIMENT_start_run" and data.decisions[action.tool_call_id]:
+                        runner_id = action.arguments.get("runner_id")
+                        if isinstance(runner_id, str):
+                            self.check_local_runner(runner_id, user_id)
             elif actions:
                 raise APIError(409, "assistant_approval_required", "请先处理当前待审批操作")
             model = row.resume_model_name if decision else data.model_name or self.models[0]
@@ -263,9 +284,9 @@ class AssistantService:
                     raise _lease_lost()
 
     async def execute_chat(self, turn: AssistantTurn, emit: EmitText | None = None,
-                           emit_display: EmitDisplay | None = None):
+                           emit_display: EmitDisplay | None = None, emit_event: EmitEvent | None = None):
         heartbeat = asyncio.create_task(self._heartbeat(turn))
-        execution = asyncio.create_task(self._run(turn, emit, emit_display))
+        execution = asyncio.create_task(self._run(turn, emit, emit_display, emit_event))
         try:
             async with asyncio.timeout(self.config.assistant_timeout_seconds):
                 done, _ = await asyncio.wait((heartbeat, execution), return_when=asyncio.FIRST_COMPLETED)
@@ -285,7 +306,8 @@ class AssistantService:
             await asyncio.gather(heartbeat, execution, return_exceptions=True)
             await self._release_chat(turn)
 
-    async def _run(self, turn: AssistantTurn, emit: EmitText | None, emit_display: EmitDisplay | None):
+    async def _run(self, turn: AssistantTurn, emit: EmitText | None, emit_display: EmitDisplay | None,
+                   emit_event: EmitEvent | None):
         data = turn.data
         decision = isinstance(data, AssistantDecisionRequest)
         if decision and emit_display is None:
@@ -305,15 +327,27 @@ class AssistantService:
                 raise APIError(409, "assistant_stream_required", "请通过 SSE 接收展示卡片")
             await emit_display(card)
 
-        async def publish_text(_, events):
+        async def publish_events(_, events):
+            identity = {"conversation_id": turn.session_id, "run_id": str(turn.run_id)}
             async for event in events:
-                if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart) and event.part.content:
+                if emit and isinstance(event, PartStartEvent) and isinstance(event.part, TextPart) and event.part.content:
                     await emit(event.part.content)
-                elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
+                elif emit and isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
                     await emit(event.delta.content_delta)
+                elif emit_event:
+                    if isinstance(event, FunctionToolCallEvent):
+                        payload = AssistantToolCallEvent(**identity, part=display_tool_part(event.part), args_valid=event.args_valid)
+                        await emit_event("tool_call", payload.model_dump(mode="json"))
+                    elif isinstance(event, FunctionToolResultEvent):
+                        payload = AssistantToolEvent(**identity, part=display_tool_part(event.part))
+                        await emit_event("tool_result", payload.model_dump(mode="json"))
+                    elif isinstance(event, DeferredToolRequestsEvent):
+                        payload = AssistantToolDeferredEvent(**identity, requests=display_deferred(event.requests))
+                        await emit_event("tool_deferred", payload.model_dump(mode="json"))
 
         deps = AssistantDeps(turn.user_id, self.experiments, self.runners, self.datasets, self.traces,
-                             turn.auth_version, check_execution, display)
+                             turn.auth_version, check_execution, display, self.experiment_configs,
+                             self.check_local_runner)
         conversation = turn.conversation
         requests = conversation.deferred_tool_requests
         deferred = requests.build_results(approvals=data.decisions) if decision else None
@@ -321,10 +355,10 @@ class AssistantService:
             model = build_model(turn.model, self.config.assistant_api_key, self.config.assistant_base_url)
             result = await build_agent(model).run(
                 None if decision else prompt_with_page_context(data.message, page_context),
-                deps=deps, conversation=conversation, deferred_tool_results=deferred,
+                deps=deps, conversation=conversation, deferred_tool_results=deferred, run_id=str(turn.run_id),
                 usage_limits=UsageLimits(request_limit=conversation.usage.requests + 6,
                                          tool_calls_limit=conversation.usage.tool_calls + 8),
-                model_settings={"max_tokens": 1500}, event_stream_handler=publish_text if emit else None)
+                model_settings={"max_tokens": 1500}, event_stream_handler=publish_events if emit or emit_event else None)
             new = result.new_messages()
             for index, message in enumerate(new):
                 metadata = {}

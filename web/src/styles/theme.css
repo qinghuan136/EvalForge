@@ -149,6 +149,8 @@ a { color: var(--color-accent); }
 .assistant-messages { display: grid; gap: 8px; max-height: 40vh; overflow-y: auto; padding: 0; margin: 0; list-style: none; }
 .assistant-messages li { padding: 12px; border: 1px solid var(--color-divider); background: var(--color-surface-muted); }
 .assistant-messages p { margin: 4px 0; white-space: pre-wrap; }
+.assistant-messages pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.assistant-tool + .assistant-tool { margin-top: 12px; }
 .dialog-form { display: grid; gap: 12px; }
 .dialog-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
 .danger { color: var(--color-error); }
@@ -166,6 +168,11 @@ a { color: var(--color-accent); }
 .example section { min-width: 0; }
 .example pre { overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--color-surface-muted); padding: 10px; margin: 6px 0 0; font: 12px/1.5 var(--font-mono); }
 .experiment-filter { max-width: 320px; margin-bottom: 18px; }
+.config-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin-bottom: 16px; }
+.config-controls .experiment-filter { margin-bottom: 0; }
+.run-scope input { accent-color: var(--color-accent); }
+.run-sample { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 8px; }
+.sample-input-preview { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .table-scroll { overflow-x: auto; }
 .experiment-table { width: 100%; border-collapse: collapse; background: var(--color-surface); text-align: left; min-width: 620px; }
 .experiment-table :is(th, td) { padding: 12px; border-bottom: 1px solid var(--color-divider); text-align: left; overflow-wrap: anywhere; }

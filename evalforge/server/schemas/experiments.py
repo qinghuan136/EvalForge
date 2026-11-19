@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from typing import Annotated, Literal
+from uuid import UUID
 
 from pydantic import AfterValidator, Field, JsonValue, StrictBool, field_validator, model_validator
 from pydantic.json_schema import SkipJsonSchema
@@ -13,6 +14,7 @@ from .evaluators import EvaluatorConfig, EvaluatorSnapshot
 
 ExperimentStatus = Literal["pending", "running", "cancelling", "completed", "failed", "cancelled"]
 JobStatus = Literal["queued", "assigned", "running", "succeeded", "failed", "cancelled", "unknown"]
+MAX_EXPERIMENT_JOBS = 10_000
 
 
 class ExecutionConfig(Schema):
@@ -34,13 +36,10 @@ class ExecutionConfig(Schema):
         return value.strip() if isinstance(value, str) else value
 
 
-class ExperimentCreate(Schema):
+class ExperimentOptions(Schema):
     name: StoredText = Field(min_length=1, max_length=100)
     description: StoredText | None = Field(default=None, max_length=2000)
-    dataset_version_id: PositiveDbId | SkipJsonSchema[None] = Field(default_factory=lambda: None)
     repetitions: int = Field(default=1, strict=True, ge=1, le=100)
-    metadata: Annotated[dict[str, JsonValue], AfterValidator(validate_database_json)] = Field(default_factory=dict)
-    execution_config: ExecutionConfig
     dataset_evaluator_ids: list[PositiveDbId] = Field(default_factory=list, max_length=100)
     evaluators: list[EvaluatorConfig] = Field(default_factory=list, max_length=100)
 
@@ -48,13 +47,6 @@ class ExperimentCreate(Schema):
     @classmethod
     def trim_name(cls, value):
         return value.strip() if isinstance(value, str) else value
-
-    @field_validator("dataset_version_id")
-    @classmethod
-    def omit_version_instead_of_null(cls, value):
-        if value is None:
-            raise ValueError("Omit dataset_version_id to use the latest version")
-        return value
 
     @field_validator("dataset_evaluator_ids")
     @classmethod
@@ -70,6 +62,74 @@ class ExperimentCreate(Schema):
         if len({evaluator.name for evaluator in self.evaluators}) != len(self.evaluators):
             raise ValueError("Experiment evaluator names must be unique")
         return self
+
+
+class ExperimentCreate(ExperimentOptions):
+    dataset_version_id: PositiveDbId | SkipJsonSchema[None] = Field(default_factory=lambda: None)
+    metadata: Annotated[dict[str, JsonValue], AfterValidator(validate_database_json)] = Field(default_factory=dict)
+    execution_config: ExecutionConfig
+
+    @field_validator("dataset_version_id")
+    @classmethod
+    def omit_version_instead_of_null(cls, value):
+        if value is None:
+            raise ValueError("Omit dataset_version_id to use the latest version")
+        return value
+
+
+class ExperimentConfigSave(ExperimentOptions, ExecutionConfig):
+    dataset_id: PositiveDbId
+    dataset_version_id: PositiveDbId | None = None
+
+
+class ExperimentConfigRevision(Schema):
+    base_version: PositiveDbId
+    config: ExperimentConfigSave
+
+
+class ExperimentConfigDetail(Schema):
+    id: int
+    config_group_id: UUID
+    version: int
+    name: str
+    description: str | None
+    dataset_id: int
+    dataset_version_id: int | None
+    runner_id: str
+    agent_target_id: str
+    timeout_seconds: float
+    stream_output: bool
+    repetitions: int
+    evaluators: list[EvaluatorSnapshot]
+    created_at: datetime
+
+    @field_validator("created_at")
+    @classmethod
+    def utc_time(cls, value: datetime) -> datetime:
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+class ExperimentConfigPage(Schema):
+    items: list[ExperimentConfigDetail]
+    page: int
+    pagesize: int
+    total: int
+
+
+class ExperimentRunCreate(Schema):
+    dataset_version_id: PositiveDbId
+    example_ids: Annotated[list[PositiveDbId], Field(min_length=1, max_length=MAX_EXPERIMENT_JOBS)] | SkipJsonSchema[None] = Field(
+        default_factory=lambda: None,
+    )
+
+    @field_validator("example_ids")
+    @classmethod
+    def unique_examples(cls, ids):
+        if ids is None:
+            raise ValueError("Omit example_ids to run all examples")
+        if len(set(ids)) != len(ids):
+            raise ValueError("Example IDs must be unique")
+        return ids
 
 
 class ExperimentProgress(Schema):
@@ -96,6 +156,9 @@ class ExperimentDetailProgress(ExperimentProgress):
 
 class ExperimentSummary(Schema):
     experiment_id: int = Field(validation_alias="id")
+    experiment_config_id: int
+    config_group_id: UUID
+    config_version: int
     dataset_id: int
     dataset_version_id: int
     name: str

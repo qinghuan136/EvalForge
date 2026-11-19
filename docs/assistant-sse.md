@@ -2,11 +2,14 @@
 
 普通消息、审批恢复共用 `POST /api/v1/assistant/stream`。请求使用 `conversation_id`、`expected_revision`，以及 `type=message` 或 `type=decision`。登录、CSRF、会话版本与执行权冲突在发送 HTTP 响应头前校验。接入参数见 [评测助手](assistant.md)。
 
-每帧使用 `event` 和 JSON `data`，以空行结束。空闲 15 秒发送 `: keep-alive` 注释。当前协议定义以下五种事件。
+每帧使用 `event` 和 JSON `data`，以空行结束。空闲 15 秒发送 `: keep-alive` 注释。工具事件复用同一连接，旧前端可忽略尚未识别的事件。
 
 | 事件 | 用途 | 发送时机 |
 | --- | --- | --- |
 | `text_delta` | 追加临时文字 | 模型生成文字时 |
+| `tool_call` | 展示工具调用 | PydanticAI 发出 FunctionToolCallEvent 时 |
+| `tool_result` | 展示工具结果 | PydanticAI 发出 FunctionToolResultEvent 时 |
+| `tool_deferred` | 标记调用等待交互 | PydanticAI 发出 DeferredToolRequestsEvent 时 |
 | `approval_required` | 展示一批批准卡片 | Conversation 和待审批调用提交成功后 |
 | `display` | 展示工具产生的信息卡片 | 工具执行过程中，数据已经产生时 |
 | `done` | 确认本轮已保存并结束 | Conversation 提交成功后 |
@@ -18,7 +21,48 @@
 {"text":"正在检查实验进度。"}
 ```
 
-前端追加到本轮临时预览。正式消息通过会话详情获取，`done` 后刷新，失败时清除临时预览。
+前端追加到本轮临时预览。正式消息通过会话详情获取，`done` 后刷新。历史读取成功并出现新 Revision 后，预览由历史替换；读取失败保留预览并提供重读按钮。流执行失败时已有文字标记为“本轮未确认保存”，不当作已持久化消息；切换会话或开始下一轮时清理本轮预览。
+
+## 实时工具事件
+
+Agent 运行入口统一消费 `event_stream_handler`，经过展示过滤后送入现有有界 asyncio.Queue，再输出 SSE；工具函数不承担 SSE 转发。没有新增连接、持久化队列或逐事件数据库写入。
+
+`tool_call` 示例：
+
+```json
+{
+  "conversation_id":"会话 ID", "run_id":"本轮运行 ID", "args_valid":true,
+  "part":{"part_kind":"tool-call", "tool_name":"RUNNER_list_runners", "tool_call_id":"call_1", "args":{"page":1}}
+}
+```
+
+`tool_result` 示例：
+
+```json
+{
+  "conversation_id":"会话 ID", "run_id":"本轮运行 ID",
+  "part":{"part_kind":"tool-return", "tool_name":"RUNNER_list_runners", "tool_call_id":"call_1",
+          "content":{"items":[]}, "outcome":"success", "timestamp":"2026-11-19T08:01:00Z"}
+}
+```
+
+`tool_deferred` 示例：
+
+```json
+{
+  "conversation_id":"会话 ID", "run_id":"本轮运行 ID",
+  "requests":{"calls":[], "approvals":[
+    {"part_kind":"tool-call", "tool_name":"RUNNER_create_runner", "tool_call_id":"call_2", "args":{"name":"本地开发"}}
+  ]}
+}
+```
+
+- `part` 保留原生 Part 结构；历史 Conversation 的同一 Part 使用相同过滤规则。args 可能是 JSON 对象、JSON 字符串或 null。ToolReturn 的 outcome 可为 success / failed / denied / interrupted / retried；工具返回的业务错误也可能位于 content.error，不能只看 outcome。
+- `args_valid=true` 表示本次参数校验通过，false 表示失败，null 表示本步没有执行参数校验；调用事件不保证工具函数已经执行。Deferred 调用同样有调用事件，收到 `tool_deferred` 后标记等待交互。被拒绝的调用可收到 outcome=denied 的结果，不能显示成已执行成功。
+- 并发工具按 `tool_call_id` 配对，不按到达顺序配对。run_id 与本次 Agent Run 保存到消息里的 ID 相同；审批恢复开启新 Run，同一 tool_call_id 可再次出现，前端更新原调用的状态，不重复计数。
+- 事件是临时预览，不代表数据库已提交。`tool_deferred` 不携带可提交的 Revision，不代替保存后发出的 `approval_required`。`done` 后重新读取详情中的 Conversation，替换本轮预览，避免重复展示。
+- 仅选择展示字段，不导出 provider/工具内部 metadata，不检查或替换 args/content 内的业务数据。完整 Runner 凭据仍由业务逻辑通过现有 `display` 卡片交付，不进入模型历史。
+- 本期不提供工具内部百分比进度、SSE 重放或断线续传；中断后读取已保存的会话状态，不自动重放写操作。
 
 ## approval_required
 
@@ -98,11 +142,12 @@
 
 ```text
 普通回答        text_delta* → done(completed)
-等待审批        text_delta* → approval_required → done(awaiting_approval)
-批准后创建      display → text_delta* → done(completed)
-工具成功后失败  display → error
+读取工具        tool_call → tool_result → text_delta* → done(completed)
+等待审批        tool_call → tool_deferred → approval_required → done(awaiting_approval)
+批准后创建      tool_call → display → tool_result → text_delta* → done(completed)
+工具成功后失败  tool_call → display → tool_result → error
 ```
 
 `text_delta*` 表示零到多条文字片段。一次 Run 可以产生多张展示卡片，也可以再次产生待审批调用。审批等待期间 Run 和 SSE 已结束，用户决定到达后开启新的 Run。
 
-协议和业务回归见 `tests/test_assistant_api.py`、`tests/test_assistant_deferred.py`、`tests/test_assistant_restart.py`。Job 输出预览和本地 Agent SSE 沿用各自协议。
+协议和业务回归见 `tests/test_assistant_api.py`、`tests/test_assistant_deferred.py`、`tests/test_assistant_presentation.py`、`tests/test_assistant_restart.py`。Job 输出预览和本地 Agent SSE 沿用各自协议。

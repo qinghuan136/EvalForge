@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "vite",
     "typecheck": "tsc --noEmit",
+    "test": "node --test tests",
     "build": "tsc --noEmit && vite build"
   },
   "dependencies": {

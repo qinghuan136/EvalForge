@@ -1,6 +1,8 @@
 """浏览器实验 REST 接口。"""
 
+from functools import partial
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Path, Query, Request, Response
 from fastapi.responses import StreamingResponse
@@ -9,7 +11,10 @@ from ..dependencies import Authenticated, SessionContext, current_user, require_
 from ..errors import APIError
 from ..experiment_events import event_frame
 from ..schemas.common import MAX_DB_ID, StoredText
-from ..schemas.experiments import ExperimentCreate, ExperimentDetail, ExperimentPage, JobDetail, JobPage, JobStatus
+from ..schemas.experiments import (
+    ExperimentCreate, ExperimentDetail, ExperimentPage, ExperimentRunCreate, ExperimentStatus, JobDetail, JobPage,
+    JobStatus,
+)
 from ..services.experiments import ExperimentService
 from ..services.experiment_lifecycle import SETTLED_JOBS
 
@@ -59,6 +64,30 @@ async def create_routed_experiment(response: Response, dataset_id: int = Path(ge
                                    data: ExperimentCreate = Depends(require_local_runner),
                                    service: ExperimentService = Depends(experiment_service)):
     return await _create_experiment(data, response, dataset_id, identity, service)
+
+
+@router.post("/runners/{runner_id}/experiment-configs/{config_id}/runs", status_code=201,
+             response_model=ExperimentDetail, dependencies=[Depends(require_csrf)])
+async def start_run(data: ExperimentRunCreate, request: Request, response: Response,
+                    runner_id: Annotated[str, Path(pattern=r"^[a-zA-Z0-9_-]{1,128}$")],
+                    config_id: int = Path(ge=1, le=MAX_DB_ID),
+                    identity: Authenticated = Depends(current_user),
+                    service: ExperimentService = Depends(experiment_service)):
+    result = await service.start_run(identity.user.id, identity.session.auth_version, config_id, data,
+                                     runner_id=runner_id, check_local=partial(_check_local_runner, request))
+    response.headers["Location"] = f"/api/v1/experiments/{result.experiment_id}"
+    return result
+
+
+@router.get("/experiment-runs", response_model=ExperimentPage)
+async def list_experiment_runs(page: int = Query(default=1, ge=1, le=MAX_DB_ID),
+                               pagesize: int = Query(default=20, ge=1, le=100),
+                               group_id: UUID | None = Query(default=None),
+                               version: int | None = Query(default=None, ge=1, le=MAX_DB_ID),
+                               status: ExperimentStatus | None = Query(default=None),
+                               identity: Authenticated = Depends(current_user),
+                               service: ExperimentService = Depends(experiment_service)):
+    return await service.list_runs(identity.user.id, page, pagesize, group_id=group_id, version=version, status=status)
 
 
 @router.get("/datasets/{dataset_id}/experiments", response_model=ExperimentPage)
