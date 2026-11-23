@@ -7,10 +7,12 @@ export type Progress = {
   succeeded: number; failed: number; cancelled: number; unknown: number
   evaluations?: EvaluationProgress
 }
+export const runStatuses = ['pending', 'running', 'cancelling', 'completed', 'failed', 'cancelled'] as const
+export type RunStatus = typeof runStatuses[number]
 export type Experiment = {
   experiment_id: number; dataset_id: number; dataset_version_id: number; name: string
   experiment_config_id: number; config_group_id: string; config_version: number
-  status: 'pending' | 'running' | 'cancelling' | 'completed' | 'failed' | 'cancelled'
+  status: RunStatus
   repetitions: number; progress: Progress; created_at: string
   description?: string | null
   execution_config?: { runner_id?: string; agent_target_id?: string; timeout_seconds?: number; stream_output?: boolean }
@@ -62,10 +64,14 @@ export function getConfig(group: string, signal: AbortSignal) {
 export function getVersions(group: string, signal: AbortSignal) {
   return getAllPages<ExperimentConfig>(`/experiment-configs/${group}/versions`, signal)
 }
-export function getRuns(group: string, page: number, version: number | undefined, signal: AbortSignal) {
+export function getRuns({ page, group, version, status }: {
+  page: number; group?: string; version?: number; status?: RunStatus
+}, signal: AbortSignal) {
   const params = new URLSearchParams({ page: String(page), pagesize: '20' })
+  if (group) params.set('group_id', group)
   if (version) params.set('version', String(version))
-  return apiRequest<Page<Experiment>>(`/experiment-configs/${group}/runs?${params}`, { signal })
+  if (status) params.set('status', status)
+  return apiRequest<Page<Experiment>>(`/experiment-runs?${params}`, { signal })
 }
 export function getExperiment(id: number, signal: AbortSignal) {
   return apiRequest<Experiment>(`/experiments/${id}`, { signal })

@@ -7,6 +7,7 @@ import { errorMessage } from '../../lib/api'
 import { getExamples } from '../datasets/api'
 import { getVersions, startRun } from './api'
 import type { ExperimentConfig, RunInput } from './api'
+import { runDetailPath, runsForGroup } from './routes'
 
 export function RunDialog({ userId, latest, onClose }: {
   userId: number; latest: ExperimentConfig; onClose: () => void
@@ -62,9 +63,8 @@ function RunSamples({ userId, config, onClose, onBusy }: {
     onMutate: () => onBusy(true),
     onSettled: () => onBusy(false),
     onSuccess: (item) => {
-      void client.invalidateQueries({ queryKey: [...privateKey, userId, 'experiment-runs', config.config_group_id] })
-      const returnTo = `/experiments?group=${config.config_group_id}`
-      navigate(`/experiments/${item.experiment_id}`, { state: { returnTo } })
+      void client.invalidateQueries({ queryKey: [...privateKey, userId, 'experiment-runs'] })
+      navigate(runDetailPath(item.experiment_id), { state: { returnTo: runsForGroup(config.config_group_id) } })
     },
   })
 

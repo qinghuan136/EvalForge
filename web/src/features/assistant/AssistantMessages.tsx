@@ -1,4 +1,5 @@
 import { Link } from 'react-router'
+import { runDetailPath } from '../experiments/routes'
 import type { ConversationItem, ToolStatus } from './conversation'
 import { pageContextLabel } from './pageContext'
 
@@ -21,7 +22,7 @@ export function AssistantMessages({ items, preview, failed }: {
       {item.pageContext ? <small className="muted"> · {pageContextLabel(item.pageContext)}</small> : null}
       {item.temporary ? <small className="muted"> · 本轮消息</small> : null}
       <p>{item.text}</p>
-      {item.sourceExperimentId != null ? <Link to={`/experiments/${item.sourceExperimentId}`}>查看数据来源</Link> : null}
+      {item.sourceExperimentId != null ? <Link to={runDetailPath(item.sourceExperimentId)}>查看数据来源</Link> : null}
     </li> : <li key={item.id}>
       <details>
         <summary>执行详情 · {item.tools.length} 个工具</summary>

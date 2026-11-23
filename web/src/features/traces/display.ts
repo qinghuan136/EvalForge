@@ -21,6 +21,6 @@ export function statusLabel(code: number | null) {
 
 export function jobReturnTo(state: unknown): string | undefined {
   const destination = (state as { jobReturnTo?: unknown } | null)?.jobReturnTo
-  return typeof destination === 'string' && /^\/experiments\/[1-9]\d*\?/.test(destination)
+  return typeof destination === 'string' && /^\/(?:experiments|experiment-runs)\/[1-9]\d*\?/.test(destination)
     && new URLSearchParams(destination.split('?')[1]).has('job') ? destination : undefined
 }

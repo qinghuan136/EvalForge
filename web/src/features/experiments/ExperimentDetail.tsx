@@ -8,6 +8,7 @@ import { useAssistantPageContext } from '../assistant/AssistantPageContext'
 import { DatasetDetail } from '../datasets/DatasetsPage'
 import { cancelExperiment, getExperiment, getJob, getJobs, processed, statusLabels } from './api'
 import { JobOutputPreview } from './JobOutputPreview'
+import { configPath, runListReturnTo } from './routes'
 
 const jobStatuses = ['queued', 'assigned', 'running', 'succeeded', 'failed', 'cancelled', 'unknown']
 const active = (status?: string) => status === 'pending' || status === 'running' || status === 'cancelling'
@@ -91,7 +92,7 @@ function ExperimentDetailPage({ userId, id }: { userId: number; id: number }) {
     onSuccess: (result) => {
       client.setQueryData([...privateKey, userId, 'experiment', id], result)
       void client.invalidateQueries({ queryKey: [...privateKey, userId, 'jobs', id] })
-      void client.invalidateQueries({ queryKey: [...privateKey, userId, 'experiment-runs', result.config_group_id] })
+      void client.invalidateQueries({ queryKey: [...privateKey, userId, 'experiment-runs'] })
       setConfirm(false)
     },
   })
@@ -104,10 +105,9 @@ function ExperimentDetailPage({ userId, id }: { userId: number; id: number }) {
     if (key === 'status') next.delete('page')
     setParams(next, { replace: key === 'job', state: location.state })
   }
-  const back = (location.state as { returnTo?: string } | null)?.returnTo
-  const returnTo = back?.startsWith('/experiments?') ? back : item ? `/experiments?group=${item.config_group_id}` : '/experiments'
+  const returnTo = runListReturnTo(location.state)
   return <>
-    <header className="page-heading"><h1>{item?.name ?? 'Run 详情'}</h1>{item ? <p>Run #{item.experiment_id}　配置 v{item.config_version}　数据集 #{item.dataset_id}　版本 #{item.dataset_version_id}　{statusLabels[item.status] ?? item.status}</p> : null}<Link className="button page-action" to={returnTo}>返回运行历史</Link></header>
+    <header className="page-heading"><h1>{item?.name ?? 'Run 详情'}</h1>{item ? <p>Run #{item.experiment_id}　配置 v{item.config_version}　数据集 #{item.dataset_id}　版本 #{item.dataset_version_id}　{statusLabels[item.status] ?? item.status}</p> : null}<Link className="button page-action" to={returnTo}>返回 Run 列表</Link></header>
     {detail.isPending ? <p role="status">正在加载实验…</p> : null}
     {detail.isError ? <div><p className="error-message" role="alert">{errorMessage(detail.error)}</p><button className="button" onClick={() => void detail.refetch()}>重试</button></div> : null}
     {item ? <>
@@ -120,7 +120,10 @@ function ExperimentDetailPage({ userId, id }: { userId: number; id: number }) {
         <div className="overview-stack"><section className="detail-panel"><h2>评分进度</h2>{item.progress.evaluations ? <><p>已保存 / 应评 {item.progress.evaluations.completed} / {item.progress.evaluations.expected}</p><p>其中评分错误 {item.progress.evaluations.errors}</p>{item.status === 'cancelled' ? <p className="muted">已保存的评分仍可查看。</p> : null}</> : <p className="muted">暂无评分进度。</p>}</section>
           <section className="detail-panel"><h2>实验配置</h2><dl className="detail-list">
             <div><dt>数据集版本</dt><dd>#{item.dataset_version_id}</dd></div><div><dt>Runner</dt><dd>{item.execution_config?.runner_id ?? '暂无'}</dd></div><div><dt>Agent 目标 ID</dt><dd>{item.execution_config?.agent_target_id ?? '暂无'}</dd></div><div><dt>执行方式</dt><dd>{item.execution_config?.stream_output ? '流式' : '普通'}</dd></div><div><dt>超时</dt><dd>{item.execution_config?.timeout_seconds ?? '暂无'} 秒</dd></div><div><dt>重复次数</dt><dd>{item.repetitions}</dd></div><div><dt>评分配置</dt><dd>{item.evaluators?.map((e) => e.name).join('、') || '未配置'}</dd></div>
-          </dl><button className="button" onClick={() => setShowSamples(true)}>查看数据集版本样本</button></section></div>
+          </dl><div className="config-controls">
+            <button className="button" onClick={() => setShowSamples(true)}>查看数据集版本样本</button>
+            <Link className="button" to={configPath(item.config_group_id)}>查看配置组</Link>
+          </div></section></div>
       </div>
       <section className="jobs-section"><div className="jobs-heading"><h2>Job 明细</h2><label className="field">状态<select value={status} onChange={(event) => update('status', event.target.value)}><option value="">全部状态</option>{jobStatuses.map((value) => <option key={value} value={value}>{statusLabels[value]}</option>)}</select></label></div>
         {jobs.isPending ? <p className="panel-message" role="status">正在加载 Job…</p> : null}

@@ -1,4 +1,5 @@
 import { matchPath } from 'react-router'
+import { legacyRunDetailPattern, runDetailPattern } from '../experiments/routes'
 
 export type PageContext =
   | { type: 'experiment'; id: number }
@@ -7,7 +8,7 @@ export type PageContext =
   | { type: 'runner'; id: string }
 
 export function derivePageContext(pathname: string): PageContext | undefined {
-  const id = matchPath('/experiments/:experimentId', pathname)?.params.experimentId
+  const id = (matchPath(runDetailPattern, pathname) ?? matchPath(legacyRunDetailPattern, pathname))?.params.experimentId
   if (!id || !/^[1-9]\d*$/.test(id) || Number(id) > 2147483647) return undefined
   return { type: 'experiment', id: Number(id) }
 }

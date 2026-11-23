@@ -1,11 +1,13 @@
 import { useQuery } from '@tanstack/react-query'
-import { Navigate, Route, Routes, useLocation } from 'react-router'
+import { Navigate, Route, Routes, useLocation, useParams } from 'react-router'
 import { AuthPage } from '../features/auth/AuthPage'
 import { getSession } from '../features/auth/api'
 import { RunnersPage } from '../features/runners/RunnersPage'
 import { DatasetsPage } from '../features/datasets/DatasetsPage'
-import { ExperimentsPage } from '../features/experiments/ExperimentsPage'
+import { ExperimentConfigsPage } from '../features/experiments/ExperimentConfigsPage'
 import { ExperimentDetail } from '../features/experiments/ExperimentDetail'
+import { ExperimentRunsPage } from '../features/experiments/ExperimentRunsPage'
+import { configListPath, legacyRunDetailPattern, runDetailPath, runDetailPattern, runListPath } from '../features/experiments/routes'
 import { TracesPage } from '../features/traces/TracesPage'
 import { TraceDetailPage } from '../features/traces/TraceDetailPage'
 import { errorMessage } from '../lib/api'
@@ -57,8 +59,10 @@ export function App() {
       <Route path="/register" element={<Navigate replace to={destination} />} />
       <Route element={<Workspace user={user} />}>
         <Route path="/runners" element={<RunnersPage userId={user.id} />} />
-        <Route path="/experiments" element={<ExperimentsPage userId={user.id} />} />
-        <Route path="/experiments/:experimentId" element={<ExperimentDetail userId={user.id} />} />
+        <Route path={configListPath} element={<ExperimentConfigsPage userId={user.id} />} />
+        <Route path={runListPath} element={<ExperimentRunsPage userId={user.id} />} />
+        <Route path={runDetailPattern} element={<ExperimentDetail userId={user.id} />} />
+        <Route path={legacyRunDetailPattern} element={<LegacyRunDetail />} />
         <Route path="/traces" element={<TracesPage userId={user.id} />} />
         <Route path="/traces/:traceId" element={<TraceDetailPage userId={user.id} />} />
         <Route path="/datasets" element={<DatasetsPage userId={user.id} />} />
@@ -66,4 +70,10 @@ export function App() {
       <Route path="*" element={<Navigate replace to="/runners" />} />
     </Routes>
   )
+}
+
+function LegacyRunDetail() {
+  const { experimentId } = useParams()
+  const { search, hash, state } = useLocation()
+  return <Navigate replace to={{ pathname: runDetailPath(experimentId!), search, hash }} state={state} />
 }

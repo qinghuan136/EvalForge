@@ -170,6 +170,8 @@ a { color: var(--color-accent); }
 .experiment-filter { max-width: 320px; margin-bottom: 18px; }
 .config-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 8px; margin-bottom: 16px; }
 .config-controls .experiment-filter { margin-bottom: 0; }
+.run-filters .field { min-width: 0; max-width: 100%; }
+.run-filters :is(input, select) { max-width: 260px; }
 .run-scope input { accent-color: var(--color-accent); }
 .run-sample { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: start; gap: 8px; }
 .sample-input-preview { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

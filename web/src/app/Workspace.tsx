@@ -6,10 +6,12 @@ import { logout } from '../features/auth/api'
 import type { Session } from '../features/auth/api'
 import { AssistantController } from '../features/assistant/AssistantController'
 import { AssistantPageContextProvider } from '../features/assistant/AssistantPageContext'
+import { configListPath, runListPath } from '../features/experiments/routes'
 import { updateSession } from './queryClient'
 
 const navigation = [
-  { to: '/experiments', label: '实验' },
+  { to: configListPath, label: '实验配置' },
+  { to: runListPath, label: '实验 Run' },
   { to: '/traces', label: '调用链' },
   { to: '/datasets', label: '数据集' },
   { to: '/runners', label: 'Runners' },
