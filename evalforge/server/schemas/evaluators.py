@@ -1,6 +1,6 @@
 """平台规则目录、数据集评分配置和实验评分快照的接口契约。"""
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import AfterValidator, Field, JsonValue, field_validator
 
@@ -20,11 +20,9 @@ class InputMapping(Schema):
     literal_mapping: Annotated[dict[str, JsonValue], AfterValidator(validate_database_json)] = Field(default_factory=dict)
 
 
-class EvaluatorConfig(Schema):
+class NamedEvaluation(Schema):
     name: StoredText = Field(min_length=1, max_length=100)
-    evaluator_key: str = Field(min_length=1, max_length=100)
     description: StoredText | None = Field(default=None, max_length=2000)
-    input_mapping: InputMapping
 
     @field_validator("name", mode="before")
     @classmethod
@@ -32,9 +30,29 @@ class EvaluatorConfig(Schema):
         return value.strip() if isinstance(value, str) else value
 
 
+class EvaluatorConfig(NamedEvaluation):
+    evaluator_key: str = Field(min_length=1, max_length=100)
+    input_mapping: InputMapping
+
+
 class EvaluatorSnapshot(EvaluatorConfig):
     dataset_evaluator_id: PositiveDbId | None = None
     output_configs: list[dict[str, JsonValue]]
+
+
+class CodeEvaluationConfig(NamedEvaluation):
+    kind: Literal["CODE"]
+    code_evaluator_version_id: PositiveDbId
+
+
+class CodeEvaluationSnapshot(CodeEvaluationConfig):
+    code_evaluator_id: PositiveDbId
+    code_evaluator_name: str
+    code_evaluator_version_number: PositiveDbId
+
+
+ExperimentEvaluatorConfig = EvaluatorConfig | CodeEvaluationConfig
+ExperimentEvaluatorSnapshot = EvaluatorSnapshot | CodeEvaluationSnapshot
 
 
 class DatasetEvaluatorDetail(EvaluatorSnapshot):

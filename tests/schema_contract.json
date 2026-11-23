@@ -226,22 +226,15 @@
     "description": true,
     "metadata": false,
     "user_id": true,
-    "created_at": false
-  },
-  "code_evaluators": {
-    "id": false,
-    "kind": false,
-    "language": false,
-    "sandbox_config_id": true,
-    "input_mapping": false,
-    "output_configs": false,
-    "updated_at": false
+    "created_at": false,
+    "draft_source_code": true,
+    "archived_at": true
   },
   "code_evaluator_code_versions": {
     "id": false,
-    "code_evaluator_id": false,
+    "evaluator_id": false,
+    "version_number": false,
     "source_code": false,
-    "user_id": true,
     "created_at": false
   },
   "llm_evaluators": {

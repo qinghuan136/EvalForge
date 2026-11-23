@@ -167,6 +167,53 @@ class ExperimentAPITests(APITestCase):
         self.assertEqual(listing.json()["items"][0]["experiment_id"], full.json()["experiment_id"])
         self.assertEqual((await self.client.get(group + "/runs", params={"version": 2})).json()["total"], 0)
 
+    async def test_code_evaluator_bindings_are_owned_and_archive_only_blocks_new_configs(self):
+        root = "/api/v1/evaluators/code"
+
+        async def publish(client, name):
+            created = await client.post(root, json={"name": name})
+            self.assertEqual(created.status_code, 201, created.text)
+            path = f"{root}/{created.json()['id']}"
+            draft = await client.patch(path + "/draft", json={"source_code": "def evaluate(context): return {'score': 1}"})
+            self.assertEqual(draft.status_code, 200, draft.text)
+            version = await client.post(path + "/versions")
+            self.assertEqual(version.status_code, 201, version.text)
+            return created.json()["id"], path, version.json()["id"]
+
+        evaluator_id, path, version_id = await publish(self.client, "我的代码评分器")
+        other = self.new_client()
+        await self.register("bob", other)
+        await self.login(other, username="bob")
+        _, _, other_version = await publish(other, "他人的评分器")
+        configs = "/api/v1/experiment-configs"
+        code = {"kind": "CODE", "name": "订单得分", "code_evaluator_version_id": version_id}
+        for denied_id in (other_version, 2_147_483_647):
+            self.assert_error(await self.client.post(configs, json=self.config_payload(
+                evaluators=[{**code, "code_evaluator_version_id": denied_id}],
+            )), 404, "code_evaluator_version_not_found")
+        metrics = [self.evaluator_payload(), code]
+        config = await self.save_config(evaluators=metrics)
+        self.assertEqual(config["evaluators"][1], {
+            **code, "description": None, "code_evaluator_id": evaluator_id,
+            "code_evaluator_name": "我的代码评分器", "code_evaluator_version_number": 1,
+        })
+        self.assertEqual((await self.client.post(path + "/archive")).status_code, 200)
+        self.assert_error(await self.client.post(configs, json=self.config_payload(evaluators=metrics)),
+                          409, "code_evaluator_archived")
+        group = f"{configs}/{config['config_group_id']}"
+        self.assert_error(await self.client.post(group + "/versions", json={
+            "base_version": 1, "config": self.config_payload(description="草稿", evaluators=metrics),
+        }), 409, "code_evaluator_archived")
+        replacement = await self.client.post(group + "/versions", json={
+            "base_version": 1, "config": self.config_payload(evaluators=[metrics[0]]),
+        })
+        self.assertEqual(replacement.status_code, 201, replacement.text)
+        run_path = f"/api/v1/runners/{self.runner_id}/experiment-configs/{config['id']}/runs"
+        with patch.object(self.app.state.scheduler, "has_ready_runner", return_value=True):
+            run = await self.client.post(run_path, json={"dataset_version_id": self.v1})
+        self.assertEqual(run.status_code, 201, run.text)
+        self.assertEqual(run.json()["evaluators"], config["evaluators"])
+
     async def test_invalid_sample_scope_and_runner_leave_no_run(self):
         config = await self.save_config(dataset_version_id=self.v2)
         path = f"/api/v1/runners/{self.runner_id}/experiment-configs/{config['id']}/runs"

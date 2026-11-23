@@ -1,6 +1,6 @@
 # 核心 ORM
 
-基于 Phoenix commit `14c193cfa`，按云端 + 轻客户端方案调整。当前 ORM 注册 25 张表，覆盖实验配置、执行、身份与凭证、评测助手和 Trace。ConversationRecord / Entry 已接入助手业务，旧助手会话与消息表暂保留用于历史兼容。
+基于 Phoenix commit `14c193cfa`，按云端 + 轻客户端方案调整。当前 ORM 注册 24 张表，覆盖实验配置、执行、身份与凭证、评测助手和 Trace。ConversationRecord / Entry 已接入助手业务，旧助手会话与消息表暂保留用于历史兼容。
 本页介绍存储结构；应用启动不自动建表，部署方式见 [数据库说明](database.md)。
 
 ## 代码入口
@@ -14,7 +14,7 @@
 | `evalforge/db/orm/auth.py` | User、Runner、RunnerCredential；字段和 ER 图见 [鉴权数据结构](auth-schema.md) |
 | `evalforge/db/orm/assistant.py` | ConversationRecord / Entry 与过渡期旧会话、消息表；字段和 ER 图见 [Agent 会话与消息表设计](Agent会话与消息表设计.md) |
 | `evalforge/db/orm/traces.py` | Trace、Span；字段和 ER 图见 [Trace 与 Span 表设计](Trace与Span表设计.md) |
-| `evalforge/db/orm/evaluators.py` | 评分器公共定义、三个子类型、源码版本、数据集使用配置 |
+| `evalforge/db/orm/evaluators.py` | 评分器公共定义、Python 草稿与发布版本、LLM 和内置评分器子表、数据集使用配置 |
 | `evalforge/db/orm/experiment_configs.py` | ExperimentConfig，每行保存一个配置版本 |
 | `evalforge/db/models.py` | 统一导入和注册入口，Alembic 由此获得完整 metadata |
 
@@ -59,10 +59,40 @@ ExperimentConfig（一个配置版本）
 
 - PostgreSQL 业务 JSON 字段通常使用 JSONB。Span 原始明细使用 JSON，OTLP 纳秒时间使用 NUMERIC(20,0)；其他日期时间使用 TIMESTAMP WITH TIME ZONE。
 - `metadata_` 是 Python 属性名，对应数据库列 `metadata`。
-- Evaluator 使用 joined-table inheritance，通过 `(kind, id)` 复合外键关联子表。
+- LLM 和内置评分器通过 `(kind, id)` 关联各自的子表。Python 评分器使用单表继承，`CodeEvaluator` 映射到 `evaluators` 中 `kind=CODE` 的行。
 - JSON 配置暂存普通 dict / list；完整配置校验、名称格式校验和版本写入服务后续实现。
 - JSON 原地修改需重新赋值属性以确保 SQLAlchemy 跟踪，例如 `row.metadata_ = {**row.metadata_, "key": "value"}`。
 - 异步查询需要的关联请显式预加载，如 `selectinload(Experiment.jobs)`，避免隐式关系加载触发额外 I/O。
+
+## Python 评分器存储
+
+```mermaid
+erDiagram
+    evaluators ||--o{ code_evaluator_code_versions : "发布源码版本"
+    evaluators {
+        int id PK
+        string kind
+        string name UK
+        string description
+        int user_id
+        json metadata
+        text draft_source_code
+        datetime archived_at
+        datetime created_at
+    }
+    code_evaluator_code_versions {
+        int id PK
+        int evaluator_id FK
+        int version_number
+        text source_code
+        datetime created_at
+    }
+```
+
+- `evaluators.draft_source_code` 可空，保存当前草稿。CODE 评分器必须有 `user_id`。
+- 版本表的 `evaluator_id` 直接引用 `evaluators.id`。`version_number` 为正整数，同一评分器内唯一。源码和发布时间保存在版本行。
+- 配置和 Run 的 JSON 快照以 `code_evaluator_version_id` 引用不可变的发布版本。归档后，已保存的快照仍可读取版本源码。评分结果保存在 `experiment_run_annotations`（`JobEvaluation`）。
+- 归档设置 `evaluators.archived_at`，保留草稿和全部发布版本。已有数据库使用 [Alembic 迁移](../migrations/versions/README.md) 更新结构。
 
 ## 已实现的约束
 
@@ -87,11 +117,9 @@ ExperimentConfig（一个配置版本）
 
 | 字段位置 | 未来目标 |
 | --- | --- |
-| Dataset、DatasetVersion、Evaluator、CodeEvaluatorVersion、DatasetEvaluators 的 user_id | users.id（表已实现，这些旧模块的外键另行接入） |
+| Dataset、DatasetVersion、Evaluator、DatasetEvaluators 的 user_id | users.id（表已实现，这些旧模块的外键另行接入） |
 | DatasetExample.span_rowid | spans.id（表已实现，数据集关联另行接入） |
 | LLMEvaluator.prompt_id / prompt_version_tag_id | prompts.id / prompt_version_tags.id |
-| CodeEvaluator.language / sandbox_config_id | languages.name / sandbox_configs.id |
-| CodeEvaluator 的 sandbox_config_id + language | sandbox_configs 的 id + language |
 | DatasetEvaluators.project_id | projects.id（当前可空，按数据集归属校验访问） |
 
 字段的 Column.info、复合约束的 Table.info 保存目标信息，供后续补迁移时参考；它们本身不生成 SQL 约束。
@@ -108,7 +136,7 @@ users、traces 和 spans 已有真实模型；Prompt、沙箱等仍未建表。
 模型专项测试使用内存 SQLite 真正执行建表、写入、查询和约束失败；另行编译全部 PostgreSQL DDL，验证 JSONB、时区字段及复合外键。
 这些不替代真实 PostgreSQL 集成测试。
 
-25 张表纳入 ORM 契约。配置测试覆盖版本唯一性、多个 Run 引用同一版本、受引用版本的删除保护，以及 Run 的非空配置外键。
+24 张表纳入 ORM 契约。配置测试覆盖版本唯一性、多个 Run 引用同一版本、受引用版本的删除保护，以及 Run 的非空配置外键。
 
 实例就绪后生成迁移：
 

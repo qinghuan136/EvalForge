@@ -19,6 +19,7 @@ dependencies = [
     "redis>=8.1,<9",
     "fastapi>=0.115,<1",
     "uvicorn>=0.30,<1",
+    "httpx>=0.28,<1",
     "pydantic>=2.9,<3",
     "pydantic-ai-slim[openai]>=2.68,<3",
     "argon2-cffi>=25.1,<26",
@@ -30,7 +31,6 @@ dependencies = [
 
 [project.optional-dependencies]
 test = [
-    "httpx>=0.28,<1",
     "aiosqlite>=0.21,<1",
     "fakeredis[lua]>=2.30,<3",
     "cryptography>=46,<49",

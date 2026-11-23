@@ -49,7 +49,7 @@ async def config_values(db: AsyncSession, owner_id: int, data: ExperimentConfigS
         if version is None:
             raise APIError(404, "dataset_version_not_found", "数据集版本不存在")
     await require_runner(db, owner_id, data.runner_id)
-    snapshots = (build_experiment_evaluator_snapshots(data.evaluators) if data.evaluators
+    snapshots = (await build_experiment_evaluator_snapshots(db, owner_id, data.evaluators) if data.evaluators
                  else await load_evaluator_snapshots(db, data.dataset_id, data.dataset_evaluator_ids))
     return {**data.model_dump(exclude={"evaluators", "dataset_evaluator_ids"}),
             "evaluators": [snapshot.model_dump(mode="json") for snapshot in snapshots]}

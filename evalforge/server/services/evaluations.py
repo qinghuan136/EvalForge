@@ -2,41 +2,73 @@
 
 from datetime import datetime, timezone
 
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from evalforge.db import Database
-from evalforge.db.models import Experiment, Job, JobEvaluation
+from evalforge.db.models import CodeEvaluator, CodeEvaluatorVersion, Experiment, Job, JobEvaluation
 from evalforge.models import EvaluationResult
 
+from ..errors import APIError
 from ..evaluators.execution import evaluate_builtin
 from ..evaluators.input_mapping import resolve_inputs
+from ..evaluators.snekbox import SnekboxClient
 from ..experiment_runtime import EvaluationWorkItem
-from ..schemas.evaluators import EvaluatorSnapshot
+from ..schemas.code_evaluators import CodeEvaluatorContext
+from ..schemas.evaluators import CodeEvaluationSnapshot, ExperimentEvaluatorSnapshot
 from .evaluation_queries import SCORABLE_EXPERIMENT_STATES, missing_evaluations
 from .experiment_lifecycle import settle_experiment
 
+SNAPSHOT = TypeAdapter(ExperimentEvaluatorSnapshot)
+
 
 class EvaluationService:
-    def __init__(self, database: Database):
+    def __init__(self, database: Database, sandbox: SnekboxClient | None = None):
         self.database = database
+        self.sandbox = sandbox
 
     async def run(self, item: EvaluationWorkItem) -> str | None:
         started = datetime.now(timezone.utc)
-        result, error = EvaluationResult(), None
         try:
-            snapshot = EvaluatorSnapshot.model_validate(item.snapshot)
-            inputs = resolve_inputs(snapshot.input_mapping, item.context)
-        except (ValidationError, ValueError):
-            error = "评分输入配置无效或路径缺失"
-        else:
-            try:
+            snapshot = SNAPSHOT.validate_python(item.snapshot)
+            if isinstance(snapshot, CodeEvaluationSnapshot):
+                result, error = await self._evaluate_code(item, snapshot)
+            else:
+                inputs = resolve_inputs(snapshot.input_mapping, item.context)
                 result, error = await evaluate_builtin(snapshot.evaluator_key, inputs)
-            except TimeoutError:
-                error = "评分执行超时"
+        except (ValidationError, ValueError):
+            result, error = EvaluationResult(), "评分输入配置无效或路径缺失"
+        except TimeoutError:
+            result, error = EvaluationResult(), "评分执行超时"
         return await self._save(item, result, error, started)
+
+    async def _evaluate_code(self, item: EvaluationWorkItem,
+                             snapshot: CodeEvaluationSnapshot) -> tuple[EvaluationResult, str | None]:
+        if self.sandbox is None:
+            return EvaluationResult(), "评分沙箱尚未配置"
+        context = CodeEvaluatorContext.model_validate(item.context)
+        version = CodeEvaluatorVersion
+        # 归档只影响新绑定。通过 Run 所有者限制历史版本的读取范围。
+        async with self.database.transaction() as db:
+            source_code = await db.scalar(
+                select(version.source_code)
+                .join(CodeEvaluator, version.evaluator_id == CodeEvaluator.id)
+                .join(Experiment, Experiment.user_id == CodeEvaluator.user_id)
+                .join(Job, Job.experiment_id == Experiment.id)
+                .where(Job.id == item.job_pk, version.id == snapshot.code_evaluator_version_id,
+                       version.evaluator_id == snapshot.code_evaluator_id)
+            )
+        if source_code is None:
+            return EvaluationResult(), "评分器发布版本不可用"
+        try:
+            outcome = await self.sandbox.execute(source_code, context)
+        except APIError as exc:
+            return EvaluationResult(), exc.message
+        if outcome.status == "failed":
+            return EvaluationResult(), outcome.error.message
+        return EvaluationResult(**outcome.result.model_dump()), None
 
     async def _save(self, item: EvaluationWorkItem, result: EvaluationResult, error: str | None,
                     started: datetime) -> str | None:

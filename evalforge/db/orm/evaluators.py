@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import CheckConstraint, ForeignKey, ForeignKeyConstraint, Index, String, UniqueConstraint, func, text
+from sqlalchemy import CheckConstraint, ForeignKey, ForeignKeyConstraint, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from ..base import HasId, JSON_VALUE, UTC_TIMESTAMP, deferred_reference
@@ -13,6 +13,7 @@ class Evaluator(HasId):
     __tablename__ = "evaluators"
     __table_args__ = (
         CheckConstraint("kind IN ('LLM', 'CODE', 'BUILTIN')", name="valid_evaluator_kind"),
+        CheckConstraint("kind <> 'CODE' OR user_id IS NOT NULL", name="code_evaluator_has_owner"),
         UniqueConstraint("kind", "id"),
     )
     __mapper_args__ = {"polymorphic_on": "kind", "polymorphic_abstract": True}
@@ -44,41 +45,25 @@ class LLMEvaluator(Evaluator):
 
 
 class CodeEvaluator(Evaluator):
-    __tablename__ = "code_evaluators"
-    __table_args__ = (
-        CheckConstraint("kind = 'CODE'", name="valid_type"),
-        ForeignKeyConstraint(["kind", "id"], ["evaluators.kind", "evaluators.id"], ondelete="CASCADE"),
-        {"info": {"deferred_foreign_key_constraints": [{
-            "columns": ["sandbox_config_id", "language"],
-            "targets": ["sandbox_configs.id", "sandbox_configs.language"],
-        }]}},
-    )
     __mapper_args__ = {"polymorphic_identity": "CODE"}
 
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=False)
-    kind: Mapped[str] = mapped_column(server_default="CODE")
-    language: Mapped[str] = deferred_reference("languages.name", nullable=False, index=True, ondelete="RESTRICT", column_type=String)
-    sandbox_config_id: Mapped[int | None] = deferred_reference("sandbox_configs.id", index=True)
-    input_mapping: Mapped[dict[str, Any]] = mapped_column(
-        JSON_VALUE, default=lambda: {"literal_mapping": {}, "path_mapping": {}},
-        server_default=text("'{\"literal_mapping\": {}, \"path_mapping\": {}}'"),
-    )
-    output_configs: Mapped[list[dict[str, Any]]] = mapped_column(JSON_VALUE, default=list, server_default=text("'[]'"))
-    updated_at: Mapped[datetime] = mapped_column(UTC_TIMESTAMP, server_default=func.now(), onupdate=func.now())
-
+    # CODE 专用字段直接存放在 evaluators 表中。
+    draft_source_code: Mapped[str | None] = mapped_column(Text)
+    archived_at: Mapped[datetime | None] = mapped_column(UTC_TIMESTAMP)
     versions: Mapped[list["CodeEvaluatorVersion"]] = relationship(back_populates="code_evaluator", cascade="all, delete-orphan", passive_deletes=True)
 
 
 class CodeEvaluatorVersion(HasId):
     __tablename__ = "code_evaluator_code_versions"
     __table_args__ = (
-        Index("ix_code_evaluator_code_versions_code_evaluator_id_id", "code_evaluator_id", "id"),
+        UniqueConstraint("evaluator_id", "version_number"),
+        CheckConstraint("version_number > 0", name="positive_version_number"),
         {"sqlite_autoincrement": True},
     )
 
-    code_evaluator_id: Mapped[int] = mapped_column(ForeignKey("code_evaluators.id", ondelete="CASCADE"))
-    user_id: Mapped[int | None] = deferred_reference("users.id", index=True)
-    source_code: Mapped[str] = mapped_column(server_default="")
+    evaluator_id: Mapped[int] = mapped_column(ForeignKey("evaluators.id", ondelete="CASCADE"))
+    version_number: Mapped[int]
+    source_code: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UTC_TIMESTAMP, server_default=func.now())
 
     code_evaluator: Mapped["CodeEvaluator"] = relationship(back_populates="versions")

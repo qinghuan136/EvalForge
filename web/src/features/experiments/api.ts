@@ -18,21 +18,29 @@ export type Experiment = {
   execution_config?: { runner_id?: string; agent_target_id?: string; timeout_seconds?: number; stream_output?: boolean }
   evaluators?: Evaluator[]
 }
-export type Evaluator = EvaluatorConfig & { dataset_evaluator_id: number | null; output_configs: unknown[] }
+export type Evaluator =
+  | (BuiltinEvaluationConfig & { dataset_evaluator_id: number | null; output_configs: unknown[] })
+  | (CodeEvaluationConfig & {
+    code_evaluator_id: number
+    code_evaluator_name: string
+    code_evaluator_version_number: number
+  })
 export type EvaluatorDefinition = {
   key: string
   description: string
+  output_configs: unknown[]
   input_schema: {
     properties: Record<string, { type?: string; default?: unknown }>
     required?: string[]
   }
 }
-export type EvaluatorConfig = {
-  name: string
+type NamedEvaluation = { name: string; description?: string | null }
+export type BuiltinEvaluationConfig = NamedEvaluation & {
   evaluator_key: string
-  description?: string | null
   input_mapping: { path_mapping: Record<string, string>; literal_mapping: Record<string, unknown> }
 }
+type CodeEvaluationConfig = NamedEvaluation & { kind: 'CODE'; code_evaluator_version_id: number }
+export type EvaluatorConfig = BuiltinEvaluationConfig | CodeEvaluationConfig
 export type Job = {
   job_id: string; example_id: number; repetition_number: number; status: string
   duration_ms: number | null; http_status: number | null; evaluation_progress: EvaluationProgress
@@ -101,11 +109,14 @@ export function getJob(id: number, job: string, signal: AbortSignal) {
 export function jobEventsUrl(id: number, job: string) {
   return `/api/v1/experiments/${id}/jobs/${encodeURIComponent(job)}/events`
 }
-export async function getAllPages<T>(path: string, signal: AbortSignal) {
+export async function getAllPages<T>(path: string, signal: AbortSignal, filters?: Record<string, string>) {
   const items: T[] = []
+  const params = new URLSearchParams(filters)
+  params.set('pagesize', '100')
   let page = 1
   while (true) {
-    const response = await apiRequest<Page<T>>(`${path}?page=${page}&pagesize=100`, { signal })
+    params.set('page', String(page))
+    const response = await apiRequest<Page<T>>(`${path}?${params}`, { signal })
     items.push(...response.items)
     if (!response.items.length || items.length >= response.total) return items
     page++

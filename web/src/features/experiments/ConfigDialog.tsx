@@ -5,6 +5,7 @@ import { privateKey } from '../../app/queryClient'
 import { Dialog } from '../../components/ui/Dialog'
 import { errorMessage } from '../../lib/api'
 import type { Dataset } from '../datasets/api'
+import type { CodeEvaluator } from '../evaluators/api'
 import type { Runner } from '../runners/api'
 import { getAllPages, getBuiltinEvaluators, saveConfig } from './api'
 import type { ConfigInput, EvaluatorDefinition, ExperimentConfig } from './api'
@@ -22,6 +23,8 @@ export function ConfigDialog(props: Props) {
     queryFn: ({ signal }) => getAllPages<Runner>('/runners', signal) })
   const catalog = useQuery({ queryKey: [...privateKey, userId, 'builtin-evaluators'],
     queryFn: ({ signal }) => getBuiltinEvaluators(signal) })
+  const codeCatalog = useQuery({ queryKey: [...privateKey, userId, 'code-evaluators', 'published'],
+    queryFn: ({ signal }) => getAllPages<CodeEvaluator>('/evaluators/code', signal, { published_only: 'true' }) })
   const save = useMutation({
     mutationFn: (data: ConfigInput) => saveConfig(data, base),
     onSuccess: () => {
@@ -29,20 +32,24 @@ export function ConfigDialog(props: Props) {
       onClose()
     },
   })
-  const loadError = runners.error || catalog.error
+  const loadError = runners.error || catalog.error || codeCatalog.error
   return <Dialog title={base ? `编辑实验配置 v${base.version}` : '新建实验配置'} onClose={onClose} busy={save.isPending}>
-    {runners.data && catalog.data
-      ? <ConfigForm {...props} runners={runners.data} definitions={catalog.data}
+    {runners.data && catalog.data && codeCatalog.data
+      ? <ConfigForm {...props} runners={runners.data} definitions={catalog.data} codeEvaluators={codeCatalog.data}
           busy={save.isPending} saveError={save.error} onSave={save.mutate} />
       : <div className="dialog-body">{loadError
         ? <><p className="error-message" role="alert">{errorMessage(loadError)}</p><button className="button"
-            onClick={() => { if (runners.isError) void runners.refetch(); if (catalog.isError) void catalog.refetch() }}>重试</button></>
+            onClick={() => {
+              if (runners.isError) void runners.refetch()
+              if (catalog.isError) void catalog.refetch()
+              if (codeCatalog.isError) void codeCatalog.refetch()
+            }}>重试</button></>
         : <p role="status">正在加载 Runner 和评分器…</p>}</div>}
   </Dialog>
 }
 
-function ConfigForm({ datasets, initialId, base, onClose, runners, definitions, busy, saveError, onSave }: Props & {
-  runners: Runner[]; definitions: EvaluatorDefinition[]; busy: boolean; saveError: Error | null
+function ConfigForm({ userId, datasets, initialId, base, onClose, runners, definitions, codeEvaluators, busy, saveError, onSave }: Props & {
+  runners: Runner[]; definitions: EvaluatorDefinition[]; codeEvaluators: CodeEvaluator[]; busy: boolean; saveError: Error | null
   onSave: (data: ConfigInput) => void
 }) {
   const [datasetId, setDatasetId] = useState(base?.dataset_id ?? initialId)
@@ -70,12 +77,13 @@ function ConfigForm({ datasets, initialId, base, onClose, runners, definitions, 
       timeout_seconds: Number(form.get('timeout')), repetitions: Number(form.get('repetitions')),
       stream_output: form.has('stream'),
     }
-    const references = base?.evaluators.flatMap((item) => item.dataset_evaluator_id === null ? [] : [item.dataset_evaluator_id])
+    const references = base?.evaluators.flatMap((item) =>
+      'dataset_evaluator_id' in item && item.dataset_evaluator_id !== null ? [item.dataset_evaluator_id] : [])
     try {
       if (base && references?.length && references.length === drafts.length && !evaluatorsChanged && datasetId === base.dataset_id) {
         values.dataset_evaluator_ids = references
       } else {
-        values.evaluators = evaluationConfigs(drafts, definitions)
+        values.evaluators = evaluationConfigs(drafts, definitions, codeEvaluators)
       }
     } catch (error) {
       setLocalError(error instanceof Error ? error.message : '评分配置无效。')
@@ -102,9 +110,9 @@ function ConfigForm({ datasets, initialId, base, onClose, runners, definitions, 
     <label className="field">Agent 目标 ID<input name="target" defaultValue={base?.agent_target_id} maxLength={128} required placeholder="Runner 本地配置中的目标 ID" /></label>
     <label className="field">重复次数<input name="repetitions" type="number" min="1" max="100" defaultValue={base?.repetitions ?? 1} required /></label>
     <label className="field">超时（秒）<input name="timeout" type="number" min="0.001" max="3600" step="any" defaultValue={base?.timeout_seconds ?? 60} required /></label>
-    <EvaluationEditor drafts={drafts} definitions={definitions} disabled={busy}
+    <EvaluationEditor userId={userId} drafts={drafts} definitions={definitions} codeEvaluators={codeEvaluators} disabled={busy}
       onAdd={() => {
-        const draft = { id: nextDraftId.current++, name: '', rule: '', parameters: {} }
+        const draft: EvaluationDraft = { id: nextDraftId.current++, kind: 'builtin', name: '', rule: '', parameters: {} }
         setDrafts((items) => [...items, draft]); setEvaluatorsChanged(true)
       }}
       onChange={(draft) => { setDrafts((items) => items.map((item) => item.id === draft.id ? draft : item)); setEvaluatorsChanged(true) }}

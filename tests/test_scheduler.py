@@ -1,6 +1,8 @@
 """调度异常路径使用 SQLite 事务与可控的 Runner 回执。"""
 
 import asyncio
+import base64
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -9,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import fakeredis.aioredis
+import httpx
 from sqlalchemy import select
 
 from api_support import SQLiteDatabase
@@ -17,16 +20,20 @@ from evalforge.db.models import (
     Base, Dataset, DatasetExample, DatasetExampleRevision, DatasetVersion, Experiment, Job,
     JobEvaluation, Runner, RunnerAttempt, User,
 )
+from evalforge.server.evaluators.snekbox import SnekboxClient
 from evalforge.server.runner_auth import RunnerIdentity
 from evalforge.server.runner_connections import RegisteredConnection, RunnerConnections
 from evalforge.server.scheduler import Scheduler
 from evalforge.server.schemas.attempts import AttemptResult
+from evalforge.server.schemas.code_evaluators import CodeEvaluatorCreate
 from evalforge.server.schemas.evaluators import EvaluatorConfig
-from evalforge.server.schemas.experiments import ExperimentCreate
+from evalforge.server.schemas.experiments import ExperimentConfigSave, ExperimentCreate, ExperimentRunCreate
 from evalforge.server.services.attempts import AttemptService
+from evalforge.server.services.code_evaluators import CodeEvaluatorService
 from evalforge.server.services.dispatch import DispatchClaim, DispatchService
 from evalforge.server.services.evaluations import EvaluationService
 from evalforge.server.services.evaluators import DatasetEvaluatorService
+from evalforge.server.services.experiment_configs import ExperimentConfigService
 from evalforge.server.services.experiments import ExperimentService
 from evalforge.server.services.runtime_loader import RuntimeLoader
 
@@ -208,6 +215,73 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         async with self.database.transaction() as db:
             score = await db.scalar(select(JobEvaluation))
             self.assertEqual((score.name, score.score, score.error), ("answer_match", 1.0, None))
+
+    async def test_archived_published_code_executes_after_task_commit_and_records_outcomes(self):
+        runner_id = "code-scoring"
+        async with self.database.transaction() as db:
+            db.add(Runner(runner_id=runner_id, name=runner_id, owner_user_id=self.owner_id))
+            dataset_version_id = await db.scalar(select(DatasetVersion.id))
+        await self.connections.register(runner_id, RegisteredConnection(
+            session_id="initial", phase="ready", capabilities=["http_json"],
+        ), 60)
+        owner = self.owner_id
+        evaluators = CodeEvaluatorService(self.database)
+        evaluator = await evaluators.create(owner, 1, CodeEvaluatorCreate(name="order-code"))
+        source_v1 = "def evaluate(context): return {'score': 0.75, 'label': 'match', 'explanation': 'details'}"
+        source_v2 = "def evaluate(context): return {'score': 0.25}"
+        versions = []
+        for source in (source_v1, source_v2):
+            await evaluators.save_draft(owner, 1, evaluator.id, source)
+            versions.append(await evaluators.publish(owner, 1, evaluator.id))
+        await evaluators.save_draft(owner, 1, evaluator.id, "# draft is not a published version")
+        config = await ExperimentConfigService(self.database).create(owner, 1, ExperimentConfigSave(
+            name="score versions", dataset_id=self.dataset_id, runner_id=runner_id, agent_target_id="agent",
+            evaluators=[{"kind": "CODE", "name": f"score_v{version.version_number}",
+                         "code_evaluator_version_id": version.id} for version in versions],
+        ))
+        await evaluators.archive(owner, 1, evaluator.id)
+        detail = await self.experiments.start_run(owner, 1, config.id, ExperimentRunCreate(
+            dataset_version_id=dataset_version_id,
+        ))
+        forwarded = []
+
+        def sandbox(request):
+            self.assertEqual((request.method, request.url.path), ("POST", "/eval"))
+            files = {file["path"]: base64.b64decode(file["content"]) for file in json.loads(request.content)["files"]}
+            source = files["evaluator.py"].decode()
+            forwarded.append(source)
+            self.assertEqual(json.loads(files["context.json"]), {
+                "input": {"value": 1}, "reference": {"answer": "你好"}, "output": {"reply": "你好"}, "metadata": {},
+            })
+            if source == source_v2:
+                return httpx.Response(200, json={"returncode": 137, "stdout": "internal output", "files": []})
+            result = base64.b64encode(b'{"score":0.75,"label":"match","explanation":"details"}').decode()
+            return httpx.Response(200, json={"returncode": 0, "stdout": "", "files": [
+                {"path": "result.json", "content": result},
+            ]})
+
+        http = httpx.AsyncClient(base_url="http://snekbox.test", transport=httpx.MockTransport(sandbox))
+        self.addAsyncCleanup(http.aclose)
+        scheduler = self.make_scheduler(EvaluationService(self.database, SnekboxClient(http)))
+        identity = RunnerIdentity(runner_id, owner, 1, datetime.max.replace(tzinfo=timezone.utc), b"")
+        session = Session(identity, AsyncMock(return_value={"accepted": True}))
+        scheduler.start()
+        await scheduler.session_ready(session)
+        await self.until(lambda: session.peer.call.await_count == 1 and not scheduler._dispatches)
+        self.assertEqual(forwarded, [])
+        await self.complete(scheduler, session, session.peer.call.call_args.args[1])
+        await self.until(lambda: len(forwarded) == 2 and not scheduler._eval_tasks)
+        self.assertCountEqual(forwarded, [source_v1, source_v2])
+        result = await self.experiments.get(owner, detail.experiment_id)
+        self.assertEqual((result.status, result.progress.succeeded), ("completed", 1))
+        self.assertEqual(result.progress.evaluations.model_dump(), {"expected": 2, "completed": 2, "errors": 1})
+        async with self.database.transaction() as db:
+            scores = {row.name: (row.score, row.label, row.explanation, row.error)
+                      for row in await db.scalars(select(JobEvaluation))}
+        self.assertEqual(scores, {
+            "score_v1": (0.75, "match", "details", None),
+            "score_v2": (None, None, None, "代码执行超过沙箱资源限制"),
+        })
 
     async def test_runner_ready_recovers_only_its_missing_evals_and_startup_does_not_scan(self):
         metric_ids = [await self.create_metric("already_saved"), await self.create_metric("new_score"),

@@ -51,8 +51,14 @@ class ServerSettings:
     assistant_timeout_seconds: int = 90
     assistant_lease_seconds: int = 180
     assistant_heartbeat_seconds: int = 60
+    snekbox_url: str | None = None
 
     def __post_init__(self):
+        if self.snekbox_url is not None:
+            origin_of(self.snekbox_url)
+            url = urlsplit(self.snekbox_url)
+            if url.path not in ("", "/") or url.query or url.fragment:
+                raise ValueError("EVALFORGE_SNEKBOX_URL must be an HTTP(S) base URL without a path")
         if len(set(self.assistant_models)) != len(self.assistant_models) or any(
             not name.strip() or len(name) > 200 for name in self.assistant_models
         ):
@@ -141,4 +147,5 @@ class ServerSettings:
             assistant_timeout_seconds=int(values.get("EVALFORGE_ASSISTANT_TIMEOUT_SECONDS", "90")),
             assistant_lease_seconds=int(values.get("EVALFORGE_ASSISTANT_LEASE_SECONDS", "180")),
             assistant_heartbeat_seconds=int(values.get("EVALFORGE_ASSISTANT_HEARTBEAT_SECONDS", "60")),
+            snekbox_url=values.get("EVALFORGE_SNEKBOX_URL") or None,
         )

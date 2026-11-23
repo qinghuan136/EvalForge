@@ -3,6 +3,7 @@
 from contextlib import AsyncExitStack, asynccontextmanager
 from collections.abc import Callable
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from redis.asyncio import Redis
@@ -12,6 +13,7 @@ from evalforge.redis import RedisSettings, RedisStore
 
 from .config import ServerSettings
 from .errors import install_handlers
+from .evaluators.snekbox import SnekboxClient
 from .routes.assistant import router as assistant_router
 from .routes.assistant import routed_router as routed_assistant_router
 from .routes.auth import router as auth_router
@@ -32,6 +34,7 @@ from .scheduler import Scheduler
 from .security import Passwords
 from .services.assistant import AssistantService
 from .services.auth import AuthService
+from .services.code_evaluators import CodeEvaluatorService
 from .services.datasets import DatasetService
 from .services.runners import RunnerService
 from .services.attempts import AttemptService
@@ -48,12 +51,20 @@ from .sessions import SessionStore
 
 def create_app(settings: ServerSettings | None = None, *, database: Database | None = None,
                redis_client: Redis | None = None,
+               snekbox_transport: httpx.AsyncBaseTransport | None = None,
                configure_runner_rpc: Callable[[JsonRpcPeer, RunnerIdentity], None] | None = None) -> FastAPI:
     config = settings or ServerSettings.from_env()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         async with AsyncExitStack() as resources:
+            app.state.snekbox = None
+            if config.snekbox_url is not None:
+                http = await resources.enter_async_context(httpx.AsyncClient(
+                    base_url=config.snekbox_url, transport=snekbox_transport,
+                    trust_env=False, follow_redirects=False, timeout=httpx.Timeout(15, connect=3),
+                ))
+                app.state.snekbox = SnekboxClient(http)
             db = database if database is not None else await resources.enter_async_context(Database(DatabaseSettings.from_env()))
             redis = redis_client
             if redis is None:
@@ -71,13 +82,14 @@ def create_app(settings: ServerSettings | None = None, *, database: Database | N
             app.state.runner_sessions = RunnerSessionManager(
                 connections, attempts, runner_auth=app.state.runner_auth)
             resources.push_async_callback(app.state.runner_sessions.close)
-            scheduler = Scheduler(DispatchService(db), RuntimeLoader(db), EvaluationService(db))
+            scheduler = Scheduler(DispatchService(db), RuntimeLoader(db), EvaluationService(db, app.state.snekbox))
             app.state.scheduler = scheduler
             app.state.runner_sessions.on_ready = scheduler.session_ready
             app.state.runner_sessions.on_closed = scheduler.session_closed
             app.state.runner_sessions.on_complete = scheduler.task_completed
             app.state.datasets = DatasetService(db)
             app.state.dataset_evaluators = DatasetEvaluatorService(db)
+            app.state.code_evaluators = CodeEvaluatorService(db)
             app.state.experiment_configs = ExperimentConfigService(db)
             app.state.experiments = ExperimentService(
                 db, connections, on_created=scheduler.experiment_created, on_cancelled=scheduler.experiment_cancelled)

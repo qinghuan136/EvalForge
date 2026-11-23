@@ -87,7 +87,9 @@ function Configs({ userId, group }: { userId: number; group: string | null }) {
         <div><dt>重复次数</dt><dd>{latest.repetitions}</dd></div>
         <div><dt>超时</dt><dd>{latest.timeout_seconds} 秒</dd></div>
         <div><dt>执行方式</dt><dd>{latest.stream_output ? '流式' : '普通'}</dd></div>
-        <div><dt>评分配置</dt><dd>{latest.evaluators.map((item) => item.name).join('、') || '未配置'}</dd></div>
+        <div><dt>评分配置</dt><dd>{latest.evaluators.map((item) => 'kind' in item
+          ? `${item.name}（${item.code_evaluator_name} v${item.code_evaluator_version_number}）` : item.name
+        ).join('、') || '未配置'}</dd></div>
       </dl>
       <div className="config-controls">
         <button className="button button-primary" onClick={() => setRun(latest)}>启动 Run</button>

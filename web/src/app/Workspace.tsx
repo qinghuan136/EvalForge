@@ -12,6 +12,7 @@ import { updateSession } from './queryClient'
 const navigation = [
   { to: configListPath, label: '实验配置' },
   { to: runListPath, label: '实验 Run' },
+  { to: '/evaluators', label: '评分器' },
   { to: '/traces', label: '调用链' },
   { to: '/datasets', label: '数据集' },
   { to: '/runners', label: 'Runners' },

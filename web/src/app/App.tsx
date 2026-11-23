@@ -1,9 +1,11 @@
+import { lazy, Suspense } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Navigate, Route, Routes, useLocation, useParams } from 'react-router'
 import { AuthPage } from '../features/auth/AuthPage'
 import { getSession } from '../features/auth/api'
 import { RunnersPage } from '../features/runners/RunnersPage'
 import { DatasetsPage } from '../features/datasets/DatasetsPage'
+import { BuiltinEvaluatorPage, EvaluatorLibrary } from '../features/evaluators/EvaluatorLibrary'
 import { ExperimentConfigsPage } from '../features/experiments/ExperimentConfigsPage'
 import { ExperimentDetail } from '../features/experiments/ExperimentDetail'
 import { ExperimentRunsPage } from '../features/experiments/ExperimentRunsPage'
@@ -13,6 +15,8 @@ import { TraceDetailPage } from '../features/traces/TraceDetailPage'
 import { errorMessage } from '../lib/api'
 import { Workspace } from './Workspace'
 import { sessionKey } from './queryClient'
+
+const EvaluatorEditor = lazy(() => import('../features/evaluators/EvaluatorEditor'))
 
 export function App() {
   const location = useLocation()
@@ -66,6 +70,13 @@ export function App() {
         <Route path="/traces" element={<TracesPage userId={user.id} />} />
         <Route path="/traces/:traceId" element={<TraceDetailPage userId={user.id} />} />
         <Route path="/datasets" element={<DatasetsPage userId={user.id} />} />
+        <Route path="/evaluators" element={<EvaluatorLibrary userId={user.id} />} />
+        <Route path="/evaluators/builtin/:key" element={<BuiltinEvaluatorPage userId={user.id} />} />
+        <Route path="/evaluators/code/:evaluatorId" element={
+          <Suspense fallback={<p className="panel-message" role="status">正在加载编辑器…</p>}>
+            <EvaluatorEditor userId={user.id} />
+          </Suspense>
+        } />
       </Route>
       <Route path="*" element={<Navigate replace to="/runners" />} />
     </Routes>

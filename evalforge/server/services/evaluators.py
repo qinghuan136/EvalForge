@@ -7,15 +7,16 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from evalforge.db import Database
-from evalforge.db.models import BuiltinEvaluator, DatasetEvaluators, Evaluator
+from evalforge.db.models import BuiltinEvaluator, CodeEvaluator, CodeEvaluatorVersion, DatasetEvaluators, Evaluator
 
 from ..errors import APIError
 from ..evaluators.builtin import BuiltinEvaluator as BuiltinRule
 from ..evaluators.builtin import get_builtin_evaluator, list_builtin_evaluators
 from ..evaluators.input_mapping import is_single_value_path
 from ..schemas.evaluators import (
-    BuiltinEvaluatorDefinition, DatasetEvaluatorDetail, DatasetEvaluatorPage,
-    EvaluatorConfig, EvaluatorSnapshot, InputMapping,
+    BuiltinEvaluatorDefinition, CodeEvaluationConfig, CodeEvaluationSnapshot, DatasetEvaluatorDetail,
+    DatasetEvaluatorPage, EvaluatorConfig, EvaluatorSnapshot, ExperimentEvaluatorConfig,
+    ExperimentEvaluatorSnapshot, InputMapping,
 )
 from .auth import locked_user
 from .datasets import require_owned_dataset
@@ -108,9 +109,33 @@ def _named_outputs(rule: type[BuiltinRule], name: str):
     return [{**config, "name": name} for config in rule.output_configs()]
 
 
-def build_experiment_evaluator_snapshots(configs: list[EvaluatorConfig]) -> list[EvaluatorSnapshot]:
-    snapshots = []
+async def build_experiment_evaluator_snapshots(db: AsyncSession, owner_id: int,
+                                               configs: list[ExperimentEvaluatorConfig]) -> list[ExperimentEvaluatorSnapshot]:
+    version_ids = {config.code_evaluator_version_id for config in configs if isinstance(config, CodeEvaluationConfig)}
+    versions = {}
+    if version_ids:
+        version = CodeEvaluatorVersion
+        evaluator = CodeEvaluator
+        rows = await db.execute(
+            select(version.id, version.evaluator_id, version.version_number, evaluator.name, evaluator.archived_at)
+            .join(evaluator, version.evaluator_id == evaluator.id)
+            .where(version.id.in_(version_ids), evaluator.user_id == owner_id)
+        )
+        versions = {row.id: row for row in rows}
+        if versions.keys() != version_ids:
+            raise APIError(404, "code_evaluator_version_not_found", "发布版本不存在")
+        if any(row.archived_at is not None for row in versions.values()):
+            raise APIError(409, "code_evaluator_archived", "请移除已归档的评分器，或选择其他评分器")
+
+    snapshots: list[ExperimentEvaluatorSnapshot] = []
     for config in configs:
+        if isinstance(config, CodeEvaluationConfig):
+            version_row = versions[config.code_evaluator_version_id]
+            snapshots.append(CodeEvaluationSnapshot(
+                **config.model_dump(), code_evaluator_id=version_row.evaluator_id, code_evaluator_name=version_row.name,
+                code_evaluator_version_number=version_row.version_number,
+            ))
+            continue
         rule = _validated_rule(config)
         snapshots.append(EvaluatorSnapshot(**config.model_dump(), output_configs=_named_outputs(rule, config.name)))
     return snapshots

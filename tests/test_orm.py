@@ -50,8 +50,8 @@ class SchemaContractTests(unittest.TestCase):
                     ("assistant_conversation_records", "forked_at"): "RESTRICT",
                 }.get((table.name, foreign_key.parent.name), "CASCADE")
                 self.assertEqual(foreign_key.ondelete, expected)
-        self.assertEqual(len(Base.metadata.sorted_tables), 25)
-        for name in ("prompts", "projects", "sandbox_configs", "languages"):
+        self.assertEqual(len(Base.metadata.sorted_tables), 24)
+        for name in ("prompts", "projects", "sandbox_configs", "languages", "code_evaluators"):
             self.assertNotIn(name, Base.metadata.tables)
         self.assertEqual(Dataset.__table__.c.user_id.info["deferred_foreign_key"]["target"], "users.id")
         self.assertFalse(Dataset.__table__.c.user_id.foreign_keys)
@@ -68,6 +68,8 @@ class SchemaContractTests(unittest.TestCase):
         self.assertIn("FOREIGN KEY(kind, id) REFERENCES evaluators (kind, id)", sql)
         self.assertIn("FOREIGN KEY(experiment_config_id) REFERENCES experiment_config (id)", sql)
         self.assertIn("UNIQUE (config_group_id, version)", sql)
+        self.assertIn("FOREIGN KEY(evaluator_id) REFERENCES evaluators (id)", sql)
+        self.assertIn("UNIQUE (evaluator_id, version_number)", sql)
         self.assertNotIn("score", Job.__table__.c)
         self.assertNotIn("evaluator_id", JobEvaluation.__table__.c)
 
@@ -253,10 +255,15 @@ class PersistenceTests(unittest.TestCase):
                           ExperimentConfig, Experiment, ExperimentDatasetExample, Job, JobEvaluation):
                 self.assertEqual(session.scalar(select(func.count()).select_from(model)), 0)
 
-    def test_evaluator_joined_inheritance_and_code_versions(self):
+    def test_evaluator_polymorphism_and_code_versions(self):
         with Session(self.engine) as session, session.begin():
-            code = CodeEvaluator(name="code-match", language="PYTHON")
-            code.versions.append(CodeEvaluatorVersion(source_code="def evaluate(output): return 1"))
+            owner = User(username="alice", password_hash="test")
+            session.add(owner)
+            session.flush()
+            first_source = "def evaluate(context): return {'score': 1}"
+            draft = "def evaluate(context): return {'score': 0}"
+            code = CodeEvaluator(name="code-match", user_id=owner.id, draft_source_code=draft)
+            code.versions.append(CodeEvaluatorVersion(version_number=1, source_code=first_source))
             llm = LLMEvaluator(name="llm-match", prompt_id=1, output_configs=[])
             builtin = BuiltinEvaluator(name="builtin-match", key="exact", input_schema={}, output_configs=[])
             session.add_all([code, llm, builtin])
@@ -265,8 +272,17 @@ class PersistenceTests(unittest.TestCase):
         with Session(self.engine) as session:
             evaluators = session.scalars(select(Evaluator).order_by(Evaluator.id)).all()
             self.assertEqual([type(e) for e in evaluators], [CodeEvaluator, LLMEvaluator, BuiltinEvaluator])
-            self.assertEqual(evaluators[0].input_mapping, {"literal_mapping": {}, "path_mapping": {}})
-            self.assertEqual(evaluators[0].versions[0].source_code, "def evaluate(output): return 1")
+            code = evaluators[0]
+            self.assertEqual(code.draft_source_code, draft)
+            self.assertEqual(code.versions[0].source_code, first_source)
+            self.assertEqual(code.versions[0].evaluator_id, code_id)
+            for number in (0, 1):
+                with self.assertRaises(IntegrityError), session.begin_nested():
+                    session.add(CodeEvaluatorVersion(evaluator_id=code_id, version_number=number, source_code=draft))
+            code.draft_source_code = "# edited after release"
+            code.versions.append(CodeEvaluatorVersion(version_number=2, source_code=draft))
+            session.commit()
+            self.assertEqual({row.version_number: row.source_code for row in code.versions}, {1: first_source, 2: draft})
             session.delete(session.get(CodeEvaluator, code_id))
             session.commit()
             self.assertIsNone(session.get(Evaluator, code_id))
@@ -274,7 +290,12 @@ class PersistenceTests(unittest.TestCase):
 
     def test_discriminator_composite_foreign_key_blocks_wrong_subtype(self):
         with Session(self.engine) as session, session.begin():
-            code = CodeEvaluator(name="code", language="PYTHON")
+            owner = User(username="alice", password_hash="test")
+            session.add(owner)
+            session.flush()
+            with self.assertRaises(IntegrityError), session.begin_nested():
+                session.add(CodeEvaluator(name="no-owner"))
+            code = CodeEvaluator(name="code", user_id=owner.id)
             session.add(code)
             session.flush()
             evaluator_id = code.id

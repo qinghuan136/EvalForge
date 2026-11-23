@@ -10,7 +10,7 @@ from typing_extensions import Required, TypedDict
 
 from .auth import Schema
 from .common import PositiveDbId, StoredText, validate_database_json
-from .evaluators import EvaluatorConfig, EvaluatorSnapshot
+from .evaluators import ExperimentEvaluatorConfig, ExperimentEvaluatorSnapshot
 
 ExperimentStatus = Literal["pending", "running", "cancelling", "completed", "failed", "cancelled"]
 JobStatus = Literal["queued", "assigned", "running", "succeeded", "failed", "cancelled", "unknown"]
@@ -41,7 +41,7 @@ class ExperimentOptions(Schema):
     description: StoredText | None = Field(default=None, max_length=2000)
     repetitions: int = Field(default=1, strict=True, ge=1, le=100)
     dataset_evaluator_ids: list[PositiveDbId] = Field(default_factory=list, max_length=100)
-    evaluators: list[EvaluatorConfig] = Field(default_factory=list, max_length=100)
+    evaluators: list[ExperimentEvaluatorConfig] = Field(default_factory=list, max_length=100)
 
     @field_validator("name", mode="before")
     @classmethod
@@ -100,7 +100,7 @@ class ExperimentConfigDetail(Schema):
     timeout_seconds: float
     stream_output: bool
     repetitions: int
-    evaluators: list[EvaluatorSnapshot]
+    evaluators: list[ExperimentEvaluatorSnapshot]
     created_at: datetime
 
     @field_validator("created_at")
@@ -187,7 +187,7 @@ class ExperimentDetail(ExperimentSummary):
     description: str | None
     metadata: dict[str, JsonValue]
     execution_config: SavedExecutionConfig
-    evaluators: list[EvaluatorSnapshot] = Field(default_factory=list)
+    evaluators: list[ExperimentEvaluatorSnapshot] = Field(default_factory=list)
 
 
 class ExperimentPage(Schema):
